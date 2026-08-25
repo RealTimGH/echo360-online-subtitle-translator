@@ -1,6 +1,15 @@
 globalThis.Echo360DirectTranslator = (() => {
   const AI_LINE_SEPARATOR = "\n<<<VTT_TRANSLATOR_LINE_BREAK_8F3B>>>\n";
   const CJK_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
+  // google-web uses an unofficial public web endpoint.  There is no published
+  // stable QPS contract for it, so keep a bounded concurrency guard and
+  // use a modest default request cadence rather than the generic provider
+  // defaults.  Lower user-supplied RPS values remain respected below.
+  const GOOGLE_WEB_CONCURRENCY_CAP = 48;
+  // This is a bounded throughput compromise for the unofficial endpoint:
+  // twice the previous 6-RPS guard, while keeping the 48-worker cap and
+  // retry protection below.  It is not an official Google quota.
+  const GOOGLE_WEB_DEFAULT_RPS = 12;
   const PROVIDER_ADAPTERS = {
     openai: {
       id: "openai",
@@ -54,7 +63,11 @@ globalThis.Echo360DirectTranslator = (() => {
       defaultEndpoint: "https://translate.googleapis.com/translate_a/single",
       keyless: true,
       supportsRecursiveFallback: true,
-      concurrencyCap: 96,
+      // The public Google web endpoint is not designed for the extension's
+      // generic high-concurrency defaults.  Keep the provider bounded even
+      // when an older stored config still says 96.
+      concurrencyCap: GOOGLE_WEB_CONCURRENCY_CAP,
+      defaultRps: GOOGLE_WEB_DEFAULT_RPS,
       authHeaders() {
         return {};
       },
@@ -106,6 +119,7 @@ globalThis.Echo360DirectTranslator = (() => {
     const adapter = getProviderAdapter(provider);
     if (key === "model") return adapter.defaultModel;
     if (key === "endpoint") return adapter.defaultEndpoint;
+    if (key === "rps") return adapter.defaultRps || 0;
     return "";
   }
 
@@ -559,10 +573,26 @@ globalThis.Echo360DirectTranslator = (() => {
       });
     }
 
+    const provider = normalizeProvider(payload.provider);
+    const isGoogleWeb = provider === "google-web";
+    const requestedConcurrency = Number(payload.concurrency);
+    const requestedRps = Number(payload.rps);
+    const effectiveRps = isGoogleWeb
+      ? (Number.isFinite(requestedRps) && requestedRps > 0
+        ? requestedRps
+        : providerDefault(provider, "rps"))
+      : requestedRps;
     const cfg = {
       ...payload,
-      provider: normalizeProvider(payload.provider),
-      waitForRequest: createRateLimiter(payload.rps),
+      provider,
+      // Keep the Google concurrency guard for legacy/default configs while
+      // allowing an explicit lower RPS setting to slow requests further.
+      concurrency: isGoogleWeb
+        ? Math.max(1, Math.min(requestedConcurrency || GOOGLE_WEB_CONCURRENCY_CAP, GOOGLE_WEB_CONCURRENCY_CAP))
+        : requestedConcurrency,
+      rps: effectiveRps,
+      retries: isGoogleWeb ? Math.max(Number(payload.retries) || 0, 2) : payload.retries,
+      waitForRequest: createRateLimiter(effectiveRps),
     };
     const lines = String(payload.vtt_text || "").replace(/\r/g, "").split("\n");
     const items = [];

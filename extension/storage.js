@@ -62,6 +62,9 @@
       reverseOrder: false,
       browserBilingual: false,
       browserReverseOrder: false,
+      // Transcript panel enhancement is an independent surface.  It remains
+      // enabled even when browser video subtitles are disabled.
+      transcriptPanelEnabled: true,
       // Default: browser <track> renderer. Native CC injection remains
       // available as an opt-in Beta, but at high playback speed Echo360's
       // own caption DOM routinely lags and miss-injection is still common,
@@ -80,6 +83,7 @@
     }
     prefs.browserBilingual = typeof prefs.browserBilingual === "boolean" ? prefs.browserBilingual : prefs.bilingual === true;
     prefs.browserReverseOrder = typeof prefs.browserReverseOrder === "boolean" ? prefs.browserReverseOrder : prefs.reverseOrder === true;
+    prefs.transcriptPanelEnabled = prefs.transcriptPanelEnabled !== false;
     prefs.bilingual = prefs.useNativeSubtitles ? prefs.browserBilingual : true;
     prefs.reverseOrder = prefs.useNativeSubtitles ? prefs.browserReverseOrder : false;
     if (prefs.size === "tiny") prefs.size = "medium";
@@ -108,6 +112,7 @@
       useNativeSubtitles,
       browserBilingual,
       browserReverseOrder,
+      transcriptPanelEnabled: prefs.transcriptPanelEnabled !== false,
       bilingual: useNativeSubtitles ? browserBilingual : true,
       reverseOrder: useNativeSubtitles ? browserReverseOrder : false,
     };

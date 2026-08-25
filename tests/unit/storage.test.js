@@ -293,6 +293,43 @@ describe("getPrefs normalization", () => {
     expect(prefs.enabled).toBe(true);
     expect(prefs.useNativeSubtitles).toBe(true);
     expect(prefs.bilingual).toBe(false);
+    expect(prefs.transcriptPanelEnabled).toBe(true);
+  });
+
+  it("upgrades a 1.4.2 prefs record without resetting existing choices", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        [prefsKey()]: {
+          enabled: false,
+          size: "large",
+          bilingual: true,
+          reverseOrder: true,
+          browserBilingual: true,
+          browserReverseOrder: true,
+          useNativeSubtitles: true,
+          renderModeVersion: 3,
+          // 1.4.2 did not persist the Transcript panel toggle.
+        },
+      },
+    });
+    const prefs = await storage.getPrefs();
+    expect(prefs).toMatchObject({
+      enabled: false,
+      size: "large",
+      bilingual: true,
+      reverseOrder: true,
+      useNativeSubtitles: true,
+      transcriptPanelEnabled: true,
+    });
+  });
+
+  it("keeps Transcript panel enhancement independent and persistently disableable", async () => {
+    const { storage, localMock } = setupStorage({
+      storageData: { [prefsKey()]: { transcriptPanelEnabled: false, useNativeSubtitles: true, renderModeVersion: 3 } },
+    });
+    expect((await storage.getPrefs()).transcriptPanelEnabled).toBe(false);
+    await storage.savePrefs({ transcriptPanelEnabled: false, enabled: true, size: "medium", bilingual: false, reverseOrder: false, useNativeSubtitles: true });
+    expect(localMock._store[prefsKey()].transcriptPanelEnabled).toBe(false);
   });
 
   it("migrates legacy prefs without schema version to prefer the browser track", async () => {
