@@ -136,4 +136,48 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(domMount).toHaveBeenCalledOnce();
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
   });
+
+  it("renders the Transcript panel as an independent surface without changing track mounting", () => {
+    const { ns } = setupControllerWithRenderer();
+    const panel = {
+      setVisible: vi.fn(),
+      setTranslation: vi.fn(),
+    };
+    ns.transcriptPanelRenderer = panel;
+    const mounted = ns.controller.renderTranslationSurfaces({
+      translatedVtt: TRANS_VTT,
+      originalVtt: ORIG_VTT,
+      prefs: { enabled: false, transcriptPanelEnabled: true, bilingual: false, reverseOrder: false, size: "medium", useNativeSubtitles: true, target: "ZH" },
+      sourceMeta: { sourceId: "source", sessionKey: "source::cfg" },
+    });
+    expect(mounted).toBe(true);
+    expect(panel.setVisible).toHaveBeenCalledWith(true);
+    expect(panel.setTranslation).toHaveBeenCalledWith(expect.objectContaining({ target: "ZH" }));
+  });
+
+  it("does not rediscover or retranslate an existing track while the panel is disabled", async () => {
+    const { ns } = setupControllerWithRenderer();
+    ns.renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false);
+    const resolveSourceVtt = vi.fn();
+    ns.translationService = { resolveSourceVtt };
+    ns.renderer.hasRenderedTranslatedTrack = vi.fn(() => true);
+    ns.transcriptPanelRenderer = {
+      start: vi.fn(),
+      getDebugState: vi.fn(() => ({ modelCueCount: 0 })),
+    };
+    ns.storage.getPrefs.mockResolvedValue({
+      enabled: true,
+      transcriptPanelEnabled: false,
+      size: "medium",
+      bilingual: true,
+      reverseOrder: false,
+      useNativeSubtitles: false,
+    });
+    let callbacks = null;
+    ns.ui.ensurePanel.mockImplementation((next) => { callbacks = next; });
+    await ns.controller.init();
+    expect(callbacks?.onTranslate).toEqual(expect.any(Function));
+    await callbacks.onTranslate();
+    expect(resolveSourceVtt).not.toHaveBeenCalled();
+  });
 });

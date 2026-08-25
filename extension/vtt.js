@@ -57,6 +57,66 @@
     return out;
   }
 
+  // Parse a WebVTT timestamp into integer milliseconds.  Echo360's transcript
+  // endpoint currently emits HH:MM:SS.mmm, but accepting the shorter MM:SS
+  // form keeps the transcript model useful for ordinary VTT fixtures too.
+  function parseVttTimestamp(value) {
+    const text = String(value || "").trim();
+    const parts = text.split(":");
+    if (parts.length !== 2 && parts.length !== 3) return null;
+    const secondsPart = parts[parts.length - 1];
+    const sec = Number(secondsPart);
+    const minute = Number(parts[parts.length - 2]);
+    const hour = parts.length === 3 ? Number(parts[0]) : 0;
+    if (![sec, minute, hour].every(Number.isFinite)) return null;
+    if (minute < 0 || minute >= 60 || hour < 0 || sec < 0 || sec >= 60) return null;
+    return Math.round((hour * 3600 + minute * 60 + sec) * 1000);
+  }
+
+  function parseVttTimingLine(line) {
+    const match = String(line || "").match(
+      /([^\s]+)\s+-->\s+([^\s]+)(?:\s+.*)?$/
+    );
+    if (!match) return null;
+    const startMs = parseVttTimestamp(match[1]);
+    const endMs = parseVttTimestamp(match[2]);
+    if (startMs == null || endMs == null || endMs < startMs) return null;
+    return { startMs, endMs, time: line };
+  }
+
+  // Unlike parseVttBlocks(), this retains cue order and exact numeric timing,
+  // which is the stable primary key used by the Transcript panel adapter.
+  function parseVttCues(vttText) {
+    const lines = String(vttText || "").replace(/\r/g, "").split("\n");
+    const cues = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const timing = parseVttTimingLine(lines[i]);
+      if (!timing) continue;
+      let id = "";
+      if (i > 0 && lines[i - 1].trim() && !/^WEBVTT(?:\s|$)/i.test(lines[i - 1]) && !lines[i - 1].includes("-->")) {
+        id = lines[i - 1].trim();
+      }
+      const text = [];
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() !== "") {
+        text.push(lines[j]);
+        j += 1;
+      }
+      cues.push({
+        id,
+        index: cues.length,
+        startMs: timing.startMs,
+        endMs: timing.endMs,
+        start: timing.startMs / 1000,
+        end: timing.endMs / 1000,
+        time: timing.time,
+        text: text.join("\n"),
+      });
+      i = j;
+    }
+    return cues;
+  }
+
   function normalizeCueText(text) {
     return String(text || "")
       .replace(/\r/g, "")
@@ -188,6 +248,9 @@
     cueTextToLine,
     parseVttStats,
     parseVttBlocks,
+    parseVttTimestamp,
+    parseVttTimingLine,
+    parseVttCues,
     isAlreadyBilingualVtt,
     normalizeBilingualOrderZhFirst,
     extractPrimaryTranslatedVtt,

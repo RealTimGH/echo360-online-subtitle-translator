@@ -4,7 +4,7 @@
 
 用于 Echo360 录播课的 Chrome/Safari 扩展，用来加载并显示翻译字幕；本地 FastAPI 后端保留为开发调试、fallback 和批处理路径。
 
-当前扩展版本：**1.4.2**
+当前扩展版本：**1.4.3**
 
 ## 功能概览
 
@@ -188,6 +188,14 @@ npm run build:dev
 
 dev 构建保留本地后端入口和 localhost 权限。
 
+如果通过 Safari/Xcode 运行扩展，Xcode 工程还必须把 `manifest.json` 引用的每个脚本加入两个 Extension target 的 Resources。当前工作区可用下面的命令核对资源清单：
+
+```bash
+npm run check:safari
+```
+
+修改扩展脚本后，需要在 Xcode 中重新 Build/Run containing app，并关闭后重新打开 Safari 的 Canvas/EchoVideo 页面；只运行 `npm run build` 不会更新已经安装的 Safari App bundle。
+
 ## 测试
 
 单元测试覆盖 `extension/` 中的 VTT 解析、字幕策略、存储、翻译 payload 与错误处理逻辑：
@@ -238,6 +246,8 @@ Google Translate provider：
 - 后端/脚本路径会自动使用 `concurrency=96, max_chars=1200, max_paragraphs=10`
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量，建议改用 AI/API provider（如 `deepseek`/`openai`/`gemini`/`deepl`）并填写自己的 API Key
+
+`google-web` 的直接扩展路径在 `rps=0`（默认值）时会自动使用受控的 `12` 请求/秒，并把同时运行的 worker 限制为 `48`；这是在尽量保持稳定的前提下提高吞吐的有界保护值。用户显式填写的正数 RPS 仍会生效。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
 
 
 
@@ -293,4 +303,3 @@ export TRANSLATOR_PYTHON_BIN=/absolute/path/to/python
 - 如果录播存在独立开场片段，扩展会优先使用强 media-id 映射，其次使用 timeline/state 兜底匹配。
 - 仅 Transcript 面板、无播放器 CC 的课时依赖 `transcript-file` API（1.2.2）；这类页面没有 Echo360 原生 CC DOM 可注入，会被 `hasNativeCaptionCapability()` 判定为无能力并直接使用浏览器字幕轨。
 - 增量预览的 partial VTT 由 `direct_translator.js` 每批产出并经 `background.js` job 轮询；`buildIncrementalPreviewVtt()` 负责把未译 cue 替换为占位文案。
-

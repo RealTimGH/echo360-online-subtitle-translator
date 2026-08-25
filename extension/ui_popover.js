@@ -35,6 +35,10 @@
         <span>显示翻译字幕</span>
         <input id="echo360-pref-enabled" type="checkbox" />
       </label>
+      <label class="echo360-popover-row">
+        <span>增强 Transcript 面板</span>
+        <input id="echo360-pref-transcript-panel" type="checkbox" />
+      </label>
       <label id="echo360-pref-bilingual-label" class="echo360-popover-row">
         <span>双语字幕</span>
         <input id="echo360-pref-bilingual" type="checkbox" />
@@ -87,6 +91,7 @@
     const refs = {
       currentProvider: pop.querySelector("#echo360-current-provider"),
       enabled: pop.querySelector("#echo360-pref-enabled"),
+      transcriptPanelEnabled: pop.querySelector("#echo360-pref-transcript-panel"),
       bilingual: pop.querySelector("#echo360-pref-bilingual"),
       bilingualLabel: pop.querySelector("#echo360-pref-bilingual-label"),
       reverseOrder: pop.querySelector("#echo360-pref-reverse"),
@@ -135,6 +140,7 @@
     pop.querySelector("#echo360-open-options-btn").addEventListener("click", openOptionsPage);
     pop.querySelector("#echo360-change-provider-btn").addEventListener("click", openOptionsPage);
     refs.enabled.addEventListener("change", () => handlers.onPrefsChanged?.());
+    refs.transcriptPanelEnabled.addEventListener("change", () => handlers.onPrefsChanged?.());
     refs.bilingual.addEventListener("change", () => handlers.onPrefsChanged?.());
     refs.reverseOrder.addEventListener("change", () => handlers.onPrefsChanged?.());
     refs.nativeCc.addEventListener("change", () => {
@@ -166,6 +172,7 @@
       };
       applyProviderLabel(cfg);
       refs.enabled.checked = !!prefs.enabled;
+      refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled !== false;
       refs.bilingual.checked = !!browserModePrefs.bilingual;
       refs.reverseOrder.checked = !!browserModePrefs.reverseOrder;
       // Checked = Beta native CC injection; unchecked = default browser track.
@@ -187,6 +194,7 @@
       }
       return {
         enabled: refs.enabled.checked,
+        transcriptPanelEnabled: refs.transcriptPanelEnabled.checked,
         bilingual: nativeCcMode ? true : browserModePrefs.bilingual,
         reverseOrder: nativeCcMode ? false : browserModePrefs.reverseOrder,
         browserBilingual: browserModePrefs.bilingual,

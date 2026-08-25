@@ -8,6 +8,56 @@
   let loadedCacheKey = "";
   let trackSyncTimer = null;
 
+  // Keep the browser video track and the Echo360 Transcript panel as separate
+  // rendering surfaces.  A panel capability failure must never change the
+  // mounted-track result used by the existing subtitle lifecycle.
+  function renderTranslationSurfaces({
+    translatedVtt,
+    originalVtt,
+    prefs,
+    sourceMeta,
+    options = {},
+  }) {
+    const resolvedSourceMeta = {
+      ...(sourceMeta || {}),
+      target: String(prefs.target || sourceMeta?.target || "ZH").toUpperCase(),
+    };
+    const mounted = ns.renderer.renderTranslatedTrack(
+      translatedVtt,
+      originalVtt,
+      prefs.bilingual,
+      prefs.size,
+      prefs.reverseOrder,
+      resolvedSourceMeta,
+      prefs.useNativeSubtitles,
+      {
+        ...options,
+        browserBilingual: prefs.browserBilingual,
+        browserReverseOrder: prefs.browserReverseOrder,
+      }
+    );
+    if (ns.transcriptPanelRenderer) {
+      if (prefs.transcriptPanelEnabled === false) {
+        ns.transcriptPanelRenderer.setVisible(false);
+      } else {
+        ns.transcriptPanelRenderer.setVisible(true);
+        ns.transcriptPanelRenderer.setTranslation({
+          translatedVtt,
+          originalVtt,
+          sourceMeta: resolvedSourceMeta,
+          target: resolvedSourceMeta.target,
+          sessionKey: resolvedSourceMeta.sessionKey,
+          pendingLabel: options.pendingLabel,
+          failureLabel: options.pendingLabel === ns.constants.SUBTITLE_FAILURE_LABEL
+            ? ns.constants.SUBTITLE_FAILURE_LABEL
+            : undefined,
+          failurePreview: options.pendingLabel === ns.constants.SUBTITLE_FAILURE_LABEL,
+        });
+      }
+    }
+    return mounted;
+  }
+
   async function onTargetChanged(event) {
     const cfg = await ns.storage.getConfig();
     cfg.target = (event.target.value || "ZH").toUpperCase();
@@ -28,21 +78,21 @@
         oldPrefs.bilingual !== prefs.bilingual ||
         oldPrefs.reverseOrder !== prefs.reverseOrder ||
         oldPrefs.useNativeSubtitles !== prefs.useNativeSubtitles ||
-        oldPrefs.size !== prefs.size
+        oldPrefs.size !== prefs.size ||
+        oldPrefs.transcriptPanelEnabled !== prefs.transcriptPanelEnabled
       )
     ) {
-      ns.renderer.renderTranslatedTrack(
-        renderState.lastRenderedVtt,
-        renderState.lastOriginalVtt,
-        prefs.bilingual,
-        prefs.size,
-        prefs.reverseOrder,
-        renderState.lastRenderSourceMeta,
-        prefs.useNativeSubtitles,
-        { browserBilingual: prefs.browserBilingual, browserReverseOrder: prefs.browserReverseOrder }
-      );
+      renderTranslationSurfaces({
+        translatedVtt: renderState.lastRenderedVtt,
+        originalVtt: renderState.lastOriginalVtt,
+        prefs,
+        sourceMeta: renderState.lastRenderSourceMeta,
+      });
     }
     ns.renderer.applySubtitleVisibility(prefs.enabled);
+    if (ns.transcriptPanelRenderer && prefs.transcriptPanelEnabled === false) {
+      ns.transcriptPanelRenderer.setVisible(false);
+    }
   }
 
   async function onClickTranslate(forceRefresh = false) {
@@ -61,6 +111,7 @@
     const dismissFailedTranslation = () => {
       ns.ui.hideTranslationFailureActions();
       ns.renderer.cleanupTranslatedTracks();
+      ns.transcriptPanelRenderer?.clear?.();
       incrementalPreviewMounted = false;
       previewRenderArgs = null;
       lastPreviewVtt = "";
@@ -72,22 +123,17 @@
     const showFailedTranslationPreview = () => {
       if (!incrementalPreviewMounted || !previewRenderArgs) return;
       const { vttText, prefs, sourceMeta } = previewRenderArgs;
-      const mounted = ns.renderer.renderTranslatedTrack(
-        lastPreviewVtt || vttText,
-        vttText,
-        prefs.bilingual,
-        prefs.size,
-        prefs.reverseOrder,
+      const mounted = renderTranslationSurfaces({
+        translatedVtt: lastPreviewVtt || vttText,
+        originalVtt: vttText,
+        prefs,
         sourceMeta,
-        prefs.useNativeSubtitles,
-        {
+        options: {
           incremental: true,
           previewPending: true,
           pendingLabel: ns.constants.SUBTITLE_FAILURE_LABEL,
-          browserBilingual: prefs.browserBilingual,
-          browserReverseOrder: prefs.browserReverseOrder,
-        }
-      );
+        },
+      });
       if (mounted) ns.renderer.applySubtitleVisibility(prefs.enabled);
       ns.ui.showTranslationFailureActions({
         onRetry: () => {
@@ -105,9 +151,16 @@
 
       const video = await ns.video.waitForVideo(15000);
       if (!video) throw new Error("未找到播放器 video 元素（15s 超时）");
-      if (forceRefresh) ns.renderer.cleanupTranslatedTracks();
+      if (forceRefresh) {
+        ns.renderer.cleanupTranslatedTracks();
+        ns.transcriptPanelRenderer?.clear?.();
+      }
 
-      if (!forceRefresh && ns.renderer.hasRenderedTranslatedTrack()) {
+      const earlyPrefs = await ns.storage.getPrefs();
+      const panelRequired = !!ns.transcriptPanelRenderer && earlyPrefs.transcriptPanelEnabled !== false;
+      const panelHasModel = Number(ns.transcriptPanelRenderer?.getDebugState?.().modelCueCount || 0) > 0;
+      const panelReady = !panelRequired || panelHasModel;
+      if (!forceRefresh && ns.renderer.hasRenderedTranslatedTrack() && panelReady) {
         ns.renderer.applySubtitleVisibility(true);
         ns.ui.updateActionButtons("翻译字幕已加载");
         ns.ui.setStatusText("当前翻译字幕已在页面中");
@@ -120,9 +173,11 @@
       if (!cfg) throw new Error("当前 Provider 需要 API Key。请点击扩展图标填写，或切换到 Google Translate。");
 
       const prefs = await ns.storage.getPrefs();
+      prefs.target = String(cfg.target || "ZH").toUpperCase();
       ns.renderer.applySubtitleSize(prefs.size);
 
       const { sourceKey, configSig, cacheKey } = await ns.translationService.buildCacheKey(cfg, sourceId, vttText);
+      const panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig, sessionKey: cacheKey };
       const cacheEntry = await ns.storage.getCacheStore();
 
       if (forceRefresh) {
@@ -134,7 +189,7 @@
       }
 
       const renderState = ns.renderer.getRenderState();
-      if (!forceRefresh && loadedCacheKey === cacheKey && renderState.lastTranslatedTrack) {
+      if (!forceRefresh && loadedCacheKey === cacheKey && renderState.lastTranslatedTrack && panelReady) {
         ns.renderer.applySubtitleVisibility(true);
         ns.ui.updateActionButtons("翻译字幕已加载");
         ns.ui.setStatusText("已加载当前翻译字幕");
@@ -143,7 +198,7 @@
 
       if (!forceRefresh && loadedCacheKey === cacheKey) {
         const existing = video.querySelector('track[data-echo360-translated="1"]');
-        if (existing) {
+        if (existing && panelReady) {
           ns.renderer.applySubtitleVisibility(true);
           ns.ui.updateActionButtons("翻译字幕已加载");
           ns.ui.setStatusText("已加载当前翻译字幕");
@@ -153,16 +208,12 @@
       }
 
       if (!forceRefresh && cacheEntry?.translatedVtt && cacheEntry.cacheKey === cacheKey) {
-        const mounted = ns.renderer.renderTranslatedTrack(
-          cacheEntry.translatedVtt,
-          vttText,
-          prefs.bilingual,
-          prefs.size,
-          prefs.reverseOrder,
-          sourceMeta,
-          prefs.useNativeSubtitles,
-          { browserBilingual: prefs.browserBilingual, browserReverseOrder: prefs.browserReverseOrder }
-        );
+        const mounted = renderTranslationSurfaces({
+          translatedVtt: cacheEntry.translatedVtt,
+          originalVtt: vttText,
+          prefs,
+          sourceMeta: panelSourceMeta,
+        });
         loadedCacheKey = cacheEntry.cacheKey || "";
         if (mounted) {
           ns.ui.updateActionButtons("翻译字幕已加载");
@@ -176,25 +227,17 @@
 
       const backendUrl = (cfg.backendUrl || "http://127.0.0.1:8765").replace(/\/+$/, "");
       const payload = ns.translationService.buildTranslatePayload(cfg, vttText, forceRefresh);
-      previewRenderArgs = { vttText, prefs, sourceMeta };
+      previewRenderArgs = { vttText, prefs, sourceMeta: panelSourceMeta };
 
       const mountTranslationPreview = (partialVtt, incremental = false) => {
         lastPreviewVtt = partialVtt;
-        const mounted = ns.renderer.renderTranslatedTrack(
-          partialVtt,
-          vttText,
-          prefs.bilingual,
-          prefs.size,
-          prefs.reverseOrder,
-          sourceMeta,
-          prefs.useNativeSubtitles,
-          {
-            incremental,
-            previewPending: true,
-            browserBilingual: prefs.browserBilingual,
-            browserReverseOrder: prefs.browserReverseOrder,
-          }
-        );
+        const mounted = renderTranslationSurfaces({
+          translatedVtt: partialVtt,
+          originalVtt: vttText,
+          prefs,
+          sourceMeta: panelSourceMeta,
+          options: { incremental, previewPending: true },
+        });
         if (!mounted) return false;
         incrementalPreviewMounted = true;
         ns.renderer.applySubtitleVisibility(prefs.enabled);
@@ -239,20 +282,13 @@
         ns.ui.setStatusText(result.cache_hit ? "缓存命中" : "翻译完成");
       }
 
-      const mounted = ns.renderer.renderTranslatedTrack(
-        result.translated_vtt,
-        vttText,
-        prefs.bilingual,
-        prefs.size,
-        prefs.reverseOrder,
-        sourceMeta,
-        prefs.useNativeSubtitles,
-        {
-          incremental: incrementalPreviewMounted,
-          browserBilingual: prefs.browserBilingual,
-          browserReverseOrder: prefs.browserReverseOrder,
-        }
-      );
+      const mounted = renderTranslationSurfaces({
+        translatedVtt: result.translated_vtt,
+        originalVtt: vttText,
+        prefs,
+        sourceMeta: panelSourceMeta,
+        options: { incremental: incrementalPreviewMounted },
+      });
       loadedCacheKey = cacheKey;
       await ns.storage.setCacheStore({
         cacheKey,
@@ -297,6 +333,8 @@
 
     ns.video.installPageProbe();
 
+    ns.transcriptPanelRenderer?.start?.();
+
     const video = await ns.video.waitForVideo(30000);
     if (!video) {
       console.log("[echo360-translator] video not found during init:", location.href);
@@ -338,5 +376,6 @@
 
   ns.controller = {
     init,
+    renderTranslationSurfaces,
   };
 })();

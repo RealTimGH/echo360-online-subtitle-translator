@@ -4,7 +4,7 @@
 
 Chrome/Safari extension for loading translated subtitles on Echo360 recordings; the local FastAPI backend is kept as a development, fallback, and batch-processing path.
 
-Current extension version: **1.4.2**
+Current extension version: **1.4.3**
 
 ## What It Does
 
@@ -179,6 +179,14 @@ npm run build:dev
 
 The dev build keeps the local backend entry and localhost permissions.
 
+When running the extension through Safari/Xcode, every script referenced by `manifest.json` must also be present in the Resources phase of both Extension targets. Verify the generated project with:
+
+```bash
+npm run check:safari
+```
+
+After changing extension scripts, rebuild/run the containing app in Xcode and reopen the Safari Canvas/EchoVideo page; running `npm run build` alone does not update an already-installed Safari app bundle.
+
 ## Testing
 
 Unit tests cover VTT parsing, subtitle strategy, storage, translation payloads, and error handling in `extension/`:
@@ -226,6 +234,8 @@ Google Translate provider:
 - The backend/script path caps it at `concurrency=96, max_chars=1200, max_paragraphs=10`
 - This endpoint is unofficial, so stability, availability, and translation quality are not guaranteed
 - For better subtitle translation quality, use an AI/API provider such as `deepseek`, `openai`, `gemini`, or `deepl` with your own API key
+
+For the direct extension path, `google-web` automatically uses a controlled `12` requests per second when `rps=0` (the default) and keeps concurrent workers capped at `48`. This is a bounded throughput compromise for the unofficial web endpoint; an explicitly positive RPS is still honored. The endpoint has no public, stable official QPS guarantee, so the formal Google Cloud Translation quotas should not be applied to it directly.
 
 ## Privacy
 
@@ -279,4 +289,4 @@ The extension keeps one local translated VTT cache entry. Bilingual display is r
 - If a separated intro clip exists, the extension prefers strong media-id mapping first and timeline/state matching as fallback.
 - Transcript-panel-only lessons without player CC rely on the `transcript-file` API (1.2.2); those pages have no native CC DOM to inject into, so `hasNativeCaptionCapability()` detects that and uses the browser track directly.
 - Incremental preview partial VTT is emitted per batch by `direct_translator.js`, polled via `background.js` jobs; `buildIncrementalPreviewVtt()` replaces untranslated cues with placeholder text.
-Beta-first rendering, capability detection, and perf/Ul polish 
+Beta-first rendering, capability detection, and perf/UI polish

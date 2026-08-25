@@ -150,6 +150,24 @@ describe("settings popover render mode controls", () => {
     expect(bilingual.checked).toBe(false);
     expect(reverseOrder.checked).toBe(false);
   });
+
+  it("exposes an independent Transcript panel setting", async () => {
+    setupUi({
+      enabled: false,
+      transcriptPanelEnabled: false,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    await openSettings();
+    const control = document.getElementById("echo360-pref-transcript-panel");
+    expect(control.checked).toBe(false);
+    control.checked = true;
+    expect(window.Echo360Translator.ui.readPanelPrefs().transcriptPanelEnabled).toBe(true);
+  });
 });
 
 describe("settings popover translation service display", () => {

@@ -3,6 +3,7 @@
     "build": "node scripts/build-extension.mjs all",
     "build:store": "node scripts/build-extension.mjs store",
     "build:dev": "node scripts/build-extension.mjs dev",
+    "check:safari": "node scripts/verify-safari-xcode-resources.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
