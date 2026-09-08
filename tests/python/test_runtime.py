@@ -1,4 +1,6 @@
 import unittest
+import sys
+from pathlib import Path
 from unittest import mock
 
 from backend import app as backend
@@ -66,6 +68,28 @@ class BackendRuntimeTests(unittest.TestCase):
             ),
             "ARGOS_MODEL_MISSING",
         )
+
+    def test_source_backend_invokes_the_translator_through_python(self):
+        command = backend.get_translator_command()
+        self.assertEqual(command[0], backend.get_translator_python())
+        self.assertEqual(command[1], str(backend.TRANSLATOR_SCRIPT))
+
+    def test_frozen_backend_dispatches_translation_through_its_own_executable(self):
+        with mock.patch.object(sys, "frozen", True, create=True):
+            self.assertEqual(backend.get_translator_command(), [sys.executable, "--translator"])
+            self.assertTrue(backend.translator_runtime_available())
+
+    def test_backend_passes_api_key_only_through_the_child_environment(self):
+        request = backend.TranslateRequest(vtt_text=SAMPLE_VTT, api_key="secret-value")
+        args = backend.build_translator_args(
+            Path("input.vtt"),
+            Path("output.vtt"),
+            request,
+            set(),
+            [],
+        )
+        self.assertNotIn("--key", args)
+        self.assertNotIn("secret-value", args)
 
 
 class TranslatorRuntimeTests(unittest.TestCase):

@@ -8,6 +8,8 @@ backend/.cache/
 *.log
 logs/
 dist/
+build/
+.backend-build-venv/
 scripts/bench-google-web.mjs
 
 # JS test tooling

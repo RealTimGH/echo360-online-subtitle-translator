@@ -8,6 +8,7 @@
     "build": "node scripts/build-extension.mjs all",
     "build:store": "node scripts/build-extension.mjs store",
     "build:dev": "node scripts/build-extension.mjs dev",
+    "build:backend": "node scripts/build-backend.mjs",
     "safari:prepare": "npm run build:store && node scripts/verify-safari-xcode-resources.mjs --required",
     "check": "npm run check:syntax && npm test && npm run build && npm run check:safari",
     "check:syntax": "node scripts/check-syntax.mjs",

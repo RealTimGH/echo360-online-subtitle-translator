@@ -1,0 +1,64 @@
+name: Build packaged backend
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*.*.*"
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            artifact: backend-windows-x64
+            archive: dist/echo360-online-subtitle-translator-backend-windows-x64.zip
+          - runner: macos-15
+            artifact: backend-macos-arm64
+            archive: dist/echo360-online-subtitle-translator-backend-macos-arm64.tar.gz
+          - runner: macos-15-intel
+            artifact: backend-macos-x64
+            archive: dist/echo360-online-subtitle-translator-backend-macos-x64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-argos.txt
+            backend/requirements-build.txt
+
+      - name: Cache Argos model assets
+        uses: actions/cache@v4
+        with:
+          path: build/backend/assets/argos
+          key: argos-1.11.0-en-zh-zt-${{ matrix.artifact }}
+
+      - name: Install build dependencies
+        run: python -m pip install -r backend/requirements-build.txt
+
+      - name: Validate Python runtime
+        run: |
+          python -m pip check
+          python -m unittest discover -s tests/python -p "test_*.py"
+
+      - name: Build standalone backend
+        run: python scripts/build-backend.py
+
+      - name: Smoke-test packaged backend and Argos
+        run: python scripts/smoke-backend.py --check-argos
+
+      - name: Upload packaged backend
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error

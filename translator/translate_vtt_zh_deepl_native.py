@@ -1735,7 +1735,11 @@ def main():
     ap = CliArgumentParser(description="Translate VTT using cloud APIs, Google Web, or local Argos models.")
     ap.add_argument("input", help="Path to input .vtt")
     ap.add_argument("--out", required=True, help="Path to output .vtt")
-    ap.add_argument("--key", default="", help="API key for selected provider; optional for Google Web and Argos")
+    ap.add_argument(
+        "--key",
+        default=os.getenv("TRANSLATOR_API_KEY", ""),
+        help="API key for selected provider; optional for Google Web and Argos",
+    )
     ap.add_argument(
         "--provider",
         default="deepl",
