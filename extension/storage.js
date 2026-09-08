@@ -9,7 +9,7 @@
     SIZE_MAP,
   } = ns.constants;
   const extensionApi = ns.browserApi;
-  const KEYLESS_PROVIDERS = new Set(["google-web"]);
+  const KEYLESS_PROVIDERS = new Set(["google-web", "argos"]);
   // Schema history:
   //   v2 – defaulted to Echo360 native CC injection (useNativeSubtitles=false).
   //   v3 – native CC injection demoted to an opt-in Beta; default is the
@@ -133,13 +133,24 @@
   async function setCacheStore(entryOrNull) {
     try {
       await extensionApi.storage.local.set({ [CACHE_KEY]: entryOrNull || null });
+      return { ok: true };
     } catch (err) {
-      console.warn("[echo360-translator] subtitle cache skipped:", err?.message || String(err));
+      const error = err instanceof Error ? err : new Error(String(err || "缓存写入失败"));
+      error.code = error.code || "CACHE_WRITE_FAILED";
+      console.error("[echo360-translator][storage] subtitle cache write failed", ns.errorUtils?.serializeError?.(error, { phase: "cache" }) || {
+        code: error.code,
+        message: error.message,
+      });
+      return { ok: false, error };
     }
   }
 
   function buildConfigSignature(cfg) {
     return JSON.stringify([
+      // Invalidate caches created before the strict result/error contract. A
+      // syntactically valid VTT from an older build may still contain only
+      // original text, so treating it as a fresh success would be misleading.
+      "cache-schema-v2",
       cfg.provider,
       cfg.model,
       cfg.endpoint || "",
@@ -184,8 +195,53 @@
       ? ""
       : (config.apiKeys?.[provider] ?? config.apiKey ?? "");
     const resolved = { ...config, apiKey: effectiveApiKey, apiKeys: config.apiKeys || {} };
+    // Restore the 1.4.2 Google Web speed profile for installations that were
+    // previously migrated to the temporary 3/3 or 24/6 safety profiles.
+    // Keep explicit non-safety settings untouched.
+    if (
+      provider === "google-web" &&
+      (
+        (Number(config.concurrency) === 3 && Number(config.rps) === 3) ||
+        (Number(config.concurrency) === 24 && Number(config.rps) === 6) ||
+        (Number(config.concurrency) === 24 && Number(config.rps) === 12) ||
+        (Number(config.concurrency) === 48 && Number(config.rps) === 12) ||
+        (Number(config.concurrency) === 1 && Number(config.rps) === 3)
+      )
+    ) {
+      resolved.concurrency = 96;
+      resolved.rps = 0;
+      try {
+        await extensionApi.storage.local.set({
+          [STORAGE_KEY]: { ...config, concurrency: 96, rps: 0 },
+        });
+        console.info("[echo360-translator][storage] restored 1.4.2 Google web speed settings", {
+          concurrency: 96,
+          rps: 0,
+        });
+      } catch (err) {
+        console.warn("[echo360-translator][storage] could not persist Google web rate migration", {
+          error: ns.errorUtils?.serializeError?.(err, { phase: "preferences" }) || {
+            code: "STORAGE_ERROR",
+            message: String(err?.message || err || "设置保存失败"),
+          },
+        });
+      }
+    }
+    if (!isLocalBackendEnabled() && provider === "argos") {
+      return {
+        ...resolved,
+        provider: "google-web",
+        model: "",
+        endpoint: "",
+        apiKey: "",
+        useLocalBackend: false,
+      };
+    }
     if (!isLocalBackendEnabled()) {
       return { ...resolved, useLocalBackend: false };
+    }
+    if (provider === "argos") {
+      return { ...resolved, useLocalBackend: true };
     }
     return resolved;
   }

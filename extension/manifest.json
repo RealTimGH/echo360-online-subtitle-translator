@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Echo360 Online Subtitle Translator",
-  "version": "1.4.3",
-  "description": "Translate Echo360 lecture subtitles and display them on recorded videos.",
+  "version": "1.5.0",
+  "description": "Translate Echo360 and Canvas Instructure Media lecture subtitles and display them on recorded videos.",
   "options_page": "options.html",
   "icons": {
     "16": "icons/icon16.png",
@@ -29,13 +29,14 @@
   "host_permissions": [
     "http://127.0.0.1:8765/*",
     "http://localhost:8765/*",
+    "http://[::1]:8765/*",
     "https://api.deepseek.com/*",
     "https://api.openai.com/*",
     "https://generativelanguage.googleapis.com/*",
     "https://translate.googleapis.com/*",
     "https://api-free.deepl.com/*",
     "https://api.deepl.com/*",
-    "*://canvas.sydney.edu.au/*",
+    "*://*.instructuremedia.com/*",
     "*://echo360.org/*",
     "*://*.echo360.org/*",
     "*://echo360.com/*",
@@ -48,7 +49,18 @@
   "content_scripts": [
     {
       "matches": [
-        "*://canvas.sydney.edu.au/*",
+        "*://canvas.sydney.edu.au/courses/*/pages/*",
+        "*://canvas.sydney.edu.au/courses/*/external_tools/*"
+      ],
+      "all_frames": false,
+      "js": [
+        "canvas_course_bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.instructuremedia.com/*",
         "*://echo360.org/*",
         "*://*.echo360.org/*",
         "*://echo360.com/*",
@@ -60,6 +72,7 @@
       ],
       "all_frames": true,
       "js": [
+        "assessment_guard.js",
         "page_probe.js"
       ],
       "run_at": "document_start",
@@ -67,7 +80,7 @@
     },
     {
       "matches": [
-        "*://canvas.sydney.edu.au/*",
+        "*://*.instructuremedia.com/*",
         "*://echo360.org/*",
         "*://*.echo360.org/*",
         "*://echo360.com/*",
@@ -79,9 +92,12 @@
       ],
       "all_frames": true,
       "js": [
+        "assessment_guard.js",
         "build_config.js",
         "browser_api.js",
         "constants.js",
+        "error_utils.js",
+        "host_support.js",
         "vtt.js",
         "transcript_model.js",
         "transcript_panel_adapter.js",
@@ -91,6 +107,7 @@
         "storage.js",
         "video.js",
         "source_finder.js",
+        "player_caption_renderer.js",
         "bilingual_dom_renderer.js",
         "renderer.js",
         "ui_theme.js",

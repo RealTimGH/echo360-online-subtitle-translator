@@ -150,7 +150,7 @@ bundle 直接证明：
 
 结论：真实 DOM 和实际 bundle 已经把 selector、搜索数据流、虚拟化和行高风险全部确认。Phase 0 取证完成，不再需要用户补充页面资料；实现必须包含能力受限的 rowHeight 扩展/虚拟滚动桥，不能停留在单纯 DOM append。
 
-### 3.5 翻译请求限速的最终决策（2026-08-25）
+### 3.5 翻译请求限速的最终决策（2026-08-26）
 
 本项目的默认 `google-web` provider 调用的是 `https://translate.googleapis.com/translate_a/single` 网页端点，而不是需要项目凭据的正式 Google Cloud Translation v2/v3 API。该网页端点没有公开、稳定、可依赖的官方 QPS 合同，因此不能把 Cloud API 的配额数字直接当作网页端点的安全上限。
 
@@ -158,15 +158,16 @@ bundle 直接证明：
 
 1. Google Cloud 官方文档说明正式 Cloud Translation 会同时实施内容配额和请求速率配额，并建议按请求大小控制延迟；正式 v3 API 的默认请求配额是每项目每分钟 6,000 次（约 100 RPS），但该数字只适用于正式 Cloud API，不适用于本项目的无 Key 网页端点。[Google Cloud Translation quotas and limits](https://docs.cloud.google.com/translate/quotas)
 2. Google 官方重试指南要求对可重试错误使用带 jitter 的截断指数退避，避免失败重试形成同步请求洪峰。[Google Cloud retry failed requests](https://docs.cloud.google.com/iam/docs/retry-strategy)
-3. 因为当前端点无公开稳定上限，不能把任何固定 RPS 宣称为“安全值”。在已验证 Safari 会因高并发出现 `Load failed`、同时用户反馈 `6 RPS` 过慢的前提下，最终采用“提高平滑请求节奏、不恢复旧版并发洪峰”的折中调整：
-   - 自动默认：`12 RPS`（请求之间约 `83.3ms`），约为上一版 6 RPS 的两倍吞吐。
-   - 并发上限：保持 `48` 个 worker；仍由 provider 专用 cap 限制，不允许旧配置中的 `96` 直接透传。
-   - 用户显式填写的正数 `rps`：继续尊重；`rps=0` 在 `google-web` 上表示使用上述受控默认值，而不是取消保护。
+3. 因为当前端点无公开稳定上限，不能把任何固定 RPS 宣称为“安全值”。在用户明确要求兼容 1.4.2 速度的前提下，恢复旧版的请求速度配置：
+   - 自动默认：`rps=0`，即不额外插入请求间隔；这是 1.4.2 的默认行为。
+   - 并发上限：恢复为 `96` 个 worker，与 1.4.2 一致。
+   - 用户显式填写的正数 `rps`：继续尊重；只有默认值 `0` 表示不启用请求间隔限速。
+   - `maxParagraphs=1` 仍保留，用于让每条字幕独立产生 partial VTT 更新；它不改变默认请求节奏。
    - 其他 provider：仍使用用户配置的 `rps`，不受这个 Google 专用默认值影响。
 
-对于当前约 1,395 个 cue 的课程，Google 网页端点通常是一 cue 一次请求；理想化的请求提交时间从 4 RPS 的约 349 秒、6 RPS 的约 233 秒，降至 12 RPS 的约 116 秒。实际时间仍会受到网络延迟、429/5xx、重试和拆分 fallback 影响。12 RPS 只是受控的吞吐折中，不是 Google 的官方配额或风控保证；48 worker 上限和至少两次重试继续保留。
+对于当前约 1,395 个 cue 的课程，Google 网页端点通常是一 cue 一次请求；恢复 1.4.2 后不再由扩展人为增加固定请求间隔，实际完成时间主要取决于网络延迟、并发请求响应、429/5xx、重试和拆分 fallback。`rps=0` 不是 Google 的官方配额或风控保证；96 worker 上限和失败重试仍由代码保留。
 
-代码位置：`extension/direct_translator.js` 的 `GOOGLE_WEB_DEFAULT_RPS`、`GOOGLE_WEB_CONCURRENCY_CAP` 和 `createRateLimiter()`；默认配置仍保留 `rps=0`，由 direct translator 在识别 `google-web` 后解析为 12 RPS。README 和设置页也已明确说明该 provider 的特殊语义。
+代码位置：`extension/direct_translator.js` 的 `GOOGLE_WEB_DEFAULT_RPS`、`GOOGLE_WEB_CONCURRENCY_CAP` 和 `createRateLimiter()`；默认配置为 `concurrency=96, rps=0`，direct translator 只有在用户显式传入正数 `rps` 时才插入请求间隔。README 和设置页也已明确说明该 provider 的特殊语义。
 
 ---
 

@@ -19,6 +19,7 @@ function setup() {
     getAllVideos: vi.fn(() => []),
     getVideoHintMediaIds: vi.fn(() => new Set()),
     extractMediaIdFromVttUrl: vi.fn(() => ""),
+    isVideoLikelyActive: vi.fn(() => false),
   };
   const ns = makeFullNs({ video: videoMock });
   window.Echo360Translator = ns;
@@ -68,7 +69,7 @@ describe("fetchTranscriptFileVtt", () => {
       "https://echo360.net.au/api/ui/echoplayer/lessons/abc/medias/media-1/transcript-file?format=vtt",
       { credentials: "include" }
     );
-    expect(result.text).toBe(VTT);
+    expect(result.text).toBe(VTT.trimEnd());
     expect(result.strongMapped).toBe(true);
     expect(result.sourceId).toContain("transcript-file");
     expect(result.sourceMeta.mediaId).toBe("media-1");
@@ -94,7 +95,7 @@ describe("fetchTranscriptFileVtt", () => {
     });
 
     const result = await sourceFinder.fetchTranscriptFileVtt({ currentTime: 0 });
-    expect(result.text).toBe(VTT);
+    expect(result.text).toBe(VTT.trimEnd());
     expect(result.sourceMeta.mediaId).toBe("good-id");
   });
 
@@ -171,6 +172,111 @@ describe("fetchTranscriptFileVtt", () => {
   });
 });
 
+describe("findBestTrackElement", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+    document.body.innerHTML = "";
+  });
+
+  it("ignores the empty mirrored track used by Instructure Media", () => {
+    const video = document.createElement("video");
+    const track = document.createElement("track");
+    track.label = "English";
+    track.kind = "subtitles";
+    video.appendChild(track);
+    document.body.appendChild(video);
+
+    expect(sourceFinder.findBestTrackElement(video)).toBeNull();
+  });
+});
+
+describe("fetchTextResource", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+    global.fetch = vi.fn();
+  });
+
+  it("uses the extension service worker when an Instructure caption request hits a CORS error", async () => {
+    setLocation("/lti-app/embed/perspective/player", "https://sydney.instructuremedia.com");
+    const sendMessage = vi.fn(async () => ({ ok: true, data: { text: VTT } }));
+    window.Echo360Translator.browserApi = { runtime: { sendMessage } };
+    global.fetch.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    const result = await sourceFinder.fetchTextResource(
+      "https://apse2.nv.instructuremedia.com/captions/c-123.vtt"
+    );
+
+    expect(result).toEqual({ ok: true, text: VTT, via: "service-worker" });
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "fetch-text-resource",
+      url: "https://apse2.nv.instructuremedia.com/captions/c-123.vtt",
+    });
+  });
+
+  it("does not proxy an arbitrary failed URL", async () => {
+    const sendMessage = vi.fn();
+    window.Echo360Translator.browserApi = { runtime: { sendMessage } };
+    global.fetch.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    const result = await sourceFinder.fetchTextResource("https://example.com/captions.vtt");
+
+    expect(result.ok).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchBestVttFromCandidates", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+    global.fetch = vi.fn();
+    Object.defineProperty(window, "performance", {
+      value: { getEntriesByType: vi.fn(() => []) },
+      configurable: true,
+    });
+  });
+
+  it("ignores Instructure caption JavaScript chunks and accepts the caption_files SRT endpoint", async () => {
+    const srt = "1\n00:00:01,250 --> 00:00:02,500\nHello\n";
+    window.performance.getEntriesByType.mockReturnValue([
+      { name: "https://files.instructuremedia.com/build/Captions.js", responseEnd: 30 },
+      { name: "https://files.instructuremedia.com/build/CaptionEditorRoute.js", responseEnd: 20 },
+      { name: "https://sydney.instructuremedia.com/api/media_management/caption_files/c-1", responseEnd: 10 },
+    ]);
+    global.fetch.mockImplementation(async (url) => {
+      if (url.includes("caption_files")) return { ok: true, text: async () => srt };
+      return { ok: true, text: async () => "not subtitles" };
+    });
+
+    const result = await sourceFinder.fetchBestVttFromCandidates({ currentTime: 1.5, duration: 3, paused: false });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(global.fetch.mock.calls[0][0]).toContain("caption_files");
+    expect(result.text).toContain("WEBVTT");
+    expect(result.text).toContain("00:00:01.250 --> 00:00:02.500");
+  });
+});
+
+describe("canonicalizeSourceId", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+  });
+
+  it("removes Instructure caption cache-busters but keeps the stable media URL", () => {
+    setLocation("/lti-app/embed/perspective/player", "https://sydney.instructuremedia.com");
+    expect(sourceFinder.canonicalizeSourceId(
+      "https://sydney.instructuremedia.com/api/media_management/caption_files/d9939fef-3aca-44c3-b09c-5df104819581-187306?1787725908057"
+    )).toBe(
+      "https://sydney.instructuremedia.com/api/media_management/caption_files/d9939fef-3aca-44c3-b09c-5df104819581-187306"
+    );
+  });
+
+  it("does not rewrite a normal caption query that may identify a variant", () => {
+    setLocation("/lti-app/embed/perspective/player", "https://sydney.instructuremedia.com");
+    const source = "https://sydney.instructuremedia.com/api/media_management/caption_files/media-1?lang=en";
+    expect(sourceFinder.canonicalizeSourceId(source)).toBe(source);
+  });
+});
+
 describe("hasNativeCaptionCapability", () => {
   beforeEach(() => {
     sourceFinder = setup();
@@ -183,6 +289,12 @@ describe("hasNativeCaptionCapability", () => {
 
   it("returns false when the video has no <track>, no textTracks, and no caption toggle button", () => {
     const video = { querySelectorAll: () => [], textTracks: [] };
+    expect(sourceFinder.hasNativeCaptionCapability(video)).toBe(false);
+  });
+
+  it("does not treat an empty mirrored <track> as a usable native caption source", () => {
+    const video = document.createElement("video");
+    video.appendChild(document.createElement("track"));
     expect(sourceFinder.hasNativeCaptionCapability(video)).toBe(false);
   });
 

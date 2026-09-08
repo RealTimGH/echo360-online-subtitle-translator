@@ -71,6 +71,7 @@ function setup({ managerShape = "direct", malformedNested = false } = {}) {
     value: { stateNode: list, return: null },
   });
   window.Echo360Translator = {};
+  evalModule("assessment_guard.js");
   evalModule("page_probe.js");
   const bridge = window.__echo360TranscriptPageBridge;
   const send = (data) => bridge.handleMessage({ source: window, data });

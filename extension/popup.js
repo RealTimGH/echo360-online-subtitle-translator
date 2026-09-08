@@ -1,69 +1,26 @@
 const STORAGE_KEY = "echo360TranslatorConfig";
 const buildConfig = globalThis.Echo360BuildConfig || {};
 const enableLocalBackend = buildConfig.enableLocalBackend !== false;
-
-const defaultConfig = {
-  apiKey: "",
-  useLocalBackend: false,
-  backendUrl: "http://127.0.0.1:8765",
-  provider: "google-web",
-  model: "",
-  endpoint: "",
-  target: "ZH",
-  maxParagraphs: 6,
-  maxChars: 1200,
-  concurrency: 96,
-  rps: 0,
-  retries: 1,
-  timeout: 10,
-  reasoningEffort: "",
-  fallbackMode: "immediate",
-  repairConcurrency: 1,
-  slowSplitThreshold: 0,
-  deepseekThinkingMode: "disabled",
-  deeplFormality: "",
-};
-
-const modelPresets = [
-  { provider: "google-web", model: "", endpoint: "", label: "Google Translate" },
-  { provider: "deepseek", model: "deepseek-v4-flash", endpoint: "", label: "DeepSeek - deepseek-v4-flash" },
-  { provider: "gemini", model: "gemini-3.1-flash-lite", endpoint: "", label: "Gemini - gemini-3.1-flash-lite" },
-  { provider: "openai", model: "gpt-5-nano", endpoint: "", label: "OpenAI - gpt-5-nano" },
-  { provider: "deepl", model: "", endpoint: "", label: "DeepL" },
-];
+const { DEFAULT_CONFIG: defaultConfig, createModelPresets, createErrorPresenter } =
+  globalThis.Echo360PreferencesUi;
+const modelPresets = createModelPresets({ includeLocalOnly: enableLocalBackend });
 const { isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = globalThis.Echo360ConfigKeys;
 const providerHints = {
   "google-web": "免费、无需 API Key，适合先试用；质量通常不如 AI/API 模型。",
   deepseek: "需要 DeepSeek API Key，适合更高质量字幕翻译；Thinking 默认关闭。",
   gemini: "需要 Gemini API Key，适合更高质量字幕翻译。",
   openai: "需要 OpenAI API Key，适合更高质量字幕翻译。",
-  deepl: "需要 DeepL API Key，适合常规机器翻译。"
+  deepl: "需要 DeepL API Key，适合常规机器翻译。",
+  argos: "本机离线翻译，无需 API Key；使用英语源字幕并需要本地后端和已安装模型。"
 };
 
-const extensionApi = globalThis.browser || globalThis.chrome;
-const usesPromiseApi = !!globalThis.browser && extensionApi === globalThis.browser;
-
-function storageGet(key) {
-  if (usesPromiseApi) return extensionApi.storage.local.get(key);
-  return new Promise((resolve, reject) => {
-    extensionApi.storage.local.get(key, (result) => {
-      const err = extensionApi.runtime?.lastError;
-      if (err) reject(new Error(err.message || String(err)));
-      else resolve(result);
-    });
-  });
-}
-
-function storageSet(items) {
-  if (usesPromiseApi) return extensionApi.storage.local.set(items);
-  return new Promise((resolve, reject) => {
-    extensionApi.storage.local.set(items, () => {
-      const err = extensionApi.runtime?.lastError;
-      if (err) reject(new Error(err.message || String(err)));
-      else resolve();
-    });
-  });
-}
+const extensionApi = globalThis.Echo360ExtensionApi;
+const errorPresenter = createErrorPresenter({ surface: "popup" });
+const typedPopupError = (errorLike, code = "STORAGE_ERROR") => errorPresenter.typed(errorLike, code);
+const clearError = () => errorPresenter.clear();
+const showError = (error, context = {}) => errorPresenter.show(error, context);
+const storageGet = (key) => extensionApi.storage.local.get(key);
+const storageSet = (items) => extensionApi.storage.local.set(items);
 
 function presetValue(preset) {
   return `${preset.provider}|${preset.model}|${preset.endpoint}`;
@@ -78,6 +35,11 @@ function findPreset(config) {
 }
 
 function ensurePresetOption(config) {
+  if (config.provider === "argos" && !enableLocalBackend) {
+    config.provider = defaultConfig.provider;
+    config.model = defaultConfig.model;
+    config.endpoint = defaultConfig.endpoint;
+  }
   if (isKeylessProvider(config.provider)) {
     config.model = "";
     config.endpoint = "";
@@ -119,10 +81,14 @@ function refreshProviderUi() {
   const apiKeyEl = document.getElementById("apiKey");
   document.getElementById("providerHint").textContent = providerHints[provider] || "";
   document.getElementById("apiKeyHint").textContent = isKeyless
-    ? "Google Translate 不需要 API Key；如果翻译质量不理想，请切换到 AI/API 模型。"
+    ? provider === "argos"
+      ? "Argos 不需要 API Key；会使用本机后端和已安装的离线模型。"
+      : "Google Translate 不需要 API Key；如果翻译质量不理想，请切换到 AI/API 模型。"
     : "API Key 只保存在 Chrome 本地 storage。";
   apiKeyEl.disabled = isKeyless;
-  apiKeyEl.placeholder = isKeyless ? "Google Translate 不需要 API Key" : "请输入你的 API Key";
+  apiKeyEl.placeholder = isKeyless
+    ? provider === "argos" ? "Argos 不需要 API Key" : "Google Translate 不需要 API Key"
+    : "请输入你的 API Key";
   if (isKeyless) {
     apiKeyEl.value = "";
     apiKeyEl.dataset.forProvider = "";
@@ -149,8 +115,10 @@ async function persistApiKeysOnly() {
     const { [STORAGE_KEY]: value } = await storageGet(STORAGE_KEY);
     const merged = { ...defaultConfig, ...(value || {}), apiKeys: { ...(value?.apiKeys || {}), ...localApiKeys } };
     await storageSet({ [STORAGE_KEY]: merged });
-  } catch (_) {
-    // Best-effort only; an explicit "保存" click still persists everything.
+  } catch (error) {
+    const typed = typedPopupError(error);
+    console.error("[echo360-translator][popup] API key persistence failed", globalThis.Echo360Error?.serializeError?.(typed, { phase: "preferences" }) || typed);
+    showError(typed, { phase: "preferences", code: "STORAGE_ERROR" });
   }
 }
 
@@ -172,12 +140,17 @@ extensionApi.storage.onChanged.addListener((changes, area) => {
 });
 
 function openOptionsPage() {
-  if (extensionApi.runtime?.openOptionsPage) {
+  try {
     const result = extensionApi.runtime.openOptionsPage();
-    if (result && typeof result.catch === "function") result.catch(() => {});
-    return;
+    if (result) {
+      if (result && typeof result.catch === "function") result.catch((error) => showError(typedPopupError(error, "RUNTIME_MESSAGE_ERROR"), { phase: "preferences" }));
+      return;
+    }
+    const fallback = extensionApi.tabs.create({ url: extensionApi.runtime.getURL("options.html") });
+    if (fallback && typeof fallback.catch === "function") fallback.catch((error) => showError(typedPopupError(error, "RUNTIME_MESSAGE_ERROR"), { phase: "preferences" }));
+  } catch (error) {
+    showError(typedPopupError(error, "RUNTIME_MESSAGE_ERROR"), { phase: "preferences" });
   }
-  extensionApi.tabs?.create?.({ url: extensionApi.runtime.getURL("options.html") });
 }
 
 async function saveConfig() {
@@ -185,7 +158,7 @@ async function saveConfig() {
   const saveBtn = document.getElementById("saveBtn");
   saveBtn.disabled = true;
   status.textContent = "";
-  status.style.color = "";
+  clearError();
 
   try {
     const { [STORAGE_KEY]: value } = await storageGet(STORAGE_KEY);
@@ -201,14 +174,13 @@ async function saveConfig() {
       model,
       endpoint,
       ...resolveForSave(mergedKeys, provider),
-      useLocalBackend: enableLocalBackend && !!(value || {}).useLocalBackend,
+      useLocalBackend: enableLocalBackend && (provider === "argos" || !!(value || {}).useLocalBackend),
     };
     await storageSet({ [STORAGE_KEY]: config });
     status.textContent = "已保存";
-    status.style.color = "";
+    status.classList.remove("error");
   } catch (err) {
-    status.textContent = `保存失败：${err?.message || String(err)}`;
-    status.style.color = "#a22";
+    showError(err, { phase: "preferences", code: "STORAGE_ERROR" });
   } finally {
     saveBtn.disabled = false;
   }
@@ -216,6 +188,9 @@ async function saveConfig() {
 
 document.getElementById("saveBtn").addEventListener("click", saveConfig);
 document.getElementById("optionsBtn").addEventListener("click", openOptionsPage);
+document.querySelector(".error-card-copy").addEventListener("click", async (event) => {
+  await errorPresenter.copyDiagnostics(event.currentTarget);
+});
 document.getElementById("modelPreset").addEventListener("change", () => {
   // Before switching, stash whatever the user typed for the previous provider
   // and persist it immediately so it survives even without an explicit save.
@@ -233,7 +208,5 @@ document.getElementById("apiKey").addEventListener("change", (event) => {
   persistApiKeysOnly();
 });
 loadConfig().catch((err) => {
-  const status = document.getElementById("status");
-  status.textContent = `加载失败：${err?.message || String(err)}`;
-  status.style.color = "#a22";
+  showError(typedPopupError(err), { phase: "preferences", code: "STORAGE_ERROR" });
 });

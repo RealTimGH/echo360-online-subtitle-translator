@@ -96,6 +96,25 @@ describe("cueTextToLine", () => {
   });
 });
 
+describe("normalizeTimedText", () => {
+  it("keeps WebVTT input and normalizes line endings", () => {
+    const input = "WEBVTT\r\n\r\n00:00:01.000 --> 00:00:02.000\r\nHello\r\n";
+    expect(vtt.normalizeTimedText(input)).toBe("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello");
+  });
+
+  it("converts Instructure Media SRT timestamps to WebVTT", () => {
+    const srt = "1\n00:00:01,250 --> 00:00:02,500\nHello\n";
+    const normalized = vtt.normalizeTimedText(srt);
+    expect(normalized).toContain("WEBVTT");
+    expect(normalized).toContain("00:00:01.250 --> 00:00:02.500");
+    expect(vtt.parseVttStats(normalized)).toMatchObject({ cueCount: 1, maxEnd: 2.5 });
+  });
+
+  it("returns empty for non-timed content", () => {
+    expect(vtt.normalizeTimedText("<html>not subtitles</html>")).toBe("");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // parseVttStats
 // ---------------------------------------------------------------------------
@@ -129,6 +148,11 @@ describe("parseVttStats", () => {
     const s = vtt.parseVttStats(SIMPLE_VTT);
     expect(s.cueCount).toBe(2);
     expect(s.maxEnd).toBeCloseTo(10.5);
+  });
+
+  it("accepts the legal short MM:SS.mmm WebVTT timestamp form", () => {
+    const s = vtt.parseVttStats("WEBVTT\n\n00:05.000 --> 00:07.500\nShort timestamp\n");
+    expect(s).toMatchObject({ cueCount: 1, maxEnd: 7.5 });
   });
 
   it("does NOT update maxEnd when second cue ends earlier (e ≤ maxEnd branch)", () => {
@@ -511,6 +535,27 @@ World
 
   it("marks still-pending cues with a failure label when translation aborts", () => {
     const preview = vtt.buildIncrementalPreviewVtt(ORIG, ORIG, { placeholder: "[翻译失败]" });
+    expect(preview).toContain("[翻译失败]");
+    expect(preview).not.toContain("正在翻译中...");
+  });
+
+  it("marks only explicitly failed cues while preserving translated cues", () => {
+    const partial = `WEBVTT
+
+1
+00:00:00.000 --> 00:00:02.000
+你好
+
+2
+00:00:02.000 --> 00:00:04.000
+World
+
+`;
+    const preview = vtt.buildIncrementalPreviewVtt(partial, ORIG, {
+      failedCues: [2],
+      failureLabel: "[翻译失败]",
+    });
+    expect(preview).toContain("你好");
     expect(preview).toContain("[翻译失败]");
     expect(preview).not.toContain("正在翻译中...");
   });

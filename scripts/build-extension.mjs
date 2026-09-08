@@ -8,15 +8,7 @@ const repoRoot = path.resolve(__dirname, "..");
 const extensionDir = path.join(repoRoot, "extension");
 const distDir = path.join(repoRoot, "dist");
 
-const targetArg = process.argv[2] || "all";
-const targets = targetArg === "all" ? ["store", "dev"] : [targetArg];
 const validTargets = new Set(["store", "dev"]);
-
-for (const target of targets) {
-  if (!validTargets.has(target)) {
-    throw new Error(`Unknown build target: ${target}`);
-  }
-}
 
 function toZipPath(filePath) {
   return filePath.split(path.sep).join("/");
@@ -154,49 +146,50 @@ async function createZip(sourceDir, zipPath) {
   await fs.writeFile(zipPath, Buffer.concat([...chunks, ...centralChunks, end]));
 }
 
-async function writeBuildConfig(outputDir, target) {
-  const enableLocalBackend = target === "dev";
-  const content = `(() => {
+function buildConfigContent(target) {
+  // Keep the local backend available in both development and store builds.
+  // Safari's containing-app build consumes the store resources, so disabling
+  // this here would make the local backend unreachable from Safari.
+  const enableLocalBackend = true;
+  return `(() => {
   globalThis.Echo360BuildConfig = {
     buildTarget: ${JSON.stringify(target)},
     enableLocalBackend: ${JSON.stringify(enableLocalBackend)},
   };
 })();
 `;
-  await fs.writeFile(path.join(outputDir, "build_config.js"), content);
+}
+
+async function writeBuildConfig(outputDir, target) {
+  await fs.writeFile(path.join(outputDir, "build_config.js"), buildConfigContent(target));
+}
+
+function manifestForTarget(sourceManifest, target) {
+  const manifest = structuredClone(sourceManifest);
+
+  if (target !== "store") {
+    manifest.name = `${manifest.name} (Dev)`;
+  }
+
+  return manifest;
 }
 
 async function patchManifest(outputDir, target) {
   const manifestPath = path.join(outputDir, "manifest.json");
-  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-
-  if (target === "store") {
-    manifest.host_permissions = (manifest.host_permissions || []).filter((permission) =>
-      !permission.startsWith("http://127.0.0.1") &&
-      !permission.startsWith("http://localhost")
-    );
-  } else {
-    manifest.name = `${manifest.name} (Dev)`;
-  }
-
+  const sourceManifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  const manifest = manifestForTarget(sourceManifest, target);
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+function optionsHtmlForTarget(sourceHtml, target) {
+  return sourceHtml;
 }
 
 async function patchStoreFiles(outputDir, target) {
   if (target !== "store") return;
-
   const optionsPath = path.join(outputDir, "options.html");
-  const optionsHtml = await fs.readFile(optionsPath, "utf8");
-  const strippedOptionsHtml = optionsHtml
-    .replace(
-      /\n\s*<!-- LOCAL_BACKEND_START -->[\s\S]*?<!-- LOCAL_BACKEND_END -->\n?/,
-      "\n"
-    )
-    .replace(
-      /\n\s*<!-- DEV_ADVANCED_START -->[\s\S]*?<!-- DEV_ADVANCED_END -->\n?/,
-      "\n"
-    );
-  await fs.writeFile(optionsPath, strippedOptionsHtml);
+  const sourceHtml = await fs.readFile(optionsPath, "utf8");
+  await fs.writeFile(optionsPath, optionsHtmlForTarget(sourceHtml, target));
 }
 
 async function buildTarget(target) {
@@ -217,6 +210,19 @@ async function buildTarget(target) {
   console.log(`  ${path.relative(repoRoot, zipPath)}`);
 }
 
-for (const target of targets) {
-  await buildTarget(target);
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+  const targetArg = process.argv[2] || "all";
+  const targets = targetArg === "all" ? ["store", "dev"] : [targetArg];
+  for (const target of targets) {
+    if (!validTargets.has(target)) {
+      throw new Error(`Unknown build target: ${target}`);
+    }
+  }
+  for (const target of targets) {
+    await buildTarget(target);
+  }
 }
+
+export { buildConfigContent, manifestForTarget, optionsHtmlForTarget };

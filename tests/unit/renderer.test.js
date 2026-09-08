@@ -15,7 +15,7 @@ const TRANS_VTT = `WEBVTT
 
 `;
 
-function setupRenderer({ domMountResult = true, buildBilingualVtt } = {}) {
+function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaptionRenderer } = {}) {
   document.body.innerHTML = "";
   document.head.innerHTML = "";
   let objectUrlId = 0;
@@ -78,6 +78,7 @@ function setupRenderer({ domMountResult = true, buildBilingualVtt } = {}) {
       setVisible: vi.fn(),
       applySize: vi.fn(),
     },
+    playerCaptionRenderer,
     storage: {
       getPrefs: vi.fn(async () => ({ enabled: true, useNativeSubtitles: false })),
     },
@@ -211,6 +212,65 @@ Partial
     expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false, { incremental: true })).toBe(true);
     expect(domMount).toHaveBeenCalledOnce();
     expect(domUpdate).toHaveBeenCalledOnce();
+  });
+});
+
+describe("renderer Canvas Instructure Media mode", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("mounts and incrementally updates the extension-owned Vidstack caption adapter", () => {
+    let mounted = false;
+    const playerCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => mounted),
+      mount: vi.fn(() => {
+        mounted = true;
+        return true;
+      }),
+      update: vi.fn(() => true),
+      unmount: vi.fn(() => {
+        mounted = false;
+      }),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({ playerCaptionRenderer });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+    expect(playerCaptionRenderer.mount).toHaveBeenCalledWith(expect.objectContaining({
+      video,
+      originalVtt: ORIG_VTT,
+      translatedVtt: TRANS_VTT,
+      bilingual: false,
+    }));
+    expect(video.querySelectorAll("track").length).toBe(0);
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true, { incremental: true })).toBe(true);
+    expect(playerCaptionRenderer.update).toHaveBeenCalledWith(expect.objectContaining({
+      video,
+      originalVtt: ORIG_VTT,
+      translatedVtt: TRANS_VTT,
+    }));
+  });
+
+  it("does not claim success through an HTML track when the custom adapter cannot mount", () => {
+    const playerCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => false),
+      mount: vi.fn(() => false),
+      update: vi.fn(() => false),
+      unmount: vi.fn(),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({ playerCaptionRenderer });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(false);
+    expect(video.querySelector('track[data-echo360-translated="1"]')).toBeNull();
   });
 });
 

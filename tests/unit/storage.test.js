@@ -129,6 +129,12 @@ describe("askApiKeyIfNeeded", () => {
     expect(result.apiKey).toBe("");
   });
 
+  it("returns config with empty apiKey for local Argos", async () => {
+    const cfg = { provider: "argos", apiKey: "stale-key" };
+    const result = await storage.askApiKeyIfNeeded(cfg);
+    expect(result.apiKey).toBe("");
+  });
+
   it("returns config unchanged when provider has apiKey", async () => {
     const cfg = { provider: "deepseek", apiKey: "sk-abc123" };
     const result = await storage.askApiKeyIfNeeded(cfg);
@@ -163,11 +169,60 @@ describe("getConfig", () => {
     expect(cfg.useLocalBackend).toBe(false);
   });
 
+  it("falls back to Google Web when a store build sees a stale Argos setting", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: { provider: "argos", useLocalBackend: true },
+      },
+      enableLocalBackend: false,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg).toMatchObject({
+      provider: "google-web",
+      model: "",
+      endpoint: "",
+      apiKey: "",
+      useLocalBackend: false,
+    });
+  });
+
+  it("forces the local backend on for Argos in a development build", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: { provider: "argos", useLocalBackend: false, apiKey: "stale" },
+      },
+      enableLocalBackend: true,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.useLocalBackend).toBe(true);
+    expect(cfg.apiKey).toBe("");
+  });
+
   it("returns default config when nothing is stored", async () => {
     const { storage } = setupStorage({ storageData: {} });
     const cfg = await storage.getConfig();
     expect(cfg.provider).toBe("google-web");
     expect(cfg.target).toBe("ZH");
+    expect(cfg.concurrency).toBe(96);
+    expect(cfg.rps).toBe(0);
+  });
+
+  it("restores the 1.4.2 Google 96/0 profile from the temporary 3/3 profile", async () => {
+    const { storage, localMock } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "google-web",
+          concurrency: 3,
+          rps: 3,
+        },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.concurrency).toBe(96);
+    expect(cfg.rps).toBe(0);
+    expect(localMock.set).toHaveBeenCalledWith({
+      echo360TranslatorConfig: expect.objectContaining({ concurrency: 96, rps: 0 }),
+    });
   });
 
   it("resolves apiKey from apiKeys[provider] map (per-provider key storage)", async () => {
@@ -604,10 +659,13 @@ describe("setCacheStore", () => {
     expect(localMock.set).toHaveBeenCalledWith({ echo360TranslatedVttCache: null });
   });
 
-  it("does not throw when storage.set rejects (error is swallowed)", async () => {
+  it("returns a typed warning when storage.set rejects", async () => {
     const { storage, localMock } = setupStorage();
     localMock.set.mockRejectedValueOnce(new Error("quota exceeded"));
-    await expect(storage.setCacheStore({ x: 1 })).resolves.toBeUndefined();
+    await expect(storage.setCacheStore({ x: 1 })).resolves.toEqual(expect.objectContaining({
+      ok: false,
+      error: expect.objectContaining({ code: "CACHE_WRITE_FAILED" }),
+    }));
   });
 });
 

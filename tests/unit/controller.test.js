@@ -155,7 +155,29 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(panel.setTranslation).toHaveBeenCalledWith(expect.objectContaining({ target: "ZH" }));
   });
 
-  it("does not rediscover or retranslate an existing track while the panel is disabled", async () => {
+  it("reports a Transcript panel failure as a warning without hiding a mounted video track", () => {
+    const { ns, video } = setupControllerWithRenderer();
+    const warning = [];
+    ns.transcriptPanelRenderer = {
+      setVisible: vi.fn(),
+      setTranslation: vi.fn(() => { throw Object.assign(new Error("panel bridge failed"), { code: "TRANSCRIPT_BRIDGE_FAILED" }); }),
+    };
+
+    const mounted = ns.controller.renderTranslationSurfaces({
+      translatedVtt: TRANS_VTT,
+      originalVtt: ORIG_VTT,
+      prefs: { enabled: true, transcriptPanelEnabled: true, bilingual: false, reverseOrder: false, size: "medium", useNativeSubtitles: true, target: "ZH" },
+      sourceMeta: { sourceId: "source", sessionKey: "source::cfg" },
+      onSurfaceWarning: (error) => warning.push(error),
+    });
+
+    expect(mounted).toBe(true);
+    expect(video.querySelector('track[data-echo360-translated="1"]')).not.toBeNull();
+    expect(warning).toHaveLength(1);
+    expect(warning[0]).toMatchObject({ code: "TRANSCRIPT_BRIDGE_FAILED", phase: "render" });
+  });
+
+  it("does not trust a DOM-only translated track and revalidates the current source", async () => {
     const { ns } = setupControllerWithRenderer();
     ns.renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false);
     const resolveSourceVtt = vi.fn();
@@ -178,6 +200,6 @@ describe("controller track sync in Echo360 native CC mode", () => {
     await ns.controller.init();
     expect(callbacks?.onTranslate).toEqual(expect.any(Function));
     await callbacks.onTranslate();
-    expect(resolveSourceVtt).not.toHaveBeenCalled();
+    expect(resolveSourceVtt).toHaveBeenCalledOnce();
   });
 });

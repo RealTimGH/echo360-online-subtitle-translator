@@ -3,7 +3,7 @@
 (() => {
   const root = globalThis;
 
-  const KEYLESS_PROVIDERS = new Set(["google-web"]);
+  const KEYLESS_PROVIDERS = new Set(["google-web", "argos"]);
 
   function isKeylessProvider(provider) {
     return KEYLESS_PROVIDERS.has(provider);

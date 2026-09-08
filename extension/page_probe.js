@@ -1,4 +1,7 @@
 (() => {
+  const assessmentGuard = window.Echo360AssessmentGuard;
+  function installAllowedPageProbes() {
+(() => {
   if (window.__echo360Probe && window.__echo360Probe.installed) return;
 
   const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
@@ -262,6 +265,27 @@
   let lifecycleObserver = null;
   let lastInstallFailure = null;
 
+  const BRIDGE_ERROR_CODES = {
+    "panel-not-found": "TRANSCRIPT_PANEL_NOT_FOUND",
+    "multiple-panels": "TRANSCRIPT_PANEL_AMBIGUOUS",
+    "list-host-not-found": "TRANSCRIPT_LIST_NOT_FOUND",
+    "react-fiber-not-found": "TRANSCRIPT_REACT_FIBER_NOT_FOUND",
+    "react-list-not-found": "TRANSCRIPT_REACT_LIST_NOT_FOUND",
+    "react-grid-not-found": "TRANSCRIPT_REACT_GRID_NOT_FOUND",
+    "react-grid-row-count-mismatch": "TRANSCRIPT_ROW_COUNT_MISMATCH",
+    "host-row-count-exceeds-model": "TRANSCRIPT_ROW_COUNT_MISMATCH",
+    "row-manager-not-found-or-invalid": "TRANSCRIPT_ROW_MANAGER_INVALID",
+    "row-manager-getter-mismatch": "TRANSCRIPT_ROW_MANAGER_INVALID",
+    "manager-row-count-mismatch": "TRANSCRIPT_ROW_COUNT_MISMATCH",
+    "bridge-install-failed": "TRANSCRIPT_BRIDGE_INSTALL_FAILED",
+    "binding-changed": "TRANSCRIPT_BRIDGE_BINDING_CHANGED",
+    "binding-inconsistent": "TRANSCRIPT_BRIDGE_BINDING_INCONSISTENT",
+    "state-not-found": "TRANSCRIPT_BRIDGE_STATE_NOT_FOUND",
+    "layout-configure-failed": "TRANSCRIPT_LAYOUT_CONFIGURE_FAILED",
+    "layout-recompute-failed": "TRANSCRIPT_LAYOUT_RECOMPUTE_FAILED",
+    "stale-revision": "TRANSCRIPT_BRIDGE_STALE_REVISION",
+  };
+
   const isFiniteInt = (value) => Number.isInteger(value) && Number.isFinite(value);
   const isOpaqueId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_.:-]+$/.test(value);
 
@@ -439,6 +463,10 @@
       ok: !!ok,
       ...extra,
     };
+    if (!payload.ok) {
+      payload.code = payload.code || BRIDGE_ERROR_CODES[payload.error] || "TRANSCRIPT_BRIDGE_FAILED";
+      payload.phase = payload.phase || "render";
+    }
     try {
       window.postMessage(payload, "*");
     } catch (_) {}
@@ -997,4 +1025,16 @@
   };
   // Alias retained for diagnostics/tools that use the shorter historical name.
   window.__echo360TranscriptBridge = window.__echo360TranscriptPageBridge;
+})();
+  }
+
+  if (assessmentGuard?.isAllowedDocument?.()) {
+    installAllowedPageProbes();
+    return;
+  }
+  Promise.resolve(assessmentGuard?.verifyAllowedDocument?.())
+    .then((allowed) => {
+      if (allowed) installAllowedPageProbes();
+    })
+    .catch(() => {});
 })();

@@ -1,0 +1,6 @@
+-r requirements.txt
+# Argos leaves spaCy unbounded. Pin the newest release that still publishes
+# CPython 3.9 wheels for macOS ARM64, which is the repository's supported
+# system-Python baseline; otherwise pip falls back to a slow, failing source build.
+spacy==3.7.5
+argostranslate==1.11.0

@@ -12,6 +12,10 @@
   let lastTranslatedTrack = null;
   let lastRenderedVtt = "";
   let lastOriginalVtt = "";
+  // A translated DOM node can survive a SPA transition or extension
+  // reinjection. Track the video that actually accepted the last successful
+  // render so callers can distinguish a current render from a DOM remnant.
+  let lastRenderedVideo = null;
   let styleEl = null;
   let lastRenderPrefs = {
     bilingual: false,
@@ -92,6 +96,7 @@
       }
     `;
     ns.bilingualDomRenderer?.applySize(normalizedSize);
+    ns.playerCaptionRenderer?.applySize(normalizedSize);
   }
 
   function shouldShowTranslatedTrackForVideo(video, videos = ns.video.getAllVideos()) {
@@ -132,6 +137,10 @@
   }
 
   function applySubtitleVisibility(enabled) {
+    if (ns.playerCaptionRenderer?.isMounted()) {
+      ns.playerCaptionRenderer.setVisible(enabled);
+      return;
+    }
     if (ns.bilingualDomRenderer?.isMounted()) {
       ns.bilingualDomRenderer.setVisible(enabled);
       return;
@@ -171,6 +180,9 @@
   }
 
   function ensureTrackOnPrimaryVideo() {
+    if (ns.playerCaptionRenderer?.isMounted()) {
+      if (ns.playerCaptionRenderer.ensureMounted() !== false) return;
+    }
     if (ns.bilingualDomRenderer?.isMounted()) {
       ns.bilingualDomRenderer.ensureMounted();
       return;
@@ -180,7 +192,7 @@
       if (target) {
         const p = pendingMount;
         pendingMount = null;
-        renderTranslatedTrack(
+        const mounted = renderTranslatedTrack(
           p.translatedVtt,
           p.originalVtt,
           p.bilingual,
@@ -190,8 +202,10 @@
           p.useNativeSubtitles,
           { browserBilingual: p.browserBilingual, browserReverseOrder: p.browserReverseOrder }
         );
-        ns.ui?.setStatusText("已找到匹配视频，字幕已自动显示");
-        ns.ui?.updateActionButtons("翻译字幕已加载");
+        if (mounted) {
+          ns.ui?.setStatusText("已找到匹配视频，字幕已自动显示");
+          ns.ui?.updateActionButtons("翻译字幕已加载");
+        }
         return;
       }
     }
@@ -210,6 +224,7 @@
   }
 
   function deactivateTranslatedRenderers() {
+    ns.playerCaptionRenderer?.unmount();
     ns.bilingualDomRenderer?.unmount();
     for (const video of ns.video.getAllVideos()) {
       for (const track of video.textTracks) {
@@ -217,9 +232,11 @@
       }
     }
     lastTranslatedTrack = null;
+    lastRenderedVideo = null;
   }
 
   function cleanupTranslatedTracks() {
+    pendingMount = null;
     deactivateTranslatedRenderers();
     removeTranslatedTrackElements();
   }
@@ -234,6 +251,7 @@
   }
 
   function hasRenderedTranslatedTrack() {
+    if (ns.playerCaptionRenderer?.isMounted()) return true;
     if (ns.bilingualDomRenderer?.isMounted()) return true;
     return ns.video
       .querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]')
@@ -263,6 +281,24 @@
     return state;
   }
 
+  function commitRenderState({ translatedVtt, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual, browserReverseOrder, sourceMeta, video }) {
+    // Commit the cache/success marker only after a renderer has actually
+    // mounted or updated. An attempted mount that returns false must not make
+    // the controller believe that subtitles are already visible.
+    lastRenderedVtt = translatedVtt;
+    lastOriginalVtt = originalVtt;
+    lastRenderPrefs = {
+      bilingual: !!bilingual,
+      size: size || DEFAULT_SUBTITLE_SIZE,
+      reverseOrder: !!reverseOrder,
+      useNativeSubtitles: !!useNativeSubtitles,
+      browserBilingual: !!browserBilingual,
+      browserReverseOrder: !!browserReverseOrder,
+    };
+    lastRenderSourceMeta = sourceMeta;
+    lastRenderedVideo = video;
+  }
+
   function renderTranslatedTrack(
     translatedVtt,
     originalVtt,
@@ -274,6 +310,10 @@
     renderOptions = {}
   ) {
     const incremental = !!renderOptions.incremental;
+    // Clear the success marker before even attempting video discovery. A
+    // missing video must not leave an older DOM render eligible for a fast
+    // success path.
+    lastRenderedVideo = null;
     // Native CC mode forces bilingual=true/reverseOrder=false on its `bilingual`/
     // `reverseOrder` params (it only ever injects one translated line, so
     // those controls are disabled while native CC injection is active) - that
@@ -307,6 +347,9 @@
     if (renderOptions.previewPending) {
       normalizedTranslated = ns.vtt.buildIncrementalPreviewVtt(normalizedTranslated, originalVtt, {
         placeholder: renderOptions.pendingLabel || SUBTITLE_PENDING_LABEL,
+        failureLabel: renderOptions.failureLabel,
+        failedCues: renderOptions.failedCues,
+        markPending: renderOptions.markPending,
       });
     }
     const rawPayload = bilingual
@@ -318,23 +361,72 @@
       })
       : normalizedTranslated;
     const payload = ns.vtt.applyCueBottom(rawPayload, size);
-    lastRenderedVtt = normalizedTranslated;
-    lastOriginalVtt = originalVtt;
-    lastRenderPrefs = {
-      bilingual: !!bilingual,
-      size: size || DEFAULT_SUBTITLE_SIZE,
-      reverseOrder: !!reverseOrder,
-      useNativeSubtitles: !!useNativeSubtitles,
-      browserBilingual: !!fallbackBilingual,
-      browserReverseOrder: !!fallbackReverseOrder,
-    };
-    lastRenderSourceMeta = resolvedSourceMeta;
 
+    const customCaptionMode = ns.playerCaptionRenderer?.isSupportedVideo?.(video) === true;
     const nativeDomMode = bilingual && !useNativeSubtitles;
     if (!incremental) {
       deactivateTranslatedRenderers();
-    } else if (ns.bilingualDomRenderer?.isMounted() && !nativeDomMode) {
+    } else if (ns.playerCaptionRenderer?.isMounted() && !customCaptionMode) {
+      ns.playerCaptionRenderer.unmount();
+    } else if (ns.bilingualDomRenderer?.isMounted() && !nativeDomMode && !customCaptionMode) {
       ns.bilingualDomRenderer.unmount();
+    }
+
+    // Canvas embeds Instructure Media's Vidstack player. The underlying
+    // <video> track is only a mirror; Vidstack renders captions in its own
+    // [data-part="captions"] surface. Mount an independent timed overlay as a
+    // player child so translation-only mode remains visible even when that
+    // native surface is hidden by the CC toggle, while keeping the same VTT
+    // timing and incremental update lifecycle.
+    if (customCaptionMode) {
+      const displayBilingual = !!fallbackBilingual;
+      if (incremental && ns.playerCaptionRenderer.isMounted()) {
+        if (ns.playerCaptionRenderer.update({
+          video,
+          originalVtt,
+          translatedVtt: normalizedTranslated,
+          size,
+          bilingual: displayBilingual,
+          reverseOrder: fallbackReverseOrder,
+        })) {
+          lastTranslatedTrack = { mode: "instructure-caption" };
+          commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+          return true;
+        }
+        // An incremental update can fail after a SPA/player transition. Try
+        // a fresh mount before declaring the render unavailable.
+        ns.playerCaptionRenderer.unmount();
+      }
+      const mounted = ns.playerCaptionRenderer.mount({
+        video,
+        originalVtt,
+        translatedVtt: normalizedTranslated,
+        size,
+        bilingual: displayBilingual,
+        reverseOrder: fallbackReverseOrder,
+      });
+      if (mounted) {
+        lastTranslatedTrack = { mode: "instructure-caption" };
+        commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+        return true;
+      }
+      // A normal HTML <track> is not a valid fallback for this custom player:
+      // Vidstack owns its caption rendering and may ignore a track appended
+      // after initialization. Keep the mount pending so periodic sync can
+      // retry after a SPA/player-root transition, and never report a false
+      // success for subtitles that cannot be seen.
+      pendingMount = {
+        translatedVtt,
+        originalVtt,
+        bilingual: !!bilingual,
+        size: size || DEFAULT_SUBTITLE_SIZE,
+        reverseOrder: !!reverseOrder,
+        sourceMeta: resolvedSourceMeta,
+        useNativeSubtitles: !!useNativeSubtitles,
+        browserBilingual: !!fallbackBilingual,
+        browserReverseOrder: !!fallbackReverseOrder,
+      };
+      return false;
     }
 
     if (nativeDomMode) {
@@ -346,9 +438,10 @@
           reverseOrder,
         })) {
           lastTranslatedTrack = { mode: "bilingual-dom" };
+          commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
           return true;
         }
-        return false;
+        ns.bilingualDomRenderer.unmount();
       }
       removeTranslatedTrackElements();
       const mounted = ns.bilingualDomRenderer?.mount({
@@ -370,6 +463,7 @@
       });
       if (mounted) {
         lastTranslatedTrack = { mode: "bilingual-dom" };
+        commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
         return true;
       }
       // mount() refused synchronously — most commonly because the
@@ -409,7 +503,7 @@
     if (!incremental) {
       const mountedVideoHintIds = Array.from(ns.video.getVideoHintMediaIds(video));
       console.log("[echo360-translator] mounted translated track:", {
-        sourceId: resolvedSourceMeta.sourceId,
+        sourceId: ns.errorUtils?.redactUrl?.(resolvedSourceMeta.sourceId) || resolvedSourceMeta.sourceId,
         mediaId: resolvedSourceMeta.mediaId,
         mapSource: resolvedSourceMeta.mapSource || "",
         sourceMaxEnd: Math.round(resolvedSourceMeta.stats?.maxEnd || 0),
@@ -421,6 +515,7 @@
     }
     lastTranslatedTrack = track;
     if (track.track) track.track.mode = "showing";
+    commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
     setTimeout(() => {
       if (lastTranslatedTrack !== track || ns.bilingualDomRenderer?.isMounted()) return;
       ns.storage.getPrefs().then((prefs) => {
@@ -437,6 +532,7 @@
       lastTranslatedTrack,
       lastRenderedVtt,
       lastOriginalVtt,
+      lastRenderedVideo,
       lastRenderPrefs,
       lastRenderSourceMeta,
     };

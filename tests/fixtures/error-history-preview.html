@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Error history preview</title>
+  <style>
+    html, body { min-height: 100%; margin: 0; }
+    body {
+      background:
+        linear-gradient(115deg, rgba(8, 18, 34, .35), rgba(3, 8, 18, .92)),
+        radial-gradient(circle at 35% 28%, #56708c, #101c2b 52%, #070b12 100%);
+      color: #fff;
+      font: 15px/1.5 ui-sans-serif, system-ui, sans-serif;
+    }
+    .preview-copy {
+      width: min(620px, calc(100vw - 460px));
+      padding: 11vh 7vw;
+      color: rgba(255, 255, 255, .78);
+    }
+    .preview-copy h1 { color: #fff; font-size: clamp(28px, 5vw, 58px); line-height: 1.05; }
+    .preview-copy p { max-width: 48ch; }
+  </style>
+</head>
+<body>
+  <main class="preview-copy">
+    <h1>Subtitle diagnostics preview</h1>
+    <p>用于验证常驻运行诊断、普通日志、错误、警告、重复记录、筛选器和诊断详情在真实浏览器中的视觉层级。</p>
+  </main>
+  <script src="/extension/constants.js"></script>
+  <script src="/extension/error_utils.js"></script>
+  <script src="/extension/ui_theme.js"></script>
+  <script src="/extension/ui_styles.js"></script>
+  <script src="/extension/ui_panel.js"></script>
+  <script src="/extension/ui_failure_actions.js"></script>
+  <script>
+    const ns = window.Echo360Translator;
+    ns.uiStyles.inject();
+    const root = document.createElement("div");
+    root.id = "echo360-ui-root";
+    root.dataset.echo360Appearance = new URLSearchParams(location.search).get("theme") || "dark";
+    document.body.appendChild(root);
+    const controls = ns.uiPanel.create(root, {}, {});
+    const diagnostics = ns.uiFailureActions.create(controls.el);
+    controls.show();
+    diagnostics.appendLog("info", "[echo360-translator][preview] diagnostics panel ready", {
+      runId: "preview-run",
+      source: "browser track",
+    });
+    diagnostics.appendLog("debug", "[echo360-translator][preview] partial preview applied", {
+      current: 4,
+      total: 18,
+    });
+
+    const records = [
+      [{ code: "VIDEO_NOT_FOUND", message: "等待 15 秒后仍未找到当前视频播放器。" }, { phase: "video" }],
+      [{ code: "CACHE_WRITE_FAILED", message: "翻译已显示，但缓存写入失败。", severity: "warning" }, { phase: "cache", severity: "warning" }],
+      [{ code: "RENDER_SYNC_ERROR", message: "Transcript 面板同步失败，视频字幕仍然可用。", severity: "warning" }, { phase: "render", severity: "warning" }],
+      [{ code: "HTTP_503", status: 503, message: "Translation provider is temporarily unavailable." }, { phase: "translation", provider: "openai", runId: "run-preview-1" }],
+      [{ code: "HTTP_429", status: 429, message: "Google Web request was rate limited." }, {
+        phase: "translation",
+        provider: "google-web",
+        target: "ZH",
+        runId: "run-preview-2",
+        onRetry: () => {},
+        onCancel: () => {},
+      }],
+    ];
+    for (const [error, options] of records) diagnostics.show({ error, ...options, context: options });
+    diagnostics.show({ error: records.at(-1)[0], ...records.at(-1)[1], context: records.at(-1)[1] });
+  </script>
+</body>
+</html>
