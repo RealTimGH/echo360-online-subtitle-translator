@@ -1,10 +1,19 @@
 {
+  "name": "echo360-online-subtitle-translator",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "node scripts/build-extension.mjs all",
     "build:store": "node scripts/build-extension.mjs store",
     "build:dev": "node scripts/build-extension.mjs dev",
+    "safari:prepare": "npm run build:store && node scripts/verify-safari-xcode-resources.mjs --required",
+    "check": "npm run check:syntax && npm test && npm run build && npm run check:safari",
+    "check:syntax": "node scripts/check-syntax.mjs",
     "check:safari": "node scripts/verify-safari-xcode-resources.mjs",
     "test": "vitest run",
+    "test:python": "python3 -m unittest discover -s tests/python -p 'test_*.py'",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },

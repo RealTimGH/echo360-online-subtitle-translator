@@ -19,6 +19,11 @@ beforeAll(() => {
     proxyRequest: vi.fn(),
     proxyTranslateSync: vi.fn(),
     waitJob: vi.fn(),
+    // translation_service.js deliberately fails closed when the shared
+    // boundary validators are unavailable. Keep this unit-test double
+    // faithful to the production dependency contract.
+    validateSourceVtt: vi.fn((vtt) => vtt),
+    validateTranslationResult: vi.fn((result) => result),
   };
   sourceFinderMock = {
     findBestTrackElement: vi.fn(() => null),
@@ -27,6 +32,7 @@ beforeAll(() => {
     fetchBestVttFromCandidates: vi.fn(async () => ({ text: "", sourceId: "", strongMapped: false, sourceMeta: null })),
     collectCandidateSubtitleUrls: vi.fn(() => []),
     buildSourceMeta: vi.fn((sourceId, vttText) => ({ sourceId, mediaId: "", mapSource: "", stats: {} })),
+    fetchTextResource: vi.fn(),
   };
   videoMock = {
     getPrimaryVideo: vi.fn(() => null),
@@ -42,6 +48,8 @@ beforeAll(() => {
     video: videoMock,
   });
   window.Echo360Translator = ns;
+  evalModule("vtt.js");
+  evalModule("error_utils.js");
   evalModule("translation_service.js");
   svc = window.Echo360Translator.translationService;
 });
@@ -53,10 +61,29 @@ beforeEach(() => {
   sourceFinderMock.fetchTranscriptFileVtt.mockResolvedValue({ text: "", sourceId: "", strongMapped: false, sourceMeta: null });
   sourceFinderMock.fetchBestVttFromCandidates.mockResolvedValue({ text: "", sourceId: "", strongMapped: false, sourceMeta: null });
   sourceFinderMock.collectCandidateSubtitleUrls.mockReturnValue([]);
+  sourceFinderMock.fetchTextResource.mockReset();
   videoMock.getPrimaryVideo.mockReturnValue(null);
 });
 
 describe("resolveSourceVtt", () => {
+  it("uses the allowlisted resource fetcher for an Instructure track source", async () => {
+    const track = document.createElement("track");
+    track.setAttribute("src", "https://apse2.nv.instructuremedia.com/captions/source.vtt");
+    sourceFinderMock.findBestTrackElement.mockReturnValue(track);
+    sourceFinderMock.fetchTextResource.mockResolvedValue({
+      ok: true,
+      text: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nHi\n",
+      via: "service-worker",
+    });
+
+    const result = await svc.resolveSourceVtt({});
+
+    expect(sourceFinderMock.fetchTextResource).toHaveBeenCalledWith(
+      "https://apse2.nv.instructuremedia.com/captions/source.vtt"
+    );
+    expect(result.vttText).toContain("Hi");
+  });
+
   it("uses the transcript-file API result when found, without falling through to the generic candidate scan", async () => {
     sourceFinderMock.fetchTranscriptFileVtt.mockResolvedValue({
       text: "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nHi\n",
@@ -86,7 +113,7 @@ describe("resolveSourceVtt", () => {
     expect(sourceFinderMock.fetchTranscriptFileVtt).toHaveBeenCalled();
   });
 
-  it("throws a clear error when no VTT source can be found by any strategy", async () => {
+  it("reports candidate-read failure when a candidate URL exists but no usable VTT is returned", async () => {
     vi.useFakeTimers();
     try {
       sourceFinderMock.collectCandidateSubtitleUrls.mockReturnValue([{ url: "https://example.com/x" }]);
@@ -94,7 +121,73 @@ describe("resolveSourceVtt", () => {
       await vi.advanceTimersByTimeAsync(12000);
       const result = await promise;
       expect(result).toBeInstanceOf(Error);
-      expect(result.message).toContain("未找到可用字幕源");
+      expect(result.code).toBe("SUBTITLE_FETCH_FAILED");
+      expect(result.message).toContain("没有得到可用的字幕文件");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not call a network failure 'no subtitle source' when a candidate was found", async () => {
+    vi.useFakeTimers();
+    try {
+      sourceFinderMock.collectCandidateSubtitleUrls.mockReturnValue([{ url: "https://example.com/captions.vtt" }]);
+      sourceFinderMock.fetchBestVttFromCandidates.mockResolvedValue({
+        text: "",
+        sourceId: "",
+        sourceMeta: null,
+        diagnostics: { attempts: [{ code: "RESOURCE_NETWORK_ERROR", outcome: "exception", error: "Load failed" }] },
+      });
+      const promise = svc.resolveSourceVtt({}).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(12000);
+      const result = await promise;
+      expect(result.code).toBe("SUBTITLE_NETWORK_ERROR");
+      expect(result.message).toContain("无法完成字幕文件请求");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("distinguishes repeated subtitle-server 5xx responses", async () => {
+    vi.useFakeTimers();
+    try {
+      sourceFinderMock.collectCandidateSubtitleUrls.mockReturnValue([{ url: "https://example.com/captions.vtt" }]);
+      sourceFinderMock.fetchBestVttFromCandidates.mockResolvedValue({
+        text: "",
+        sourceId: "",
+        sourceMeta: null,
+        diagnostics: { attempts: [{ code: "HTTP_503", status: 503, outcome: "fetch-failed", error: "HTTP 503" }] },
+      });
+      const promise = svc.resolveSourceVtt({}).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(12000);
+      const result = await promise;
+      expect(result.code).toBe("SUBTITLE_SERVER_ERROR");
+      expect(result.message).toContain("5xx");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not label mixed HTTP and network failures as one specific cause", async () => {
+    vi.useFakeTimers();
+    try {
+      sourceFinderMock.collectCandidateSubtitleUrls.mockReturnValue([{ url: "https://example.com/captions.vtt" }]);
+      sourceFinderMock.fetchBestVttFromCandidates.mockResolvedValue({
+        text: "",
+        sourceId: "",
+        sourceMeta: null,
+        diagnostics: {
+          attempts: [
+            { code: "HTTP_404", status: 404, outcome: "fetch-failed", error: "HTTP 404" },
+            { code: "RESOURCE_NETWORK_ERROR", outcome: "exception", error: "Load failed" },
+          ],
+        },
+      });
+      const promise = svc.resolveSourceVtt({}).catch((e) => e);
+      await vi.advanceTimersByTimeAsync(12000);
+      const result = await promise;
+      expect(result.code).toBe("SUBTITLE_FETCH_FAILED");
+      expect(result.message).toContain("所有读取尝试都失败");
     } finally {
       vi.useRealTimers();
     }
@@ -153,6 +246,7 @@ describe("buildTranslatePayload", () => {
     expect(payload.max_paragraphs).toBe(6);
     expect(payload.max_chars).toBe(1200);
     expect(payload.concurrency).toBe(96);
+    expect(payload.rps).toBe(0);
     expect(payload.force_refresh).toBe(true);
   });
 
@@ -180,7 +274,7 @@ describe("buildTranslatePayload", () => {
   });
 
   it("treats repairConcurrency=0 as 1 (direct_translator enforces Math.max(1,...) internally)", () => {
-    // direct_translator.js L567: Math.max(1, ...) — 0 and 1 are equivalent at the consumer.
+    // direct_translator.js enforces Math.max(1, ...) — 0 and 1 are equivalent at the consumer.
     // The || 1 default here is intentional and consistent with that constraint.
     const payload = svc.buildTranslatePayload({ repairConcurrency: 0 }, "WEBVTT\n\n", false);
     expect(payload.repair_concurrency).toBe(1);
@@ -240,11 +334,25 @@ describe("translateWithConfig (store build)", () => {
     await svc.translateWithConfig(
       { useLocalBackend: false, provider: "google-web" },
       "",
-      { vtt_text: "WEBVTT\n\n" },
+      { vtt_text: "WEBVTT\n\n", target: "ZH" },
       { isActive, onProgress }
     );
 
-    expect(backendClientMock.waitDirectJob).toHaveBeenCalledWith("job-99", { isActive, onProgress, onPartialVtt: expect.any(Function) });
+    expect(backendClientMock.waitDirectJob).toHaveBeenCalledWith("job-99", expect.objectContaining({
+      isActive,
+      target: "ZH",
+      onProgress,
+      onPartialVtt: expect.any(Function),
+    }));
+  });
+
+  it("does not convert a non-404 async creation failure into a second translation", async () => {
+    const backendError = Object.assign(new Error("backend overloaded"), { code: "HTTP_503", status: 503 });
+    backendClientMock.proxyRequest.mockRejectedValue(backendError);
+
+    await expect(svc.translateWithBackend("http://127.0.0.1:8765", { vtt_text: "WEBVTT" }))
+      .rejects.toMatchObject({ code: "HTTP_503", status: 503 });
+    expect(backendClientMock.proxyTranslateSync).not.toHaveBeenCalled();
   });
 });
 

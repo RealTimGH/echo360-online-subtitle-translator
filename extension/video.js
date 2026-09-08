@@ -159,8 +159,22 @@
   }
 
   function extractMediaIdFromVttUrl(url) {
-    const m = String(url || "").match(/captions-([0-9a-f-]{36})-/i);
-    return m ? m[1].toLowerCase() : "";
+    const raw = String(url || "");
+    // Echo360's lesson endpoint uses captions-<uuid>-<suffix>, while Canvas
+    // Instructure Media uses /api/media_management/caption_files/<uuid>-<suffix>
+    // (the suffix is usually an institution/player identifier).  Both URLs
+    // identify the same media UUID; keeping this extraction in the shared
+    // video module lets source selection and mount selection use the exact
+    // same mapping for both old and new page types.
+    const patterns = [
+      /captions-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-/i,
+      /\/caption_files\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:-|\/|$)/i,
+    ];
+    for (const pattern of patterns) {
+      const match = raw.match(pattern);
+      if (match) return match[1].toLowerCase();
+    }
+    return "";
   }
 
   function extractInteractiveMediaId(url) {

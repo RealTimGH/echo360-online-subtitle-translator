@@ -18,6 +18,17 @@
         pointer-events: none;
         ${toCssVars(DARK)}
       }
+      .echo360-sr-only {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        padding: 0 !important;
+        margin: -1px !important;
+        overflow: hidden !important;
+        clip: rect(0, 0, 0, 0) !important;
+        white-space: nowrap !important;
+        border: 0 !important;
+      }
 
       /* Light theme – explicit "light" override */
       #echo360-ui-root[data-echo360-appearance="light"] {
@@ -185,6 +196,7 @@
         right: 12px;
         bottom: 80px;
         width: ${PANEL_W}px;
+        box-sizing: border-box;
         z-index: 2147483647;
         pointer-events: auto;
         display: flex;
@@ -197,12 +209,31 @@
         border-radius: 12px;
         padding: 10px;
         box-shadow: -4px 2px 24px var(--echo360-panel-shadow);
+        color: var(--echo360-popover-fg);
         transform: translateX(${PANEL_W + 52}px);
         will-change: transform;
         transition: transform 0.32s cubic-bezier(0.34,1.15,0.64,1);
       }
       #echo360-translator-panel.echo360-panel-visible {
         transform: translateX(0);
+      }
+      #echo360-translator-panel.echo360-panel-has-diagnostics {
+        width: min(380px, calc(100vw - 24px));
+        max-height: calc(100vh - 96px);
+        overflow-y: auto;
+      }
+      #echo360-translator-panel.echo360-panel-has-diagnostics .echo360-panel-controls {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      #echo360-translator-panel.echo360-panel-has-diagnostics .echo360-panel-btn--collapse {
+        grid-column: 1 / -1;
+      }
+
+      .echo360-panel-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
       }
 
       /* ===== Panel buttons ===== */
@@ -243,6 +274,23 @@
         text-align: center;
         padding: 6px 0;
       }
+      .echo360-panel-btn--diagnostics {
+        border: 1px solid var(--echo360-diagnostic-border);
+        background: var(--echo360-diagnostic-subtle);
+        color: var(--echo360-diagnostic-secondary-text);
+      }
+      .echo360-panel-btn--diagnostics:hover:not(:disabled) {
+        border-color: var(--echo360-diagnostic-accent);
+        color: var(--echo360-popover-fg);
+      }
+      .echo360-panel-btn--diagnostics-error {
+        border-color: var(--echo360-diagnostic-error-border);
+        color: var(--echo360-diagnostic-error-strong);
+      }
+      .echo360-panel-btn--diagnostics-warning {
+        border-color: var(--echo360-diagnostic-warning-border);
+        color: var(--echo360-diagnostic-warning-muted);
+      }
 
       /* ===== Settings popover ===== */
       #echo360-translator-popover {
@@ -261,9 +309,33 @@
         padding: 12px;
         box-shadow: 0 6px 18px var(--echo360-popover-shadow);
       }
+      .echo360-popover-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
       .echo360-popover-title {
         font-weight: 600;
-        margin-bottom: 8px;
+      }
+      .echo360-popover-close {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        flex: 0 0 auto;
+        padding: 0;
+        border: 1px solid var(--echo360-popover-border-color);
+        border-radius: 7px;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        font: 20px/1 ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+      }
+      .echo360-popover-close:hover {
+        background: var(--echo360-diagnostic-subtle);
       }
       .echo360-popover-provider-row {
         display: flex;
@@ -355,6 +427,19 @@
         opacity: .9;
         margin-top: 8px;
         min-height: 18px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .echo360-status-text.echo360-status-error {
+        color: var(--echo360-diagnostic-error);
+        font-weight: 700;
+      }
+      .echo360-status-text.echo360-status-warning {
+        color: var(--echo360-diagnostic-warning);
+        font-weight: 700;
+      }
+      .echo360-status-text.echo360-status-success {
+        color: #9ce6b0;
       }
       .echo360-popover-link-btn {
         display: inline-flex;
@@ -378,45 +463,194 @@
       .echo360-popover-link-btn--underline {
         text-decoration: underline;
       }
-
-      /* ===== Translation failure actions (subtitle-adjacent) ===== */
-      #echo360-translator-failure-actions {
-        position: fixed;
-        left: 50%;
-        bottom: 12%;
-        transform: translateX(-50%);
-        z-index: 2147483647;
-        pointer-events: auto;
-        display: none;
-        align-items: center;
-        gap: 10px;
-        max-width: min(92vw, 720px);
-        padding: 8px 14px;
-        border-radius: 8px;
-        background: rgba(20, 20, 20, 0.82);
-        color: #fff;
-        font-size: clamp(14px, 2.1vw, 20px);
-        line-height: 1.35;
-        text-align: center;
-        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-        backdrop-filter: blur(6px);
-        -webkit-backdrop-filter: blur(6px);
+      .echo360-panel-btn:focus-visible,
+      .echo360-popover-close:focus-visible,
+      .echo360-popover-link-btn:focus-visible,
+      .echo360-popover-row input:focus-visible,
+      .echo360-popover-select:focus-visible {
+        outline: 2px solid var(--echo360-diagnostic-accent);
+        outline-offset: 2px;
       }
-      .echo360-failure-label {
+
+      /* ===== Diagnostics extension (inside the control panel) ===== */
+      .echo360-diagnostics-extension {
+        display: flex;
+        min-width: 0;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .echo360-diagnostics-extension[hidden] {
+        display: none;
+      }
+
+      /* ===== Structured translation error panel ===== */
+      #echo360-translator-failure-actions {
+        position: static;
+        transform: none;
+        z-index: auto;
+        pointer-events: auto;
+        display: flex;
+        flex: 0 0 auto;
+        flex-direction: column;
+        width: auto;
+        max-height: min(48vh, 520px);
+        overflow: auto;
+        margin-top: 0;
+        padding: 9px 0 0;
+        border: 0;
+        border-top: 1px solid var(--echo360-diagnostic-error-border);
+        border-radius: 0;
+        background: transparent;
+        color: var(--echo360-popover-fg);
+        font-size: 13px;
+        line-height: 1.35;
+        box-shadow: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+      }
+      #echo360-translator-failure-actions.echo360-error-warning {
+        border-color: var(--echo360-diagnostic-warning-border);
+        background: transparent;
+      }
+      .echo360-error-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      .echo360-error-heading {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      .echo360-error-context {
+        margin-bottom: 5px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+      }
+      .echo360-error-historical .echo360-error-context {
+        color: var(--echo360-diagnostic-accent);
+      }
+      .echo360-error-severity {
+        color: var(--echo360-diagnostic-error);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+      }
+      .echo360-error-warning .echo360-error-severity {
+        color: var(--echo360-diagnostic-warning);
+      }
+      .echo360-error-empty .echo360-error-severity {
+        color: var(--echo360-diagnostic-accent);
+      }
+      .echo360-error-code {
+        padding: 2px 6px;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-radius: 5px;
+        color: var(--echo360-diagnostic-error-muted);
+        font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .echo360-error-close {
+        flex: 0 0 auto;
+        border: 0;
+        background: transparent;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 20px;
+        line-height: 1;
         font-weight: 600;
+        cursor: pointer;
+        padding: 0 2px;
+      }
+      .echo360-error-close:hover {
+        color: var(--echo360-popover-fg);
+      }
+      .echo360-error-title {
+        margin-top: 6px;
+        font-size: 17px;
+        font-weight: 800;
+      }
+      .echo360-error-summary {
+        margin-top: 5px;
+        color: var(--echo360-diagnostic-error-strong);
+        font-size: 14px;
+      }
+      .echo360-error-recommendation {
+        margin-top: 8px;
+        padding: 8px 10px;
+        border-left: 3px solid var(--echo360-diagnostic-error);
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-error-muted);
+      }
+      .echo360-error-warning .echo360-error-recommendation {
+        border-left-color: var(--echo360-diagnostic-warning);
+        color: var(--echo360-diagnostic-warning-muted);
+      }
+      .echo360-error-empty .echo360-error-summary {
+        color: var(--echo360-diagnostic-secondary-text);
+      }
+      .echo360-error-empty .echo360-error-recommendation {
+        border-left-color: var(--echo360-diagnostic-accent);
+        color: var(--echo360-diagnostic-secondary-text);
+      }
+      .echo360-error-details {
+        margin-top: 10px;
+        border-top: 1px solid var(--echo360-diagnostic-border);
+        padding-top: 8px;
+      }
+      .echo360-error-details summary {
+        cursor: pointer;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-weight: 700;
+      }
+      .echo360-error-detail-list {
+        display: grid;
+        gap: 5px;
+        margin-top: 7px;
+      }
+      .echo360-error-detail-row {
+        display: grid;
+        grid-template-columns: minmax(92px, 132px) minmax(0, 1fr);
+        gap: 8px;
+        padding: 5px 7px;
+        border-radius: 5px;
+        background: var(--echo360-diagnostic-subtle);
+      }
+      .echo360-error-detail-label {
+        color: var(--echo360-diagnostic-muted-text);
+        font-weight: 700;
+      }
+      .echo360-error-detail-value {
+        min-width: 0;
+        color: var(--echo360-popover-fg);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-family: ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+      }
+      .echo360-error-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid var(--echo360-diagnostic-border);
       }
       .echo360-failure-link {
         border: 0;
         background: transparent;
-        color: #8ec8ff;
+        color: var(--echo360-diagnostic-accent);
         font: inherit;
-        font-weight: 600;
+        font-weight: 700;
         cursor: pointer;
         text-decoration: underline;
         padding: 0;
       }
       .echo360-failure-link:hover {
-        color: #b8dcff;
+        color: var(--echo360-diagnostic-accent-hover);
       }
       .echo360-failure-link:active {
         transform: scale(0.96);
@@ -424,6 +658,509 @@
       .echo360-failure-sep {
         opacity: 0.55;
         user-select: none;
+      }
+
+      /* ===== Persistent runtime log panel ===== */
+      .echo360-runtime-logs {
+        display: block;
+        margin-top: 0;
+        padding-top: 8px;
+        border-top: 1px solid var(--echo360-divider-color);
+        color: var(--echo360-popover-fg);
+      }
+      .echo360-runtime-logs-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .echo360-runtime-logs-toggle {
+        display: inline-flex;
+        min-width: 0;
+        align-items: center;
+        gap: 6px;
+        border: 0;
+        padding: 3px 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 850;
+        cursor: pointer;
+      }
+      .echo360-runtime-logs-toggle:hover,
+      .echo360-runtime-logs-toggle:focus-visible {
+        color: var(--echo360-diagnostic-accent);
+      }
+      .echo360-runtime-logs-total {
+        display: inline-flex;
+        min-width: 19px;
+        height: 19px;
+        box-sizing: border-box;
+        align-items: center;
+        justify-content: center;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 10px;
+      }
+      .echo360-runtime-logs-chevron {
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 11px;
+      }
+      .echo360-runtime-logs-actions {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+      .echo360-runtime-logs-copy,
+      .echo360-runtime-logs-clear {
+        border: 0;
+        padding: 2px 0;
+        background: transparent;
+        color: var(--echo360-diagnostic-accent);
+        font: inherit;
+        font-size: 10px;
+        font-weight: 750;
+        cursor: pointer;
+      }
+      .echo360-runtime-logs-copy:hover,
+      .echo360-runtime-logs-clear:hover {
+        color: var(--echo360-diagnostic-accent-hover);
+        text-decoration: underline;
+      }
+      .echo360-runtime-logs-clear[data-confirming="true"] {
+        color: var(--echo360-diagnostic-error);
+      }
+      .echo360-runtime-logs-copy:disabled {
+        cursor: default;
+        opacity: .58;
+        text-decoration: none;
+      }
+      .echo360-runtime-logs-content[hidden] {
+        display: none;
+      }
+      .echo360-runtime-logs-overview {
+        margin-top: 6px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 10px;
+      }
+      .echo360-runtime-logs-tools {
+        display: grid;
+        gap: 6px;
+        margin-top: 7px;
+      }
+      .echo360-runtime-logs-search-wrap {
+        display: block;
+      }
+      .echo360-runtime-logs-search {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-radius: 7px;
+        padding: 7px 9px;
+        background: var(--echo360-diagnostic-subtle);
+        color: var(--echo360-popover-fg);
+        font: 11px/1.25 ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+        outline: none;
+      }
+      .echo360-runtime-logs-search::placeholder {
+        color: var(--echo360-diagnostic-muted-text);
+      }
+      .echo360-runtime-logs-search:focus {
+        border-color: var(--echo360-diagnostic-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+      }
+      .echo360-runtime-logs-filters {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 3px;
+        padding: 3px;
+        border-radius: 8px;
+        background: var(--echo360-diagnostic-subtle);
+      }
+      .echo360-runtime-logs-filters button {
+        border: 0;
+        border-radius: 6px;
+        padding: 5px 2px;
+        background: transparent;
+        color: var(--echo360-diagnostic-secondary-text);
+        font: inherit;
+        font-size: 9px;
+        cursor: pointer;
+      }
+      .echo360-runtime-logs-filters button[aria-pressed="true"] {
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-popover-fg);
+        font-weight: 800;
+        box-shadow: 0 1px 3px var(--echo360-panel-shadow);
+      }
+      .echo360-runtime-logs-filters span {
+        color: var(--echo360-diagnostic-muted-text);
+        font-variant-numeric: tabular-nums;
+      }
+      .echo360-runtime-logs-empty {
+        margin-top: 8px;
+        padding: 12px 8px;
+        border: 1px dashed var(--echo360-diagnostic-border);
+        border-radius: 7px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 11px;
+        text-align: center;
+      }
+      .echo360-runtime-logs-list {
+        display: grid;
+        gap: 5px;
+        margin: 8px 0 0;
+        padding: 0;
+        max-height: min(28vh, 280px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+        list-style: none;
+      }
+      .echo360-runtime-log-item {
+        padding: 6px 8px;
+        border-left: 3px solid var(--echo360-diagnostic-accent);
+        border-radius: 5px;
+        background: var(--echo360-diagnostic-subtle);
+      }
+      .echo360-runtime-log-item.is-debug {
+        border-left-color: var(--echo360-diagnostic-muted-text);
+      }
+      .echo360-runtime-log-item.is-warn {
+        border-left-color: var(--echo360-diagnostic-warning);
+      }
+      .echo360-runtime-log-item.is-error {
+        border-left-color: var(--echo360-diagnostic-error);
+      }
+      .echo360-runtime-log-line {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .echo360-runtime-log-level {
+        color: var(--echo360-diagnostic-accent);
+        font-size: 9px;
+        font-weight: 850;
+        letter-spacing: .04em;
+      }
+      .is-debug .echo360-runtime-log-level {
+        color: var(--echo360-diagnostic-muted-text);
+      }
+      .is-warn .echo360-runtime-log-level {
+        color: var(--echo360-diagnostic-warning);
+      }
+      .is-error .echo360-runtime-log-level {
+        color: var(--echo360-diagnostic-error);
+      }
+      .echo360-runtime-log-time {
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 9px;
+        font-variant-numeric: tabular-nums;
+      }
+      .echo360-runtime-log-message {
+        margin-top: 3px;
+        color: var(--echo360-diagnostic-secondary-text);
+        font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .echo360-runtime-logs-feedback {
+        min-height: 14px;
+        margin-top: 5px;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 10px;
+      }
+
+      /* ===== Session error history (inside the same control panel) ===== */
+      .echo360-error-history {
+        display: none;
+        margin-top: 0;
+        padding-top: 8px;
+        border-top: 1px solid var(--echo360-divider-color);
+        color: var(--echo360-popover-fg);
+      }
+      .echo360-error-history-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .echo360-error-history-toggle {
+        display: inline-flex;
+        min-width: 0;
+        align-items: center;
+        gap: 6px;
+        border: 0;
+        padding: 3px 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 850;
+        cursor: pointer;
+      }
+      .echo360-error-history-toggle:hover,
+      .echo360-error-history-toggle:focus-visible {
+        color: var(--echo360-diagnostic-accent);
+      }
+      .echo360-error-history-total {
+        display: inline-flex;
+        min-width: 19px;
+        height: 19px;
+        box-sizing: border-box;
+        align-items: center;
+        justify-content: center;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 10px;
+      }
+      .echo360-error-history-chevron {
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 11px;
+      }
+      .echo360-error-history-actions,
+      .echo360-error-history-item-actions {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+      .echo360-error-history-clear,
+      .echo360-error-history-copy,
+      .echo360-error-history-view,
+      .echo360-error-history-item-copy {
+        border: 0;
+        padding: 2px 0;
+        background: transparent;
+        color: var(--echo360-diagnostic-accent);
+        font: inherit;
+        font-size: 10px;
+        font-weight: 750;
+        cursor: pointer;
+      }
+      .echo360-error-history-clear:hover,
+      .echo360-error-history-copy:hover,
+      .echo360-error-history-view:hover,
+      .echo360-error-history-item-copy:hover {
+        color: var(--echo360-diagnostic-accent-hover);
+        text-decoration: underline;
+      }
+      .echo360-error-history-clear[data-confirming="true"] {
+        color: var(--echo360-diagnostic-error);
+      }
+      .echo360-error-history-copy:disabled,
+      .echo360-error-history-view:disabled {
+        cursor: default;
+        opacity: .58;
+        text-decoration: none;
+      }
+      .echo360-error-history-content[hidden] {
+        display: none;
+      }
+      .echo360-error-history-overview {
+        margin-top: 6px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 10px;
+      }
+      .echo360-error-history-tools {
+        display: grid;
+        gap: 6px;
+        margin-top: 7px;
+      }
+      .echo360-error-history-search-wrap {
+        display: block;
+      }
+      .echo360-error-history-search {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-radius: 7px;
+        padding: 7px 9px;
+        background: var(--echo360-diagnostic-subtle);
+        color: var(--echo360-popover-fg);
+        font: 11px/1.25 ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+        outline: none;
+      }
+      .echo360-error-history-search::placeholder {
+        color: var(--echo360-diagnostic-muted-text);
+      }
+      .echo360-error-history-search:focus {
+        border-color: var(--echo360-diagnostic-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+      }
+      .echo360-error-history-filters {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 3px;
+        padding: 3px;
+        border-radius: 8px;
+        background: var(--echo360-diagnostic-subtle);
+      }
+      .echo360-error-history-filters button {
+        border: 0;
+        border-radius: 6px;
+        padding: 5px 4px;
+        background: transparent;
+        color: var(--echo360-diagnostic-secondary-text);
+        font: inherit;
+        font-size: 10px;
+        cursor: pointer;
+      }
+      .echo360-error-history-filters button[aria-pressed="true"] {
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-popover-fg);
+        font-weight: 800;
+        box-shadow: 0 1px 3px var(--echo360-panel-shadow);
+      }
+      .echo360-error-history-filters span {
+        color: var(--echo360-diagnostic-muted-text);
+        font-variant-numeric: tabular-nums;
+      }
+      .echo360-error-history-empty {
+        margin-top: 8px;
+        padding: 12px 8px;
+        border: 1px dashed var(--echo360-diagnostic-border);
+        border-radius: 7px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 11px;
+        text-align: center;
+      }
+      .echo360-error-history-list {
+        display: grid;
+        gap: 7px;
+        margin: 8px 0 0;
+        padding: 0;
+        max-height: min(30vh, 300px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+        list-style: none;
+      }
+      .echo360-error-history-item {
+        padding: 8px 9px;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-left: 3px solid var(--echo360-diagnostic-error-border);
+        border-radius: 7px;
+        background: var(--echo360-diagnostic-subtle);
+        transition: border-color .15s, background .15s;
+      }
+      .echo360-error-history-item.is-warning {
+        border-left-color: var(--echo360-diagnostic-warning-border);
+      }
+      .echo360-error-history-item.is-selected {
+        border-color: var(--echo360-diagnostic-accent);
+        background: var(--echo360-diagnostic-raised);
+      }
+      .echo360-error-history-line {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 5px;
+      }
+      .echo360-error-history-severity {
+        flex: 0 0 auto;
+        color: var(--echo360-diagnostic-error);
+        font-size: 9px;
+        font-weight: 850;
+      }
+      .is-warning .echo360-error-history-severity {
+        color: var(--echo360-diagnostic-warning);
+      }
+      .echo360-error-history-code {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--echo360-diagnostic-secondary-text);
+        font: 9px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .echo360-error-history-repeats {
+        flex: 0 0 auto;
+        padding: 1px 4px;
+        border-radius: 999px;
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 9px;
+        font-weight: 800;
+        font-variant-numeric: tabular-nums;
+      }
+      .echo360-error-history-label {
+        margin-top: 5px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .echo360-error-history-time {
+        margin-left: auto;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 10px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .echo360-error-history-summary {
+        display: -webkit-box;
+        margin-top: 4px;
+        overflow: hidden;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 11px;
+        line-height: 1.35;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+      }
+      .echo360-error-history-footer {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 8px;
+        margin-top: 7px;
+      }
+      .echo360-error-history-meta {
+        display: flex;
+        min-width: 0;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .echo360-error-history-meta span {
+        max-width: 118px;
+        overflow: hidden;
+        padding: 2px 5px;
+        border-radius: 4px;
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .echo360-error-history-item-actions {
+        flex: 0 0 auto;
+      }
+      .echo360-error-history-feedback {
+        min-height: 14px;
+        margin-top: 5px;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 10px;
+      }
+      #echo360-translator-failure-actions button:focus-visible,
+      .echo360-runtime-logs button:focus-visible,
+      .echo360-runtime-logs input:focus-visible,
+      .echo360-error-history button:focus-visible,
+      .echo360-error-history input:focus-visible {
+        outline: 2px solid var(--echo360-diagnostic-accent);
+        outline-offset: 2px;
+      }
+      @media (max-width: 430px) {
+        #echo360-translator-panel.echo360-panel-has-diagnostics {
+          right: 8px;
+          width: calc(100vw - 16px);
+          max-height: calc(100vh - 88px);
+        }
       }
     `;
     document.head.appendChild(style);

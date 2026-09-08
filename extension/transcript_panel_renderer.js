@@ -275,7 +275,9 @@
         state.diagnostics.lastBridgeDetail = result && typeof result === "object"
           ? {
             ok: result.ok === true,
+            code: result.code ? String(result.code) : null,
             error: result.error ? String(result.error) : null,
+            phase: result.phase ? String(result.phase) : null,
             transient: result.transient === true,
             capability: result.capability ? String(result.capability) : null,
             appliedRevision: Number.isFinite(Number(result.appliedRevision)) ? Number(result.appliedRevision) : null,
@@ -288,7 +290,14 @@
       };
       const timer = setTimeout(() => {
         state.pendingRequests.delete(requestId);
-        finish({ ok: false, error: "timeout" });
+        finish({
+          ok: false,
+          code: "TRANSCRIPT_BRIDGE_TIMEOUT",
+          error: "timeout",
+          message: "Transcript panel page-world bridge did not respond before the deadline",
+          phase: "render",
+          transient: true,
+        });
       }, timeoutMs);
       state.pendingRequests.set(requestId, { timer, resolve: finish });
       try {
@@ -296,13 +305,20 @@
       } catch (error) {
         clearTimeout(timer);
         state.pendingRequests.delete(requestId);
-        finish({ ok: false, error: String(error?.message || error) });
+        finish({
+          ok: false,
+          code: "TRANSCRIPT_BRIDGE_POST_FAILED",
+          error: String(error?.message || error || "postMessage failed"),
+          message: "无法向 Transcript 页面层发送桥接消息",
+          phase: "render",
+          transient: false,
+        });
       }
     });
   }
 
   function isRetryableBridgeResult(result) {
-    return result?.error === "timeout" || result?.transient === true;
+    return result?.code === "TRANSCRIPT_BRIDGE_TIMEOUT" || result?.error === "timeout" || result?.transient === true;
   }
 
   async function postBridgeWithRetry(action, panelState, payload = {}, timeoutMs = 350, maxAttempts = 3) {

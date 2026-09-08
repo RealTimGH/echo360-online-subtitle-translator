@@ -2,45 +2,19 @@ const STORAGE_KEY = "echo360TranslatorConfig";
 const extensionApi = window.Echo360ExtensionApi;
 const buildConfig = window.Echo360BuildConfig || {};
 const enableLocalBackend = buildConfig.enableLocalBackend !== false;
-
-const defaultConfig = {
-  apiKey: "",
-  useLocalBackend: false,
-  backendUrl: "http://127.0.0.1:8765",
-  provider: "google-web",
-  model: "",
-  endpoint: "",
-  target: "ZH",
-  maxParagraphs: 6,
-  maxChars: 1200,
-  concurrency: 96,
-  rps: 0,
-  retries: 1,
-  timeout: 10,
-  reasoningEffort: "",
-  fallbackMode: "immediate",
-  repairConcurrency: 1,
-  slowSplitThreshold: 0,
-  deepseekThinkingMode: "disabled",
-  deeplFormality: ""
-};
-
-const providerDefaults = {
-  "google-web": { model: "", endpoint: "" },
-  openai: { model: "gpt-5-nano", endpoint: "" },
-  deepseek: { model: "deepseek-v4-flash", endpoint: "" },
-  gemini: { model: "gemini-3.1-flash-lite", endpoint: "" },
-  deepl: { model: "", endpoint: "" }
-};
+const { DEFAULT_CONFIG: defaultConfig, PROVIDER_DEFAULTS: providerDefaults, createErrorPresenter } =
+  window.Echo360PreferencesUi;
 const { isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = window.Echo360ConfigKeys;
+const errorPresenter = createErrorPresenter({ surface: "options" });
+const typedOptionsError = (errorLike, code = "STORAGE_ERROR") => errorPresenter.typed(errorLike, code);
 
-const knownDefaultModels = new Set(Object.values(providerDefaults).map((item) => item.model).filter(Boolean));
 const providerHints = {
   "google-web": "免费且无需 API Key，适合首次试用和低门槛使用；翻译质量通常不如专用 AI/API 模型。",
   deepseek: "需要你自己的 DeepSeek API Key。更适合追求课程字幕翻译质量的长期使用；为了更丝滑的翻译体验，DeepSeek Thinking 默认为关闭。",
   gemini: "需要你自己的 Gemini API Key。适合追求更好翻译质量；请确认所在地区和账号可用。",
   openai: "需要你自己的 OpenAI API Key。适合追求更好翻译质量；Reasoning Effort 仅对支持模型生效。",
-  deepl: "需要你自己的 DeepL API Key。适合常规机器翻译质量需求；不支持 YUE 目标语言。"
+  deepl: "需要你自己的 DeepL API Key。适合常规机器翻译质量需求；不支持 YUE 目标语言。",
+  argos: "完全在本机离线翻译，不需要 API Key；仅开发版可用，源字幕必须是英语，并需先安装 Argos 与目标语言模型。"
 };
 
 function applyAppearance(mode) {
@@ -56,7 +30,15 @@ function setStatus(text, isError = false) {
   const status = document.getElementById("status");
   status.textContent = text;
   status.classList.toggle("error", !!isError);
+  status.setAttribute("aria-live", isError ? "off" : "polite");
+  if (!isError) {
+    const details = document.getElementById("errorDetails");
+    if (details) details.hidden = true;
+  }
 }
+
+const clearError = () => errorPresenter.clear();
+const showError = (error, context = {}) => errorPresenter.show(error, context);
 
 function setInputValue(id, value) {
   const el = document.getElementById(id);
@@ -102,10 +84,14 @@ function refreshProviderUi() {
 
   providerHint.textContent = providerHints[provider] || "";
   apiKeyHint.textContent = isKeyless
-    ? "Google Translate 不需要 API Key；保存时会自动清空本地 API Key 字段。若翻译质量不理想，请切换到 AI/API 模型。"
+    ? provider === "argos"
+      ? "Argos 不需要 API Key；会强制使用本地后端。请先安装 Argos 依赖和对应的 en→目标语言模型。"
+      : "Google Translate 不需要 API Key；保存时会自动清空本地 API Key 字段。若翻译质量不理想，请切换到 AI/API 模型。"
     : "API Key 仅保存在 Chrome 本地 storage，用于请求你选择的翻译服务。";
   apiKeyEl.disabled = isKeyless;
-  apiKeyEl.placeholder = isKeyless ? "Google Translate 不需要 API Key" : "请输入你的 API Key";
+  apiKeyEl.placeholder = isKeyless
+    ? provider === "argos" ? "Argos 不需要 API Key" : "Google Translate 不需要 API Key"
+    : "请输入你的 API Key";
   if (isKeyless) {
     apiKeyEl.value = "";
     apiKeyEl.dataset.forProvider = "";
@@ -115,6 +101,11 @@ function refreshProviderUi() {
   }
   modelEl.disabled = isKeyless;
   if (isKeyless) modelEl.value = "";
+  const useLocalBackendEl = document.getElementById("useLocalBackend");
+  if (useLocalBackendEl && enableLocalBackend) {
+    if (provider === "argos") useLocalBackendEl.checked = true;
+    useLocalBackendEl.disabled = provider === "argos";
+  }
   refreshAdvancedUi(provider);
 }
 
@@ -125,13 +116,17 @@ function refreshBuildUi() {
     if (section) section.hidden = true;
     if (checkbox) checkbox.checked = false;
   }
+  const argosOption = document.querySelector('option[value="argos"]');
+  if (argosOption) argosOption.disabled = !enableLocalBackend;
 }
 
 async function loadConfig() {
   const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
   const config = { ...defaultConfig, ...(value || {}) };
   localApiKeys = buildKeyMap(config);
-  const currentProvider = providerDefaults[config.provider] ? config.provider : defaultConfig.provider;
+  const currentProvider = providerDefaults[config.provider] && (config.provider !== "argos" || enableLocalBackend)
+    ? config.provider
+    : defaultConfig.provider;
   const useLocalBackendEl = document.getElementById("useLocalBackend");
   const backendUrlEl = document.getElementById("backendUrl");
   if (useLocalBackendEl) useLocalBackendEl.checked = enableLocalBackend && !!config.useLocalBackend;
@@ -177,12 +172,13 @@ function applyProviderDefaults() {
   const defaults = providerDefaults[provider] || providerDefaults.deepseek;
   const modelEl = document.getElementById("model");
   const endpointEl = document.getElementById("endpoint");
-  if (!modelEl.value.trim() || knownDefaultModels.has(modelEl.value.trim())) {
-    modelEl.value = defaults.model;
-  }
-  if (!endpointEl.value.trim()) {
-    endpointEl.value = defaults.endpoint;
-  }
+  // Model and endpoint belong to a provider as a pair. Carrying a custom
+  // DeepSeek model/endpoint into OpenAI (or vice versa) creates a request that
+  // is guaranteed to hit the wrong API contract. A deliberate provider
+  // change therefore starts from that provider's known-safe defaults; users
+  // can still enter a custom model/endpoint afterwards.
+  modelEl.value = defaults.model;
+  endpointEl.value = defaults.endpoint;
   refreshProviderUi();
   persistApiKeysOnly();
 }
@@ -195,8 +191,12 @@ async function persistApiKeysOnly() {
     const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
     const merged = { ...defaultConfig, ...(value || {}), apiKeys: { ...(value?.apiKeys || {}), ...localApiKeys } };
     await extensionApi.storage.local.set({ [STORAGE_KEY]: merged });
-  } catch (_) {
-    // Best-effort only; an explicit "保存设置" click still persists everything.
+  } catch (error) {
+    // A key switch is best-effort, but it must still be visible if browser
+    // storage rejects it; otherwise the next translation fails mysteriously.
+    const typed = typedOptionsError(error);
+    console.error("[echo360-translator][options] API key persistence failed", globalThis.Echo360Error?.serializeError?.(typed, { phase: "preferences" }) || typed);
+    showError(typed, { phase: "preferences", code: "STORAGE_ERROR" });
   }
 }
 
@@ -219,59 +219,66 @@ extensionApi.storage.onChanged.addListener((changes, area) => {
 
 function isLocalBackendUrl(url) {
   try {
-    const { hostname } = new URL(url);
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    const { protocol, hostname: rawHostname } = new URL(url);
+    const hostname = String(rawHostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+    return (protocol === "http:" || protocol === "https:") &&
+      (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
   } catch {
     return false;
   }
 }
 
 async function saveConfig() {
-  const provider = document.getElementById("provider").value;
-  const { [STORAGE_KEY]: existingValue } = await extensionApi.storage.local.get(STORAGE_KEY);
-  const existing = { ...defaultConfig, ...(existingValue || {}) };
-  const useLocalBackendEl = document.getElementById("useLocalBackend");
-  const backendUrlEl = document.getElementById("backendUrl");
-  const useLocalBackend = enableLocalBackend && !!useLocalBackendEl?.checked;
-  const rawBackendUrl = backendUrlEl?.value.trim() || defaultConfig.backendUrl;
-  if (useLocalBackend && !isLocalBackendUrl(rawBackendUrl)) {
-    setStatus("错误：Backend 地址只允许 localhost、127.0.0.1 或 ::1", true);
-    setTimeout(() => setStatus(""), 3000);
-    return;
+  try {
+    const provider = document.getElementById("provider").value;
+    const { [STORAGE_KEY]: existingValue } = await extensionApi.storage.local.get(STORAGE_KEY);
+    const existing = { ...defaultConfig, ...(existingValue || {}) };
+    const useLocalBackendEl = document.getElementById("useLocalBackend");
+    const backendUrlEl = document.getElementById("backendUrl");
+    const useLocalBackend = enableLocalBackend && (provider === "argos" || !!useLocalBackendEl?.checked);
+    const rawBackendUrl = backendUrlEl?.value.trim() || defaultConfig.backendUrl;
+    if (useLocalBackend && !isLocalBackendUrl(rawBackendUrl)) {
+      const error = { code: "BACKEND_URL_INVALID", message: "Backend 地址只允许使用 HTTP/HTTPS 的 localhost、127.0.0.1 或 [::1]" };
+      showError(error, { phase: "preferences" });
+      return;
+    }
+    stashKey(localApiKeys, provider, document.getElementById("apiKey").value);
+    // Merge in whatever is currently in storage in case it changed elsewhere
+    // (e.g. the popup) more recently than our own onChanged listener caught up.
+    const mergedKeys = { ...(existingValue?.apiKeys || {}), ...localApiKeys };
+    const config = {
+      useLocalBackend,
+      backendUrl: rawBackendUrl,
+      ...resolveForSave(mergedKeys, provider),
+      provider,
+      model: isKeylessProvider(provider) ? "" : document.getElementById("model").value.trim(),
+      endpoint: document.getElementById("endpoint").value.trim(),
+      target: (document.getElementById("target").value || "ZH").toUpperCase(),
+      maxParagraphs: getNumberValue("maxParagraphs", existing.maxParagraphs ?? defaultConfig.maxParagraphs, 1),
+      maxChars: getNumberValue("maxChars", existing.maxChars ?? defaultConfig.maxChars, 100),
+      concurrency: getNumberValue("concurrency", existing.concurrency ?? defaultConfig.concurrency, 1),
+      rps: getNumberValue("rps", existing.rps ?? defaultConfig.rps, 0),
+      retries: getNumberValue("retries", existing.retries ?? defaultConfig.retries, 0),
+      timeout: getNumberValue("timeout", existing.timeout ?? defaultConfig.timeout, 1),
+      reasoningEffort: provider === "openai" ? getInputValue("reasoningEffort", "") : "",
+      fallbackMode: getInputValue("fallbackMode", existing.fallbackMode || defaultConfig.fallbackMode) || defaultConfig.fallbackMode,
+      repairConcurrency: getNumberValue("repairConcurrency", existing.repairConcurrency ?? defaultConfig.repairConcurrency, 1),
+      slowSplitThreshold: getNumberValue("slowSplitThreshold", existing.slowSplitThreshold ?? defaultConfig.slowSplitThreshold, 0),
+      deepseekThinkingMode: provider === "deepseek"
+        ? getInputValue("deepseekThinkingMode", defaultConfig.deepseekThinkingMode)
+        : defaultConfig.deepseekThinkingMode,
+      deeplFormality: provider === "deepl" ? getInputValue("deeplFormality", "") : "",
+      appearance: getInputValue("appearance", "auto") || "auto",
+    };
+    await extensionApi.storage.local.set({ [STORAGE_KEY]: config });
+    clearError();
+    setStatus("已保存。请回到 Echo360 页面，点击“加载翻译字幕”。");
+    setTimeout(() => {
+      setStatus("");
+    }, 1200);
+  } catch (error) {
+    showError(typedOptionsError(error), { phase: "preferences", code: "STORAGE_ERROR" });
   }
-  stashKey(localApiKeys, provider, document.getElementById("apiKey").value);
-  // Merge in whatever is currently in storage in case it changed elsewhere
-  // (e.g. the popup) more recently than our own onChanged listener caught up.
-  const mergedKeys = { ...(existingValue?.apiKeys || {}), ...localApiKeys };
-  const config = {
-    useLocalBackend,
-    backendUrl: rawBackendUrl,
-    ...resolveForSave(mergedKeys, provider),
-    provider,
-    model: isKeylessProvider(provider) ? "" : document.getElementById("model").value.trim(),
-    endpoint: document.getElementById("endpoint").value.trim(),
-    target: (document.getElementById("target").value || "ZH").toUpperCase(),
-    maxParagraphs: getNumberValue("maxParagraphs", existing.maxParagraphs ?? defaultConfig.maxParagraphs, 1),
-    maxChars: getNumberValue("maxChars", existing.maxChars ?? defaultConfig.maxChars, 100),
-    concurrency: getNumberValue("concurrency", existing.concurrency ?? defaultConfig.concurrency, 1),
-    rps: getNumberValue("rps", existing.rps ?? defaultConfig.rps, 0),
-    retries: getNumberValue("retries", existing.retries ?? defaultConfig.retries, 0),
-    timeout: getNumberValue("timeout", existing.timeout ?? defaultConfig.timeout, 1),
-    reasoningEffort: provider === "openai" ? getInputValue("reasoningEffort", "") : "",
-    fallbackMode: getInputValue("fallbackMode", existing.fallbackMode || defaultConfig.fallbackMode) || defaultConfig.fallbackMode,
-    repairConcurrency: getNumberValue("repairConcurrency", existing.repairConcurrency ?? defaultConfig.repairConcurrency, 1),
-    slowSplitThreshold: getNumberValue("slowSplitThreshold", existing.slowSplitThreshold ?? defaultConfig.slowSplitThreshold, 0),
-    deepseekThinkingMode: provider === "deepseek"
-      ? getInputValue("deepseekThinkingMode", defaultConfig.deepseekThinkingMode)
-      : defaultConfig.deepseekThinkingMode,
-    deeplFormality: provider === "deepl" ? getInputValue("deeplFormality", "") : "",
-    appearance: getInputValue("appearance", "auto") || "auto",
-  };
-  await extensionApi.storage.local.set({ [STORAGE_KEY]: config });
-  setStatus("已保存。请回到 Echo360 页面，点击“加载翻译字幕”。");
-  setTimeout(() => {
-    setStatus("");
-  }, 1200);
 }
 
 document.getElementById("provider").addEventListener("change", applyProviderDefaults);
@@ -286,5 +293,9 @@ document.getElementById("appearance").addEventListener("change", (event) => appl
 document.getElementById("saveBtn").addEventListener("click", saveConfig);
 refreshBuildUi();
 loadConfig().catch((err) => {
-  setStatus(`加载失败：${err?.message || String(err)}`, true);
+  showError(typedOptionsError(err), { phase: "preferences", code: "STORAGE_ERROR" });
+});
+
+document.querySelector(".error-card-copy")?.addEventListener("click", async (event) => {
+  await errorPresenter.copyDiagnostics(event.currentTarget);
 });

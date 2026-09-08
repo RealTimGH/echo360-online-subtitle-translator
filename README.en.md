@@ -2,13 +2,13 @@
 
 [简体中文](README.md) | **English**
 
-Chrome/Safari extension for loading translated subtitles on Echo360 recordings; the local FastAPI backend is kept as a development, fallback, and batch-processing path.
+Chrome/Safari extension for loading translated subtitles on Echo360 recordings and Canvas-embedded Instructure Media videos; the local FastAPI backend is kept as a development, fallback, and batch-processing path.
 
-Current extension version: **1.4.3**
+Current extension version: **1.5.0**
 
 ## What It Does
 
-1. Finds the Echo360 VTT subtitle source for the current lecture (player CC, network capture, `transcript-file` API, etc.).
+1. Finds the VTT subtitle source for the current Echo360 lecture or Canvas-embedded video (player CC, network capture, `transcript-file` API, etc.).
 2. Translates directly from the extension frontend by default (`direct_translator.js`); dev builds can also proxy through the local backend.
 3. If the local backend is enabled, the backend calls the bundled VTT translator script as a fallback/batch tool:
    `translator/translate_vtt_zh_deepl_native.py`
@@ -60,6 +60,20 @@ If every strategy fails, the control panel reports that no usable subtitle sourc
 
 Prefs schema v3 migrates the old "native CC preferred" default to the browser track once; users who want the native look can re-enable the Beta in settings.
 
+3. **Canvas / Instructure Media videos**
+   - Canvas embeds the video in a separate `sydney.instructuremedia.com` iframe. The player uses Vidstack's custom `[data-part="captions"]` surface, so the extension detects each iframe independently instead of treating all videos on the page as one player.
+   - Translation still uses the same timed VTT and cache. Cues are rendered against `video.currentTime` in the player's captions surface, so translated subtitles do not depend on the native CC toggle and do not leak between the page's multiple videos.
+   - If a caption URL's CORS policy prevents direct content-script access, the extension retries through the service worker, restricted to `*.instructuremedia.com` rather than acting as an arbitrary URL proxy.
+
+### Canvas assessment safe mode
+
+- The top-level Canvas matches are `/courses/*/pages/*` and `/courses/*/external_tools/*`, where the isolated `canvas_course_bridge.js` runs. It is never injected into `quizzes`, `assignments`, `taking`, `modules/items`, or other Canvas routes. The bridge checks the live URL and high-confidence assessment DOM markers, then answers a media frame's one-time nonce; it does not modify the DOM, read page text or keyboard input, access extension storage, or make network requests.
+- For Canvas-embedded Echo360 / Instructure Media frames, `assessment_guard.js` runs before every other active module. A full `/courses/{id}/pages/{slug}` or `/courses/{id}/external_tools/{tool_id}` referrer is accepted directly. If referrer policy exposes only the Canvas origin, the frame must receive a response with the matching request ID from the course-page bridge before it can start.
+- Quiz, assignment, New Quizzes, and taking routes have no course-page bridge and therefore fail closed. Missing proof, empty referrers, ambiguous ancestry, and high-confidence assessment DOM markers also fail closed.
+- In safe mode, apart from a one-shot `postMessage` verification listener lasting at most 1.5 seconds, the extension creates no translation UI, subtitle track, page probe, persistent timer, or media-event listener, and performs no extension-storage read or translation request.
+
+This protection minimizes interaction with an assessment page, but no extension can guarantee that proctoring software will not report it merely because it is installed. If an assessment policy prohibits browser extensions, disable this extension in the browser's extension manager beforehand and use the institution-mandated browser or a separate exam profile.
+
 Display preferences (bilingual, order, size) do not require retranslation. The extension caches one translated VTT and renders client-side.
 
 ## Directory Layout
@@ -76,14 +90,18 @@ Main extension modules:
 
 ```text
 build_config.js           Build target (dev/store) and local-backend switch
+assessment_guard.js       Fail-closed Canvas assessment/assignment context gate
+canvas_course_bridge.js   Data-free proof bridge limited to Canvas course-content/external_tools routes
 browser_api.js            Chrome / Safari storage and runtime API abstraction
 config_keys.js            Shared per-provider API key logic for popup/options
 constants.js              Shared defaults and option lists
+host_support.js           Echo360 / Canvas Instructure Media host detection and adapter helpers
 vtt.js                    Pure VTT parsing, formatting, bilingual, and incremental preview helpers
 subtitle_strategy.js      Browser detection and bilingual VTT build strategy
 storage.js                Config, prefs, and local subtitle cache
 video.js                  Echo360 video discovery, media-id hints, and page-probe bridge
 source_finder.js          Subtitle source discovery (incl. transcript-file API) and video matching
+player_caption_renderer.js Timed captions overlay for Canvas Vidstack players
 bilingual_dom_renderer.js Echo360 native CC DOM bilingual injection
 renderer.js               Browser track / native CC DOM render orchestration and cue styling
 direct_translator.js      In-extension direct translation and partial VTT callbacks (default store path)
@@ -103,6 +121,8 @@ popup.js / options.js     Extension popup and options page
 ```
 
 ## Backend Setup
+
+The backend and translator CLI support Python 3.9 or later. On macOS, prefer a Homebrew/pyenv Python built with OpenSSL; the Xcode-provided LibreSSL Python can start the application, but its TLS stack is not fully supported by current `urllib3` releases.
 
 First, go to the repo root:
 
@@ -179,41 +199,51 @@ npm run build:dev
 
 The dev build keeps the local backend entry and localhost permissions.
 
-When running the extension through Safari/Xcode, every script referenced by `manifest.json` must also be present in the Resources phase of both Extension targets. Verify the generated project with:
+`extension/` is the single source of business logic shared by Chrome and Safari. The Safari/Xcode project references generated release resources in `dist/extension-store/`, not a second manually maintained source tree. This build layer intentionally transforms `build_config.js`, `manifest.json`, and `options.html` to remove the local-backend UI and permissions.
+
+Before opening Xcode or using Build/Run, run:
 
 ```bash
-npm run check:safari
+npm run safari:prepare
 ```
 
-After changing extension scripts, rebuild/run the containing app in Xcode and reopen the Safari Canvas/EchoVideo page; running `npm run build` alone does not update an already-installed Safari app bundle.
+This regenerates the store resources from the current `extension/` tree and strictly verifies that every generated file matches the source plus release transforms, both Extension targets contain the complete resource set, and every Xcode reference points exactly to `dist/extension-store/`. Do not continue with an old Xcode build if this validation fails.
+
+After changing extension scripts, also rebuild/run the containing app in Xcode and reopen the Safari Canvas/EchoVideo page; generating resources does not update an already-installed Safari app bundle. The regular `npm run check:safari` quality gate performs the same drift checks, but skips Xcode-project validation when no generated Safari project is present in the current environment.
 
 ## Testing
 
-Unit tests cover VTT parsing, subtitle strategy, storage, translation payloads, and error handling in `extension/`:
+Unit and property tests cover VTT parsing, subtitle strategy, storage, translation payloads, the cross-browser API adapter, and error handling in `extension/`. Run the complete quality gate before submitting changes:
 
 ```bash
-npm install
-npm test
+npm ci
+npm run check
 npm run test:coverage
 ```
 
-Test files live under `tests/unit/`; see `vitest.config.js` for configuration.
+After installing `backend/requirements.txt`, run the Python backend/CLI smoke regressions separately:
+
+```bash
+npm run test:python
+```
+
+`npm run check` syntax-checks every JavaScript and Python source file, runs the extension test suite, and produces both store and development builds. Tests live under `tests/unit/`, `tests/property/`, and `tests/python/`; see `vitest.config.js` for JavaScript test configuration.
 
 ## Defaults
 
 - provider: `google-web`
 - model: empty by default (Gemini preset: `gemini-3.1-flash-lite`)
 - target: `ZH`
-- max_paragraphs: `6`
+- max_paragraphs: `6` (the Google web endpoint refreshes progress per cue)
 - max_chars: `1200`
-- concurrency: `96`
-- rps: `0`
+- concurrency: `96` (the 1.4.2 profile is tried first; recovery lowers it only after a failed run)
+- rps: `0` (no added pacing on the first run; recovery uses `3` RPS only after a failed run)
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: empty by default
 - deepseek_thinking_mode: `disabled`
 
-Supported providers: `google-web`, `deepseek`, `openai`, `gemini`, `deepl`. All except `google-web` require an API key.
+Supported providers: `google-web`, `deepseek`, `openai`, `gemini`, `deepl`, plus the development/local-backend-only `argos` provider. `google-web` and `argos` do not require API keys.
 
 Target language options: `ZH`, `ZH-HK`, `YUE`, `EN`, `JA`, `KO`, `FR`, `DE`, `ES`, `IT`, `PT`, `RU`, `AR`, `HI`.
 
@@ -227,19 +257,37 @@ The dev build also keeps local-backend tuning controls such as `maxParagraphs`, 
 
 Language notes:
 - `deepl` does not support `YUE`; use an AI provider instead (`deepseek`/`openai`/`gemini`)
+- `argos` explicitly uses English source subtitles. It supports installed pairs such as `ZH` (`en→zh`) and `ZH-HK` (`en→zt`), but does not support `YUE` or accept `EN` as the target.
 
 Google Translate provider:
 - `google-web` uses an unofficial web endpoint and does not require an API key, so it is useful for quick first-run testing
 - The store build calls it directly from the extension frontend; the dev build can optionally proxy it through the local backend
-- The backend/script path caps it at `concurrency=96, max_chars=1200, max_paragraphs=10`
+- The backend/script path restores the 1.4.2 speed profile: default `concurrency=96, rps=0` (no added pacing), while keeping `max_chars=1200, max_paragraphs=1` for independent incremental updates
 - This endpoint is unofficial, so stability, availability, and translation quality are not guaranteed
 - For better subtitle translation quality, use an AI/API provider such as `deepseek`, `openai`, `gemini`, or `deepl` with your own API key
 
-For the direct extension path, `google-web` automatically uses a controlled `12` requests per second when `rps=0` (the default) and keeps concurrent workers capped at `48`. This is a bounded throughput compromise for the unofficial web endpoint; an explicitly positive RPS is still honored. The endpoint has no public, stable official QPS guarantee, so the formal Google Cloud Translation quotas should not be applied to it directly.
+For the direct extension path, `google-web` restores the 1.4.2 default speed profile: up to `96` workers with default `rps=0` (no added pacing). An explicitly supplied positive `rps` is still honored. Each cue is handled independently; `HTTP 429` uses `Retry-After` or exponential backoff, failed cues keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports the effective concurrency/RPS, progress, retries, 429s, queue waits, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly.
+
+Argos Translate provider (development build only):
+
+`argos` loads local Argos models directly inside the existing Python translator subprocess. It does not require a second LibreTranslate service and does not send subtitle text to a third party. The runtime uses one worker to avoid model contention and duplicate CTranslate2 memory use. Install the optional dependency and the models you need in the backend virtual environment:
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-argos.txt
+argospm update
+argospm install translate-en_zh
+python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["en"])'
+# Traditional Chinese: argospm install translate-en_zt
+```
+
+The last command explicitly preloads MiniSBD's English sentence-boundary model. Then build and load the development extension and select `Argos Translate (local)` in the full settings page. Saving automatically enables the local backend. Translation never downloads models or accesses the network silently: missing runtime dependencies, language packages, and sentence-boundary models are reported as `ARGOS_DEPENDENCY_MISSING` or `ARGOS_MODEL_MISSING`, with actionable installation guidance.
 
 ## Privacy
 
-See [PRIVACY.md](PRIVACY.md). The extension sends subtitle text to the translation provider selected by the user; API keys and subtitle cache are stored in Chrome local storage.
+See [PRIVACY.md](PRIVACY.md). The extension sends subtitle text to the translation provider selected by the user; with `argos`, subtitles stay on the local machine. API keys and subtitle cache are stored in Chrome local storage.
 
 ## Backend Translator Invocation
 

@@ -133,6 +133,7 @@ export function makeFullNs(overrides = {}) {
  */
 export function loadUiModules() {
   for (const filename of [
+    "error_utils.js",
     "ui_theme.js",
     "ui_styles.js",
     "ui_ball.js",

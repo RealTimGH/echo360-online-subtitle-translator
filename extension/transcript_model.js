@@ -184,6 +184,11 @@
     const pendingLabel = options.pendingLabel || DEFAULT_PENDING_LABEL;
     const failureLabel = options.failureLabel || DEFAULT_FAILURE_LABEL;
     const failurePreview = options.failurePreview === true;
+    const failedCues = new Set(
+      (Array.isArray(options.failedCues) ? options.failedCues : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    );
     const originalCues = parseCues(originalVtt);
     const translatedCues = parseCues(translatedVtt);
     const mapping = alignTranslationCues(originalCues, translatedCues);
@@ -195,7 +200,9 @@
         : "";
       let status = "unmapped";
       if (translatedCue) {
-        status = isFailureText(translatedText || translatedCue.text, failureLabel)
+        status = failedCues.has(index + 1)
+          ? "failed"
+          : isFailureText(translatedText || translatedCue.text, failureLabel)
           ? "failed"
           : isPendingText(translatedText, originalText, pendingLabel)
             ? (failurePreview ? "failed" : "pending")

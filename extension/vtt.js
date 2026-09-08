@@ -4,6 +4,7 @@
     DEFAULT_SUBTITLE_SIZE,
     CUE_LINE_MAP,
     SUBTITLE_PENDING_LABEL,
+    SUBTITLE_FAILURE_LABEL,
   } = ns.constants;
 
   function formatVttTime(seconds) {
@@ -21,19 +22,40 @@
     return String(text || "").replace(/\r/g, "").trim();
   }
 
+  // Instructure Media's caption_files endpoint currently returns plain-text
+  // SRT (for example, 00:00:01,234 --> 00:00:02,345), while the rest of the
+  // extension expects WebVTT.  Normalize both formats at the source boundary
+  // so translation, matching, and the custom player renderer all receive one
+  // stable format.
+  function normalizeTimedText(text) {
+    const raw = String(text || "")
+      .replace(/^\uFEFF/, "")
+      .replace(/\r\n?/g, "\n")
+      .trim();
+    if (!raw || !raw.includes("-->")) return "";
+
+    const lines = raw.split("\n").map((line) => line.replace(
+      /(\d{1,2}:\d{2}:\d{2}),(\d{3})/g,
+      "$1.$2"
+    ));
+    if (/^WEBVTT(?:\s|$)/i.test(lines[0].trim())) return lines.join("\n");
+    return ["WEBVTT", "", ...lines].join("\n");
+  }
+
   function parseVttStats(vttText) {
     const lines = String(vttText || "").split("\n");
-    const timeRe = /(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})/;
     let cueCount = 0;
     let maxEnd = 0;
     const ranges = [];
-    const toSec = (h, m, s, ms) => Number(h) * 3600 + Number(m) * 60 + Number(s) + Number(ms) / 1000;
     for (const line of lines) {
-      const match = line.match(timeRe);
-      if (!match) continue;
+      // WebVTT permits both MM:SS.mmm and HH:MM:SS.mmm timestamps. Reuse the
+      // strict timing parser so source discovery and rendering count the same
+      // cues regardless of which legal form the site emits.
+      const timing = parseVttTimingLine(line);
+      if (!timing) continue;
       cueCount += 1;
-      const s = toSec(match[1], match[2], match[3], match[4]);
-      const e = toSec(match[5], match[6], match[7], match[8]);
+      const s = timing.startMs / 1000;
+      const e = timing.endMs / 1000;
       if (e > maxEnd) maxEnd = e;
       ranges.push([s, e]);
     }
@@ -75,7 +97,7 @@
 
   function parseVttTimingLine(line) {
     const match = String(line || "").match(
-      /([^\s]+)\s+-->\s+([^\s]+)(?:\s+.*)?$/
+      /^\s*([^\s]+)\s+-->\s+([^\s]+)(?:\s+.*)?$/
     );
     if (!match) return null;
     const startMs = parseVttTimestamp(match[1]);
@@ -227,6 +249,13 @@
 
   function buildIncrementalPreviewVtt(partialVtt, originalVtt, options = {}) {
     const placeholder = options.placeholder || SUBTITLE_PENDING_LABEL;
+    const failureLabel = options.failureLabel || SUBTITLE_FAILURE_LABEL;
+    const markPending = options.markPending !== false;
+    const failedCues = new Set(
+      (Array.isArray(options.failedCues) ? options.failedCues : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    );
     const trans = parseVttBlocks(partialVtt);
     const orig = parseVttBlocks(originalVtt);
     const n = Math.min(trans.length, orig.length);
@@ -234,10 +263,11 @@
     for (let i = 0; i < n; i += 1) {
       const origText = cueTextToLine(orig[i].text);
       const transText = cueTextToLine(trans[i].text);
-      const pending = !transText || normalizeCueText(transText) === normalizeCueText(origText);
+      const failed = failedCues.has(i + 1);
+      const pending = markPending && !failed && (!transText || normalizeCueText(transText) === normalizeCueText(origText));
       lines.push(String(i + 1));
       lines.push(trans[i].time);
-      lines.push(pending ? placeholder : trans[i].text);
+      lines.push(failed ? failureLabel : (pending ? placeholder : trans[i].text));
       lines.push("");
     }
     return lines.join("\n");
@@ -246,6 +276,7 @@
   ns.vtt = {
     formatVttTime,
     cueTextToLine,
+    normalizeTimedText,
     parseVttStats,
     parseVttBlocks,
     parseVttTimestamp,

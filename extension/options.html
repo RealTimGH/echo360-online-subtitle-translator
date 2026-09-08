@@ -218,6 +218,50 @@
         color: var(--danger);
       }
 
+      #status.warning {
+        color: #8a5a00;
+      }
+
+      .error-card {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border: 1px solid var(--danger);
+        border-radius: 12px;
+        background: var(--warning-bg);
+        color: var(--danger);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .error-card.warning {
+        border-color: #c99524;
+        background: #fff9e8;
+        color: #6b4b00;
+      }
+
+      .error-card[hidden] { display: none; }
+      .error-card-title { font-weight: 800; }
+      .error-card-summary { margin-top: 4px; }
+      .error-card-recommendation { margin-top: 6px; }
+      .error-card details { margin-top: 8px; }
+      .error-card pre {
+        max-height: 260px;
+        margin: 8px 0 0;
+        overflow: auto;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: var(--ink);
+        font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .error-card-copy {
+        margin-top: 9px;
+        padding: 7px 10px;
+        border: 1px solid var(--danger);
+        background: transparent;
+        color: var(--danger);
+        font-size: 12px;
+      }
+
       @media (max-width: 760px) {
         body { padding: 18px; }
         .grid { grid-template-columns: 1fr; }
@@ -242,6 +286,7 @@
             <option value="gemini">Gemini</option>
             <option value="openai">OpenAI</option>
             <option value="deepl">DeepL</option>
+            <option value="argos" data-local-backend-only>Argos Translate（本地）</option>
           </select>
           <div id="providerHint" class="hint"></div>
 
@@ -288,6 +333,18 @@
 
           <button id="saveBtn">保存设置</button>
           <div id="status" role="status" aria-live="polite"></div>
+          <section id="errorDetails" class="error-card" role="region" aria-live="off" hidden>
+            <div id="errorAnnouncement" role="alert" aria-live="assertive" aria-atomic="true">
+              <div class="error-card-title"></div>
+              <div class="error-card-summary"></div>
+              <div class="error-card-recommendation"></div>
+            </div>
+            <details open>
+              <summary>诊断详情</summary>
+              <pre></pre>
+            </details>
+            <button type="button" class="error-card-copy">复制错误信息</button>
+          </section>
         </section>
 
         <details>
@@ -313,7 +370,7 @@
 
               <label for="rps">RPS</label>
               <input id="rps" type="number" min="0" step="0.1" />
-              <div class="hint">每秒请求数限制。0 表示通用 provider 不主动限速；Google Translate 网页端点会自动使用受控的 12 RPS。</div>
+              <div class="hint">每秒请求数限制；0 表示首轮不主动限速。Google Translate 遇到 HTTP 429 或整批无有效结果时会自动退避并切换到 3 RPS / 3 并发恢复。</div>
 
               <label for="retries">Retries</label>
               <input id="retries" type="number" min="0" step="1" />
@@ -326,10 +383,10 @@
               <label for="fallbackMode">Fallback Mode</label>
               <select id="fallbackMode">
                 <option value="immediate">immediate</option>
-                <option value="after-repair">after-repair</option>
-                <option value="off">off</option>
+                <option value="deferred">deferred</option>
+                <option value="deferred-fastpath">deferred-fastpath</option>
               </select>
-              <div class="hint">翻译失败时的回退策略。</div>
+              <div class="hint">翻译失败时立即拆分重试，或在主翻译阶段结束后集中修复。</div>
 
               <label for="repairConcurrency">Repair Concurrency</label>
               <input id="repairConcurrency" type="number" min="1" step="1" />
@@ -411,6 +468,8 @@
     <script src="build_config.js"></script>
     <script src="browser_api.js"></script>
     <script src="config_keys.js"></script>
+    <script src="error_utils.js"></script>
+    <script src="preferences_ui.js"></script>
     <script src="options.js"></script>
   </body>
 </html>

@@ -2,13 +2,13 @@
 
 **简体中文** | [English](README.en.md)
 
-用于 Echo360 录播课的 Chrome/Safari 扩展，用来加载并显示翻译字幕；本地 FastAPI 后端保留为开发调试、fallback 和批处理路径。
+用于 Echo360 录播课和 Canvas 内嵌 Instructure Media 视频的 Chrome/Safari 扩展，用来加载并显示翻译字幕；本地 FastAPI 后端保留为开发调试、fallback 和批处理路径。
 
-当前扩展版本：**1.4.3**
+当前扩展版本：**1.5.0**
 
 ## 功能概览
 
-1. 在当前 Echo360 录播课页面中寻找 VTT 字幕源（播放器 CC、网络抓取、`transcript-file` API 等）。
+1. 在当前 Echo360 录播课页面或 Canvas 内嵌视频中寻找 VTT 字幕源（播放器 CC、网络抓取、`transcript-file` API 等）。
 2. 默认通过扩展前端直连翻译服务（`direct_translator.js`）；dev 构建也可以发送到本地后端。
 3. 如果启用本地后端，后端会调用仓库内的 VTT 翻译脚本作为 fallback/批处理工具：
   `translator/translate_vtt_zh_deepl_native.py`
@@ -64,6 +64,20 @@
 
 偏好 schema v3 起会把旧版「原生 CC 默认」一次性迁移为浏览器轨默认；需要原生外观的用户可在设置中重新勾选 Beta。
 
+3. **Canvas / Instructure Media 视频**
+  - Canvas 页面里的视频实际运行在 `sydney.instructuremedia.com` 的独立 iframe 中，播放器使用 Vidstack 的自定义 `[data-part="captions"]` 渲染层；扩展会在每个 iframe 内独立识别视频，避免把页面上的多个视频混成一个。
+  - 翻译仍使用同一份时间码 VTT 和同一套翻译缓存；字幕按 `video.currentTime` 直接更新到播放器 captions surface，因此不依赖播放器原生 CC 是否打开，也不会在多个视频之间串字幕。
+  - 如果字幕 URL 的跨域响应不允许 content script 直接读取，扩展会把请求交给 service worker，但只允许 `*.instructuremedia.com`，不会变成任意网址代理。
+
+### Canvas 考试安全模式
+
+- 扩展只在 Canvas 顶层的 `/courses/*/pages/*` 课程内容页和 `/courses/*/external_tools/*` 独立外部工具页注入 `canvas_course_bridge.js`；不会在 `quizzes`、`assignments`、`taking`、`modules/items` 或其他 Canvas 路径注入。课程页桥只验证当前 URL、检查高可信考试 DOM 标记并回复媒体 iframe 的一次性 nonce，不修改 DOM，不读取页面正文、键盘输入或扩展存储，也不发起网络请求。
+- Canvas 内嵌的 Echo360 / Instructure Media iframe 由 `assessment_guard.js` 在其他模块启动前检查。referrer 含完整 `/courses/{id}/pages/{slug}` 或 `/courses/{id}/external_tools/{tool_id}` 路径时可直接启用；若浏览器的 referrer policy 只暴露 Canvas origin，iframe 必须从上述课程页桥取得同 request ID 的页面证明才能启动。
+- `quizzes`、`assignments`、New Quizzes/taking 等考试路径没有课程页桥，因此一律默认禁用。未取得证明、无 referrer、来源模糊或发现考试 DOM 标记时也默认禁用。
+- 禁用时除最长 1.5 秒的一次性 `postMessage` 验证监听外，不会创建翻译 UI、字幕轨、页面探针、持续定时器或媒体事件监听，也不会读取扩展存储或发起翻译请求。
+
+该保护用于减少插件对考试页面的影响，但任何插件都无法保证不会被学校的监考软件仅因“已安装”而报告。若考试规则禁止浏览器扩展，最稳妥的做法仍是在考试前从浏览器扩展管理页停用本扩展，并按学校要求使用指定浏览器或独立考试配置文件。
+
 切换显示偏好（双语、顺序、大小）不需要重新翻译；扩展端只缓存一份翻译 VTT，在前端渲染。
 
 ## 目录结构
@@ -80,14 +94,18 @@ tests/        Vitest 单元测试（覆盖 extension 核心逻辑）
 
 ```text
 build_config.js           构建目标（dev/store）与本地后端开关
+assessment_guard.js       Canvas 考试/作业来源检查与默认拒绝安全门
+canvas_course_bridge.js   仅限 Canvas 课程内容页/external_tools 的无数据页面证明桥
 browser_api.js            Chrome / Safari storage 与 runtime API 抽象
 config_keys.js            popup/options 共用的 per-provider API Key 逻辑
 constants.js              共享默认值和选项列表
+host_support.js           Echo360 / Canvas Instructure Media 播放器识别与宿主适配
 vtt.js                    纯 VTT 解析、格式化、双语与增量预览工具
 subtitle_strategy.js      浏览器检测与双语 VTT 构建策略
 storage.js                配置、偏好和本地字幕缓存
 video.js                  Echo360 视频发现、media-id 线索和页面探针桥接
 source_finder.js          字幕源发现（含 transcript-file API）和字幕到视频匹配
+player_caption_renderer.js Canvas Vidstack captions overlay 的定时字幕渲染
 bilingual_dom_renderer.js Echo360 原生 CC DOM 双语注入
 renderer.js               浏览器字幕 track / 原生 CC DOM 渲染编排与 cue 样式
 direct_translator.js      扩展内直连翻译与 partial VTT 回调（store 默认路径）
@@ -109,6 +127,8 @@ popup.js / options.js     扩展弹窗与选项页
 
 
 ## 后端启动
+
+后端与翻译 CLI 支持 Python 3.9 及以上版本。macOS 上建议使用采用 OpenSSL 的 Homebrew/pyenv Python；Xcode 自带的 LibreSSL Python 可启动程序，但当前 `urllib3` 不对该 TLS 栈提供完整支持。
 
 先进入仓库根目录：
 
@@ -188,41 +208,51 @@ npm run build:dev
 
 dev 构建保留本地后端入口和 localhost 权限。
 
-如果通过 Safari/Xcode 运行扩展，Xcode 工程还必须把 `manifest.json` 引用的每个脚本加入两个 Extension target 的 Resources。当前工作区可用下面的命令核对资源清单：
+`extension/` 是 Chrome 与 Safari 共用的唯一业务源码。Safari/Xcode 工程引用的是由它生成的 `dist/extension-store/` 发布态资源，而不是另一套需要手工维护的源码；这层构建产物会有意改写 `build_config.js`、`manifest.json` 和 `options.html`，以移除本地后端入口与权限。
+
+打开 Xcode 或 Build/Run 前先执行：
 
 ```bash
-npm run check:safari
+npm run safari:prepare
 ```
 
-修改扩展脚本后，需要在 Xcode 中重新 Build/Run containing app，并关闭后重新打开 Safari 的 Canvas/EchoVideo 页面；只运行 `npm run build` 不会更新已经安装的 Safari App bundle。
+该命令会从当前 `extension/` 重新生成 store 资源，并严格验证三件事：构建产物的每个文件内容与源码及发布态转换完全一致、Xcode 的两个 Extension target 都包含完整资源、所有 Xcode 引用都精确指向 `dist/extension-store/`。校验失败时不要继续用 Xcode 里的旧产物。
+
+修改扩展脚本后，还需要在 Xcode 中重新 Build/Run containing app，并关闭后重新打开 Safari 的 Canvas/EchoVideo 页面；生成资源本身不会更新已经安装的 Safari App bundle。普通质量门禁中的 `npm run check:safari` 也会执行相同的防漂移校验；若当前环境没有生成 Safari 工程则跳过工程校验。
 
 ## 测试
 
-单元测试覆盖 `extension/` 中的 VTT 解析、字幕策略、存储、翻译 payload 与错误处理逻辑：
+单元测试和属性测试覆盖 `extension/` 中的 VTT 解析、字幕策略、存储、翻译 payload、跨浏览器 API 适配与错误处理逻辑。提交前建议运行完整质量门禁：
 
 ```bash
-npm install
-npm test
+npm ci
+npm run check
 npm run test:coverage
 ```
 
-测试文件位于 `tests/unit/`；配置见 `vitest.config.js`。
+安装 `backend/requirements.txt` 后，可另行运行 Python 后端/CLI 冒烟回归：
+
+```bash
+npm run test:python
+```
+
+`npm run check` 会检查全部 JavaScript/Python 源文件语法，运行扩展测试，并生成 store/dev 两种扩展构建。测试文件位于 `tests/unit/`、`tests/property/` 和 `tests/python/`；配置见 `vitest.config.js`。
 
 ## 默认参数
 
 - provider: `google-web`
 - model: 默认空（Gemini 预设为 `gemini-3.1-flash-lite`）
 - target: `ZH`
-- max_paragraphs: `6`
+- max_paragraphs: `6`（Google 网页端点会按单条字幕刷新进度）
 - max_chars: `1200`
-- concurrency: `96`
-- rps: `0`
+- concurrency: `96`（首次请求沿用 1.4.2；失败时才自动尝试低并发恢复）
+- rps: `0`（首次请求不额外限速；失败时才自动尝试 `3` RPS 恢复）
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: 默认空
 - deepseek_thinking_mode: `disabled`
 
-支持的 provider：`google-web`、`deepseek`、`openai`、`gemini`、`deepl`。除 `google-web` 外均需填写 API Key。
+支持的 provider：`google-web`、`deepseek`、`openai`、`gemini`、`deepl`，以及仅开发版/本地后端可用的 `argos`。`google-web` 与 `argos` 不需要 API Key。
 
 目标语言选项：`ZH`、`ZH-HK`、`YUE`、`EN`、`JA`、`KO`、`FR`、`DE`、`ES`、`IT`、`PT`、`RU`、`AR`、`HI`。
 
@@ -238,22 +268,40 @@ dev 构建会额外保留本地后端调试参数，例如 `maxParagraphs`、`ma
 语言补充：
 
 - 当 provider 为 `deepl` 时，不支持 `YUE`（请使用 AI provider，如 `deepseek`/`openai`/`gemini`）
+- `argos` 当前明确使用英语作为源语言，支持 `ZH`（`en→zh`）与 `ZH-HK`（`en→zt`）等已安装语言对；不支持 `YUE`，也不接受 `EN` 作为目标语言
 
 Google Translate provider：
 
 - `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用
 - store 构建会由扩展前端直接请求；dev 构建可选择通过本地后端转发
-- 后端/脚本路径会自动使用 `concurrency=96, max_chars=1200, max_paragraphs=10`
+- 后端/脚本路径恢复 1.4.2 的速度配置：默认 `concurrency=96, rps=0`（不增加请求间隔），同时保持 `max_chars=1200, max_paragraphs=1` 以便逐条显示增量进度
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量，建议改用 AI/API provider（如 `deepseek`/`openai`/`gemini`/`deepl`）并填写自己的 API Key
 
-`google-web` 的直接扩展路径在 `rps=0`（默认值）时会自动使用受控的 `12` 请求/秒，并把同时运行的 worker 限制为 `48`；这是在尽量保持稳定的前提下提高吞吐的有界保护值。用户显式填写的正数 RPS 仍会生效。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
+`google-web` 的直接扩展路径恢复 1.4.2 的默认速度：最多 `96` 个 worker，默认 `rps=0`（不增加请求间隔）；显式设置正数 `rps` 时仍会按该值排队。每条字幕独立处理，遇到 `HTTP 429` 会按 `Retry-After` 或指数退避重试；最终失败的字幕保留原文、列入 `failed_items`，并且部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、重试、429、队列等待和最终失败摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
+
+Argos Translate provider（仅开发版）：
+
+`argos` 直接在现有 Python 翻译子进程中加载本机 Argos 模型，不需要再启动 LibreTranslate 服务，也不会把字幕发送到第三方。为了避免 CTranslate2 模型竞争和重复占用内存，运行时固定为单 worker。先在后端虚拟环境安装可选依赖和所需模型：
+
+```bash
+cd backend
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-argos.txt
+argospm update
+argospm install translate-en_zh
+python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["en"])'
+# 如需繁体中文：argospm install translate-en_zt
+```
+
+最后一条命令会显式预下载英语 MiniSBD 断句模型。然后构建并加载开发版扩展，在完整设置中选择 `Argos Translate（本地）`。保存时会自动启用本地后端；后端仍按原方式在 `127.0.0.1:8765` 启动。翻译过程中不会静默联网或下载模型：缺少依赖、语言包或断句模型时，界面会分别显示 `ARGOS_DEPENDENCY_MISSING` 或 `ARGOS_MODEL_MISSING` 及安装提示。
 
 
 
 ## 隐私
 
-详见 [PRIVACY.md](PRIVACY.md)。扩展会将字幕文本发送到用户选择的翻译服务；API Key 与字幕缓存保存在 Chrome 本地 storage。
+详见 [PRIVACY.md](PRIVACY.md)。扩展会将字幕文本发送到用户选择的翻译服务；选择 `argos` 时字幕只在本机处理。API Key 与字幕缓存保存在 Chrome 本地 storage。
 
 ## 后端翻译脚本调用方式
 

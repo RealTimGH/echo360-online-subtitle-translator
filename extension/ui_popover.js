@@ -3,7 +3,26 @@
   const { TARGET_OPTIONS, TARGET_LABELS, DEFAULT_SUBTITLE_SIZE, PROVIDER_LABELS, STORAGE_KEY } = ns.constants;
 
   function openOptionsPage() {
-    chrome.runtime.sendMessage({ type: "OPEN_OPTIONS_PAGE" });
+    try {
+      const result = ns.browserApi?.runtime?.sendMessage
+        ? ns.browserApi.runtime.sendMessage({ type: "OPEN_OPTIONS_PAGE" })
+        : chrome.runtime.sendMessage({ type: "OPEN_OPTIONS_PAGE" });
+      const handleResponse = (response) => {
+        if (response && response.ok === false) {
+          ns.ui?.showError?.(response, { phase: "preferences" });
+        }
+        return response;
+      };
+      if (result && typeof result.then === "function") {
+        result.then(handleResponse).catch((error) => ns.ui?.showError?.(error, { phase: "preferences" }));
+      }
+    } catch (error) {
+      console.error("[echo360-translator][ui] opening options failed", ns.errorUtils?.serializeError?.(error, { phase: "preferences" }) || {
+        code: "RUNTIME_MESSAGE_ERROR",
+        message: String(error?.message || error || "打开设置失败"),
+      });
+      ns.ui?.showError?.(error, { phase: "preferences" });
+    }
   }
 
   function styleDisabledControl(control, disabled) {
@@ -16,17 +35,21 @@
   // The "翻译字幕设置" popover: per-lesson display prefs, target language,
   // and a read-only summary of the active translation provider with a link
   // out to the full options page.
-  function create(root, handlers) {
+  function create(root, handlers, { trigger = null } = {}) {
     let browserModePrefs = { bilingual: false, reverseOrder: false };
+    let previouslyFocused = null;
 
     const pop = document.createElement("div");
     pop.id = "echo360-translator-popover";
     pop.setAttribute("role", "dialog");
-    pop.setAttribute("aria-label", "翻译字幕设置");
+    pop.setAttribute("aria-labelledby", "echo360-popover-title");
     // Explicit inline display:none so the JS toggle (=== "none") works correctly.
     pop.style.display = "none";
     pop.innerHTML = `
-      <div class="echo360-popover-title">翻译字幕设置</div>
+      <div class="echo360-popover-header">
+        <div id="echo360-popover-title" class="echo360-popover-title" tabindex="-1">翻译字幕设置</div>
+        <button type="button" class="echo360-popover-close" aria-label="关闭字幕设置" title="关闭字幕设置">×</button>
+      </div>
       <div class="echo360-popover-provider-row">
         <span>翻译服务：<strong id="echo360-current-provider">-</strong></span>
         <button id="echo360-change-provider-btn" class="echo360-popover-link-btn echo360-popover-link-btn--underline">更改</button>
@@ -77,7 +100,6 @@
           ${TARGET_OPTIONS.map((t) => `<option value="${t}">${(TARGET_LABELS && TARGET_LABELS[t]) || t}</option>`).join("")}
         </select>
       </label>
-      <div id="echo360-status-text" class="echo360-status-text" role="status" aria-live="polite"></div>
       <div class="echo360-popover-divider"></div>
       <button id="echo360-open-options-btn" class="echo360-popover-link-btn" title="打开完整设置">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" style="flex-shrink:0;">
@@ -100,8 +122,32 @@
       size: pop.querySelector("#echo360-pref-size"),
       sizeLabel: pop.querySelector("#echo360-pref-size-label"),
       target: pop.querySelector("#echo360-pref-target"),
-      statusText: pop.querySelector("#echo360-status-text"),
+      close: pop.querySelector(".echo360-popover-close"),
+      title: pop.querySelector("#echo360-popover-title"),
     };
+
+    function isVisible() {
+      return pop.style.display !== "none";
+    }
+
+    function hide({ restoreFocus = false } = {}) {
+      if (!isVisible()) return;
+      pop.style.display = "none";
+      trigger?.setAttribute?.("aria-expanded", "false");
+      if (restoreFocus) {
+        const focusTarget = trigger || previouslyFocused;
+        if (focusTarget?.isConnected !== false) focusTarget?.focus?.();
+      }
+      previouslyFocused = null;
+    }
+
+    refs.close.addEventListener("click", () => hide({ restoreFocus: true }));
+    pop.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      hide({ restoreFocus: true });
+    });
 
     function syncRenderModeControls() {
       // Bilingual/reverse-order/size only apply to the browser <track>
@@ -160,27 +206,53 @@
     refs.target.addEventListener("change", (event) => handlers.onTargetChanged?.(event));
 
     async function toggle() {
-      const show = pop.style.display === "none";
-      pop.style.display = show ? "block" : "none";
-      if (!show) return;
+      const show = !isVisible();
+      if (!show) {
+        hide({ restoreFocus: true });
+        return false;
+      }
 
-      const prefs = await ns.storage.getPrefs();
-      const cfg = await ns.storage.getConfig();
-      browserModePrefs = {
-        bilingual: prefs.browserBilingual ?? (prefs.useNativeSubtitles === true ? !!prefs.bilingual : false),
-        reverseOrder: prefs.browserReverseOrder ?? (prefs.useNativeSubtitles === true ? !!prefs.reverseOrder : false),
-      };
-      applyProviderLabel(cfg);
-      refs.enabled.checked = !!prefs.enabled;
-      refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled !== false;
-      refs.bilingual.checked = !!browserModePrefs.bilingual;
-      refs.reverseOrder.checked = !!browserModePrefs.reverseOrder;
-      // Checked = Beta native CC injection; unchecked = default browser track.
-      // (prefs.useNativeSubtitles===true still means "use browser track".)
-      refs.nativeCc.checked = prefs.useNativeSubtitles !== true;
-      syncRenderModeControls();
-      refs.size.value = prefs.size || DEFAULT_SUBTITLE_SIZE;
-      refs.target.value = (cfg.target || "ZH").toUpperCase();
+      previouslyFocused = document.activeElement;
+      pop.style.display = "block";
+      trigger?.setAttribute?.("aria-expanded", "true");
+
+      try {
+        const prefs = await ns.storage.getPrefs();
+        const cfg = await ns.storage.getConfig();
+        browserModePrefs = {
+          bilingual: prefs.browserBilingual ?? (prefs.useNativeSubtitles === true ? !!prefs.bilingual : false),
+          reverseOrder: prefs.browserReverseOrder ?? (prefs.useNativeSubtitles === true ? !!prefs.reverseOrder : false),
+        };
+        applyProviderLabel(cfg);
+        refs.enabled.checked = !!prefs.enabled;
+        refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled !== false;
+        refs.bilingual.checked = !!browserModePrefs.bilingual;
+        refs.reverseOrder.checked = !!browserModePrefs.reverseOrder;
+        // Checked = Beta native CC injection; unchecked = default browser track.
+        // (prefs.useNativeSubtitles===true still means "use browser track".)
+        refs.nativeCc.checked = prefs.useNativeSubtitles !== true;
+        syncRenderModeControls();
+        refs.size.value = prefs.size || DEFAULT_SUBTITLE_SIZE;
+        refs.target.value = (cfg.target || "ZH").toUpperCase();
+        // The user may close the popover while asynchronous storage reads are
+        // in flight. Do not steal focus back into an element that is now
+        // hidden after their explicit close action.
+        if (!isVisible()) return false;
+        refs.close.focus();
+        return true;
+      } catch (error) {
+        console.error("[echo360-translator][ui] settings load failed", ns.errorUtils?.serializeError?.(error, { phase: "preferences" }) || {
+          code: "STORAGE_ERROR",
+          message: String(error?.message || error || "设置读取失败"),
+        });
+        hide({ restoreFocus: true });
+        ns.ui?.showError?.(error, {
+          phase: "preferences",
+          code: "STORAGE_ERROR",
+          onCancel: () => ns.ui?.clearError?.(),
+        });
+        return false;
+      }
     }
 
     function readPrefs() {
@@ -207,13 +279,9 @@
     return {
       el: pop,
       toggle,
-      hide() {
-        pop.style.display = "none";
-      },
+      hide,
+      isVisible,
       readPrefs,
-      setStatusText(text) {
-        refs.statusText.textContent = text;
-      },
     };
   }
 
