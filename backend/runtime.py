@@ -7,10 +7,104 @@ import shutil
 import sys
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 APP_DIR_NAME = "Echo360 Subtitle Translator"
 ASSET_DIR_NAME = "backend_assets"
+URL_SCHEME = "echo360-subtitle-backend"
+URL_SCHEME_START = f"{URL_SCHEME}://start"
+WINDOWS_URL_SCHEME_REGISTRY_PATH = rf"Software\Classes\{URL_SCHEME}"
+
+
+def parse_backend_url(value: object) -> dict[str, str] | None:
+    """Parse a launch URL delivered by a browser or the operating system.
+
+    A custom URL is passed as an ordinary command-line argument by Windows
+    and by PyInstaller's macOS argv emulation.  Keep the parser deliberately
+    small: the URL is only a wake-up signal, not a command channel.  The
+    caller may therefore safely discard the value after checking its scheme.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != URL_SCHEME:
+        return None
+    action = (parsed.netloc or parsed.path.lstrip("/")).strip().lower()
+    if not action:
+        return None
+    return {
+        "scheme": URL_SCHEME,
+        "action": action,
+        "url": value.strip(),
+    }
+
+
+def _quote_windows_command_arg(value: object) -> str:
+    """Quote one executable path for a Windows registry command value."""
+    # A Windows path cannot contain a literal double quote.  Escaping here
+    # still keeps this helper safe if it is reused for a non-path argument.
+    return '"' + str(value).replace('"', '\\"') + '"'
+
+
+def windows_url_scheme_command(executable: str | Path | None = None) -> str:
+    """Build the HKCU command that handles ``echo360-subtitle-backend://``."""
+    executable_value = str(executable or sys.executable or "python")
+    # Preserve a Windows drive path when tests/build tooling inspect the
+    # command from a non-Windows host; pathlib on POSIX would otherwise turn
+    # ``C:\\Program Files\\...`` into a bogus path under the repository.
+    if len(executable_value) >= 2 and executable_value[1] == ":":
+        executable_path = Path(executable_value)
+    else:
+        executable_path = Path(executable_value).resolve()
+    if is_frozen():
+        return f'{_quote_windows_command_arg(executable_path)} "%1"'
+    launcher_path = Path(__file__).resolve().parent / "launcher.py"
+    return (
+        f'{_quote_windows_command_arg(executable_path)} '
+        f'{_quote_windows_command_arg(launcher_path)} "%1"'
+    )
+
+
+def register_windows_url_scheme(executable: str | Path | None = None) -> bool:
+    """Register the current-user URL handler on Windows.
+
+    The registration is intentionally HKCU-only: it needs no elevation and
+    can be removed with the user's profile.  Non-Windows callers are a no-op
+    so normal startup can invoke this function on every platform.
+    """
+    if platform.system() != "Windows":
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+
+    command = windows_url_scheme_command(executable)
+    try:
+        key_write = getattr(winreg, "KEY_WRITE", 0x20006)
+        reg_sz = getattr(winreg, "REG_SZ", 1)
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            WINDOWS_URL_SCHEME_REGISTRY_PATH,
+            0,
+            key_write,
+        ) as scheme_key:
+            winreg.SetValueEx(scheme_key, None, 0, reg_sz, "URL:Echo360 Subtitle Backend")
+            winreg.SetValueEx(scheme_key, "URL Protocol", 0, reg_sz, "")
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            WINDOWS_URL_SCHEME_REGISTRY_PATH + r"\shell\open\command",
+            0,
+            key_write,
+        ) as command_key:
+            winreg.SetValueEx(command_key, None, 0, reg_sz, command)
+    except (OSError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def is_frozen() -> bool:

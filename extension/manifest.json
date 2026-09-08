@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Echo360 Online Subtitle Translator",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Translate Echo360 and Canvas Instructure Media lecture subtitles and display them on recorded videos.",
   "options_page": "options.html",
   "icons": {
@@ -72,7 +72,7 @@
       ],
       "all_frames": true,
       "js": [
-        "assessment_guard.js",
+        "assessment_guard_main.js",
         "page_probe.js"
       ],
       "run_at": "document_start",

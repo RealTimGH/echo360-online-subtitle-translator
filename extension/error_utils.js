@@ -823,7 +823,8 @@
 
   function hasRateLimit(code, status, failureCodes, metrics) {
     return status === 429 || code === "HTTP_429" ||
-      Number(metrics?.rateLimitCount || 0) > 0 || Number(failureCodes?.HTTP_429 || 0) > 0;
+      Number(metrics?.rateLimitCount || 0) > 0 || Number(metrics?.google429Responses || 0) > 0 ||
+      Number(failureCodes?.HTTP_429 || 0) > 0;
   }
 
   const NON_RETRYABLE_ERROR_CODES = new Set([
@@ -842,6 +843,11 @@
     "PROVIDER_API_KEY_MISSING",
     "ARGOS_DEPENDENCY_MISSING",
     "ARGOS_MODEL_MISSING",
+    "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+    "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
+    "ARGOS_BACKEND_START_TIMEOUT",
+    "ARGOS_BACKEND_START_UNAVAILABLE",
+    "ARGOS_BACKEND_PORT_UNSUPPORTED",
     "INVALID_PROVIDER_RESPONSE",
     "INVALID_PROVIDER_OUTPUT",
     "INCONSISTENT_TRANSLATION_RESULT",
@@ -910,7 +916,11 @@
     let summary = message || "发生了未分类错误";
     let recommendation = "请展开“诊断详情”，按建议处理后重试。";
 
-    if (code === "GOOGLE_WEB_ALL_REQUESTS_FAILED") {
+    if (code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN") {
+      title = "Google 限流熔断已触发";
+      summary = "短时间内收到了大量 HTTP 429，扩展已停止继续请求 Google；自动 Argos 备份未能完成。";
+      recommendation = "确认 Echo360 Subtitle Backend 已正确安装且可由系统启动，然后重新翻译；无需继续重试 Google。";
+    } else if (code === "GOOGLE_WEB_ALL_REQUESTS_FAILED") {
       if (rateLimited) {
         title = "Google 网页翻译被限流";
         summary = `Google 网页端点拒绝了本次请求${total != null ? `（${failed ?? total}/${total} 条字幕失败）` : ""}，检测到 HTTP 429。`;
@@ -1110,6 +1120,17 @@
       title = "本地后端返回格式无效";
       summary = "本地后端有响应，但内容不是扩展约定的 JSON/任务格式；结果没有被当作成功。";
       recommendation = "确认 Backend URL 指向当前版本，并重新启动本地后端；如果使用代理，请关闭会改写响应的中间层。";
+    } else if ([
+      "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
+      "ARGOS_BACKEND_START_TIMEOUT",
+      "ARGOS_BACKEND_START_UNAVAILABLE",
+      "ARGOS_BACKEND_PORT_UNSUPPORTED",
+    ].includes(code)) {
+      title = "Argos 后端没有自动启动";
+      summary = message || "扩展已请求操作系统启动 Argos 后端，但没有连接成功。";
+      recommendation = code === "ARGOS_BACKEND_PORT_UNSUPPORTED"
+        ? "把 Backend URL 改回 http://127.0.0.1:8765 后重试。"
+        : "Windows 请先运行发布包内的“安装并启动”入口；macOS 请把应用移到 Applications 并至少打开一次。";
     } else if (code === "BACKEND_DISABLED" || code === "BACKEND_URL_MISSING" || code === "BACKEND_REQUEST_ERROR" || code === "BACKEND_NETWORK_ERROR") {
       title = "本地后端请求失败";
       summary = message || "扩展没有得到本地后端的有效响应。";

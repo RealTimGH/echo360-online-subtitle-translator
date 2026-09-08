@@ -48,9 +48,9 @@ CORS_ORIGIN_PATTERN = (
     r")$"
 )
 WEB_PROVIDER_LIMITS = {
-    # Match the 1.4.2 local-backend speed profile. rps=0 means no default
-    # pacing; max_paragraphs=1 remains an incremental-display choice.
-    "google-web": {"concurrency": 96, "rps": 0.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
+    # Cap Google Web at half of the former 96-worker profile. rps=0 means no
+    # default pacing; max_paragraphs=1 remains an incremental-display choice.
+    "google-web": {"concurrency": 48, "rps": 0.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
     # Argos runs in the translator subprocess and uses English as the source.
     # A single worker avoids loading/contending on the same CTranslate2 model
     # from multiple Python threads.
@@ -61,8 +61,11 @@ WEB_PROVIDER_LIMITS = {
 class TranslateRequest(BaseModel):
     vtt_text: str = Field(..., min_length=1)
     api_key: str = ""
-    provider: str = "deepseek"
-    model: str = "deepseek-v4-flash"
+    # Keep the backend's omitted-field behavior aligned with the extension's
+    # first-install configuration.  The browser normally sends this field,
+    # but direct/API callers and older clients may omit it.
+    provider: str = "google-web"
+    model: str = ""
     endpoint: str = ""
     target: str = "ZH"
     max_paragraphs: int = Field(6, ge=0)
@@ -129,6 +132,7 @@ ERROR_TITLES = {
     "INVALID_PROVIDER_OUTPUT": "翻译服务返回内容无效",
     "TRANSLATION_CANCELLED": "翻译已取消",
     "GOOGLE_WEB_ALL_REQUESTS_FAILED": "Google 网页翻译全部请求失败",
+    "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN": "Google 网页翻译限流熔断",
     "GOOGLE_WEB_INVALID_RESPONSES": "Google 网页翻译返回格式无效",
     "GOOGLE_WEB_NO_TARGET_TRANSLATIONS": "Google 网页翻译没有返回目标语言",
     "INVALID_BACKEND_RESPONSE": "本地后端返回格式无效",
@@ -582,7 +586,7 @@ def build_translator_args(
             else max(0.0, rps)
         )
         retries = min(2, retries)
-        warnings.append(
+        logger.info(
             f"{limit_key} effective settings: concurrency={concurrency}, rps={rps:g}, "
             f"max_paragraphs={max_paragraphs}, retries={retries}"
         )
@@ -1030,10 +1034,13 @@ def no_result_failure_code(
     provider_results: int,
     target_results: int | None,
 ) -> str:
-    if provider == "argos":
-        for code in ("ARGOS_DEPENDENCY_MISSING", "ARGOS_MODEL_MISSING"):
-            if failure_codes.get(code, 0) == failed and failed > 0:
-                return code
+    # A Google job may have switched its unresolved cues to Argos after the
+    # 429 circuit opened. If that local fallback is the sole remaining cause,
+    # expose the actionable Argos diagnosis even though the requested provider
+    # recorded in the job remains google-web.
+    for code in ("ARGOS_DEPENDENCY_MISSING", "ARGOS_MODEL_MISSING"):
+        if failure_codes.get(code, 0) == failed and failed > 0:
+            return code
     if provider != "google-web":
         return "NO_TRANSLATIONS"
     invalid_response_count = sum(
@@ -1225,16 +1232,16 @@ def run_translation(
     if not translator_runtime_available():
         raise_problem(500, "TRANSLATOR_SCRIPT_MISSING", "本地翻译脚本不存在", phase="backend")
     if provider_name == "google-web":
-        warnings.append(f"{limit_key} is experimental and uses an unofficial web endpoint; stability is not guaranteed")
         limits = WEB_PROVIDER_LIMITS[limit_key]
         rps_note = f"rps<={limits['rps']}" if float(limits["rps"]) > 0 else "rps=0 (unlimited default)"
-        warnings.append(
-            f"{limit_key} uses 1.4.2 speed settings: concurrency<={limits['concurrency']}, "
+        logger.info(
+            f"{limit_key} uses an unofficial web endpoint; stability is not guaranteed; "
+            f"speed settings: concurrency<={limits['concurrency']}, "
             f"max_chars<={limits['max_chars']}, max_paragraphs={limits['max_paragraphs']}, {rps_note}"
         )
     elif provider_name == "argos":
         limits = WEB_PROVIDER_LIMITS[provider_name]
-        warnings.append(
+        logger.info(
             f"argos runs locally with English source: concurrency<={limits['concurrency']}, "
             f"max_chars<={limits['max_chars']}, max_paragraphs={limits['max_paragraphs']}"
         )

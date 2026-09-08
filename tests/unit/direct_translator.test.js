@@ -16,7 +16,7 @@ describe("direct translator provider safeguards", () => {
   it("uses the configured bounded Google web cadence", () => {
     const adapter = translator.getProviderAdapter("google-web");
 
-    expect(adapter.concurrencyCap).toBe(96);
+    expect(adapter.concurrencyCap).toBe(48);
     expect(adapter.defaultRps).toBe(0);
   });
 
@@ -173,6 +173,39 @@ describe("direct translator provider safeguards", () => {
       );
     } finally {
       errorLog.mockRestore();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("opens the Google 429 circuit after a burst and skips retries and adaptive Google recovery", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response("rate limited", { status: 429, headers: { "retry-after": "0" } })
+    ));
+    const cues = Array.from({ length: 12 }, (_, index) => (
+      `\n${index + 1}\n00:00:${String(index).padStart(2, "0")}.000 --> 00:00:${String(index + 1).padStart(2, "0")}.000\nline ${index + 1}\n`
+    )).join("");
+
+    try {
+      await expect(translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        concurrency: 2,
+        rps: 0,
+        retries: 2,
+        timeout: 5,
+        max_paragraphs: 1,
+        max_chars: 1200,
+        vtt_text: `WEBVTT\n${cues}`,
+      })).rejects.toMatchObject({
+        code: "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+        metrics: expect.objectContaining({
+          google429Responses: 5,
+          googleCircuitTripped: true,
+        }),
+      });
+      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(5);
+      expect(fetchMock.mock.calls.length).toBeLessThan(12);
+    } finally {
       fetchMock.mockRestore();
     }
   });

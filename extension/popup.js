@@ -177,6 +177,16 @@ async function saveConfig() {
       useLocalBackend: enableLocalBackend && (provider === "argos" || !!(value || {}).useLocalBackend),
     };
     await storageSet({ [STORAGE_KEY]: config });
+    if (provider === "argos") {
+      status.textContent = "设置已保存，正在启动 Argos 后端…";
+      const response = await extensionApi.runtime.sendMessage({
+        type: "ensure-argos-backend",
+        backendUrl: config.backendUrl,
+      });
+      if (!response?.ok) {
+        throw extensionApi.toError(response, "ARGOS_BACKEND_START_FAILED", "Argos 设置已保存，但后端启动失败");
+      }
+    }
     status.textContent = "已保存";
     status.classList.remove("error");
   } catch (err) {

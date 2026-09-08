@@ -366,11 +366,102 @@
     return await ns.backendClient.waitDirectJob(create.job_id, waitOptions);
   }
 
-  async function translateWithConfig(cfg, backendUrl, payload, options = {}) {
-    if (cfg.useLocalBackend && ns.buildConfig?.enableLocalBackend !== false) {
-      return await translateWithBackend(backendUrl, payload, options);
+  function shouldFallbackGoogleToArgos(error, payload) {
+    if (String(payload?.provider || "").toLowerCase() !== "google-web") return false;
+    const target = String(payload?.target || "ZH").toUpperCase();
+    if (["YUE", "CANTONESE", "EN"].includes(target)) return false;
+    const code = String(error?.code || error?.error_code || "").toUpperCase();
+    const rateLimitCount = Number(
+      error?.google429Responses ??
+      error?.metrics?.google429Responses ??
+      error?.failure_codes?.HTTP_429 ??
+      error?.failureCodes?.HTTP_429 ??
+      0
+    );
+    return code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN" ||
+      error?.googleCircuitTripped === true ||
+      error?.metrics?.googleCircuitTripped === true ||
+      rateLimitCount >= 5;
+  }
+
+  function buildArgosFallbackPayload(payload) {
+    return {
+      ...payload,
+      provider: "argos",
+      model: "",
+      endpoint: "",
+      concurrency: 1,
+      rps: 0,
+      retries: 0,
+      max_paragraphs: 6,
+      force_refresh: true,
+    };
+  }
+
+  async function translateWithArgosFallback(backendUrl, payload, options, googleError) {
+    const rateLimitCount = Number(
+      googleError?.google429Responses ??
+      googleError?.metrics?.google429Responses ??
+      googleError?.failure_codes?.HTTP_429 ??
+      googleError?.failureCodes?.HTTP_429 ??
+      0
+    );
+    options.onProgress?.(
+      0,
+      0,
+      "Google Translate 触发大量 429，正在启动 Argos 离线翻译…",
+      { phase: "argos-fallback", fallbackProvider: "argos", google429Responses: rateLimitCount }
+    );
+    if (typeof ns.backendClient?.ensureArgosBackend !== "function") {
+      const error = new Error("扩展缺少 Argos 后端启动器，无法执行 Google 429 自动备份");
+      error.code = "ARGOS_BACKEND_START_UNAVAILABLE";
+      error.phase = "backend";
+      error.cause = googleError;
+      throw error;
     }
-    return await translateInExtension(payload, options);
+    await ns.backendClient.ensureArgosBackend(backendUrl);
+    const result = await translateWithBackend(
+      backendUrl,
+      buildArgosFallbackPayload(payload),
+      options
+    );
+    const warning = `Google Translate 在短时间内返回 ${rateLimitCount || "多"} 次 HTTP 429，已停止 Google 重试并改用本机 Argos 完成翻译。`;
+    return {
+      ...result,
+      warnings: [warning, ...(Array.isArray(result?.warnings) ? result.warnings : [])],
+      metrics: {
+        ...(result?.metrics || {}),
+        initialProvider: "google-web",
+        fallbackProvider: "argos",
+        google429Responses: rateLimitCount,
+        googleCircuitTripped: true,
+      },
+    };
+  }
+
+  async function translateWithConfig(cfg, backendUrl, payload, options = {}) {
+    try {
+      if (String(payload?.provider || cfg?.provider || "").toLowerCase() === "argos") {
+        if (ns.buildConfig?.enableLocalBackend === false || typeof ns.backendClient?.ensureArgosBackend !== "function") {
+          const error = new Error("当前构建无法启动本地 Argos 后端");
+          error.code = "ARGOS_BACKEND_START_UNAVAILABLE";
+          error.phase = "backend";
+          throw error;
+        }
+        options.onProgress?.(0, 0, "正在启动 Argos 离线翻译后端…", { phase: "argos-startup" });
+        await ns.backendClient.ensureArgosBackend(backendUrl);
+        return await translateWithBackend(backendUrl, payload, options);
+      }
+      if (cfg.useLocalBackend && ns.buildConfig?.enableLocalBackend !== false) {
+        return await translateWithBackend(backendUrl, payload, options);
+      }
+      return await translateInExtension(payload, options);
+    } catch (error) {
+      if (!shouldFallbackGoogleToArgos(error, payload) || ns.buildConfig?.enableLocalBackend === false) {
+        throw error;
+      }
+      return await translateWithArgosFallback(backendUrl, payload, options, error);
+    }
   }
 
   async function buildCacheKey(cfg, sourceId, vttText) {
@@ -391,6 +482,8 @@
     translateWithBackend,
     translateInExtension,
     translateWithConfig,
+    shouldFallbackGoogleToArgos,
+    buildArgosFallbackPayload,
     buildCacheKey,
   };
 })();

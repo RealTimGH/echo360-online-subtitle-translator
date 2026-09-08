@@ -19,6 +19,9 @@ const SUPPORTED_TARGET_CODES_BG = globalThis.Echo360Translator?.errorUtils?.SUPP
 ]);
 
 const DIRECT_LOG_TAG = "[echo360-translator][background]";
+const ARGOS_BACKEND_LAUNCH_URL = "echo360-subtitle-backend://start";
+const ARGOS_BACKEND_START_TIMEOUT_MS = 20000;
+let argosBackendStartPromise = null;
 
 function backgroundLog(level, event, details = {}) {
   const logger = console?.[level] || console?.log;
@@ -470,6 +473,103 @@ function isAllowedBackendUrl(rawUrl) {
   } catch (_) {
     return false;
   }
+}
+
+function normalizeAutoLaunchBackendUrl(rawUrl) {
+  let url;
+  try {
+    url = new URL(rawUrl || "http://127.0.0.1:8765");
+  } catch (_) {
+    throw Object.assign(new Error("Argos 自动启动收到的 Backend 地址无效"), {
+      code: "BACKEND_URL_INVALID",
+      status: 400,
+    });
+  }
+  const hostname = String(url.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+  if (url.protocol !== "http:" || !["localhost", "127.0.0.1", "::1"].includes(hostname)) {
+    throw Object.assign(new Error("Argos 自动启动只允许使用本机 HTTP Backend 地址"), {
+      code: "BACKEND_URL_INVALID",
+      status: 400,
+    });
+  }
+  const port = Number(url.port || 80);
+  if (port !== 8765) {
+    throw Object.assign(new Error("Argos 自动启动当前只支持默认端口 8765"), {
+      code: "ARGOS_BACKEND_PORT_UNSUPPORTED",
+      status: 400,
+    });
+  }
+  return `http://${hostname === "::1" ? "[::1]" : hostname}:8765`;
+}
+
+async function argosBackendHealth(backendUrl, timeoutMs = 900) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${backendUrl}/health`, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null);
+    return body?.ok === true;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function startAndWaitForArgosBackend(rawBackendUrl) {
+  const backendUrl = normalizeAutoLaunchBackendUrl(rawBackendUrl);
+  if (await argosBackendHealth(backendUrl)) {
+    return { ready: true, launched: false, backendUrl };
+  }
+
+  let launchTab = null;
+  try {
+    launchTab = await extensionApi.tabs.create({
+      url: `${ARGOS_BACKEND_LAUNCH_URL}?port=8765`,
+      active: false,
+    });
+  } catch (error) {
+    throw Object.assign(new Error(
+      "无法调用 Argos 后端启动协议；请先安装并至少启动一次 Echo360 Subtitle Backend"
+    ), {
+      code: "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
+      phase: "backend",
+      cause: error,
+    });
+  }
+
+  const startedAt = Date.now();
+  try {
+    while (Date.now() - startedAt < ARGOS_BACKEND_START_TIMEOUT_MS) {
+      if (await argosBackendHealth(backendUrl, 700)) {
+        return { ready: true, launched: true, backendUrl };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  } finally {
+    if (Number.isInteger(Number(launchTab?.id))) {
+      await extensionApi.tabs.remove(Number(launchTab.id)).catch(() => {});
+    }
+  }
+  throw Object.assign(new Error(
+    "已请求操作系统启动 Argos 后端，但 20 秒内没有连接成功"
+  ), {
+    code: "ARGOS_BACKEND_START_TIMEOUT",
+    phase: "backend",
+  });
+}
+
+async function ensureArgosBackend(rawBackendUrl) {
+  if (!argosBackendStartPromise) {
+    argosBackendStartPromise = startAndWaitForArgosBackend(rawBackendUrl)
+      .finally(() => { argosBackendStartPromise = null; });
+  }
+  return argosBackendStartPromise;
 }
 
 async function fetchAllowedTextResource(rawUrl) {
@@ -1320,6 +1420,21 @@ extensionApi.runtime.addOnMessageListener(async (message) => {
       return { ok: true, data: null };
     } catch (error) {
       return backgroundErrorResponse(error, { phase: "preferences" }, "RUNTIME_MESSAGE_ERROR");
+    }
+  }
+
+  if (message.type === "ensure-argos-backend") {
+    if (buildConfig.enableLocalBackend === false) {
+      return backgroundErrorResponse(
+        Object.assign(new Error("当前构建未启用本地 Argos 后端"), { code: "BACKEND_DISABLED", status: 503 }),
+        { phase: "backend" },
+        "BACKEND_DISABLED"
+      );
+    }
+    try {
+      return { ok: true, data: await ensureArgosBackend(message.backendUrl) };
+    } catch (error) {
+      return backgroundErrorResponse(error, { phase: "backend" }, "ARGOS_BACKEND_START_FAILED");
     }
   }
 

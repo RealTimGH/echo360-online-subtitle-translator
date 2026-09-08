@@ -133,6 +133,22 @@ describe("friendlyErrorMessage", () => {
 });
 
 describe("backend response contract", () => {
+  it("asks the service worker to ensure the Argos backend is ready", async () => {
+    runtimeSendMessage.mockResolvedValue({
+      ok: true,
+      data: { ready: true, launched: true, backendUrl: "http://127.0.0.1:8765" },
+    });
+
+    await expect(client.ensureArgosBackend("http://127.0.0.1:8765")).resolves.toMatchObject({
+      ready: true,
+      launched: true,
+    });
+    expect(runtimeSendMessage).toHaveBeenCalledWith({
+      type: "ensure-argos-backend",
+      backendUrl: "http://127.0.0.1:8765",
+    });
+  });
+
   it("normalizes camelCase job IDs at the creation boundary", () => {
     expect(client.validateJobCreationResponse({ jobId: "  job-42  " })).toEqual({
       jobId: "  job-42  ",

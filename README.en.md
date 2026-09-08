@@ -4,7 +4,7 @@
 
 Chrome/Safari extension for loading translated subtitles on Echo360 recordings and Canvas-embedded Instructure Media videos; the local FastAPI backend is kept as a development, fallback, and batch-processing path.
 
-Current extension version: **1.5.0**
+Current extension version: **1.5.1**
 
 ## What It Does
 
@@ -166,12 +166,12 @@ Invoke-WebRequest http://127.0.0.1:8765/health
 
 Release artifacts bundle Python, FastAPI, the translator, the Argos/CTranslate2 runtime, `en→zh`, `en→zt`, and the English MiniSBD model in one application directory. End users do not install Python, pip, a virtual environment, or Argos models:
 
-- macOS: extract `echo360-online-subtitle-translator-backend-macos-*.tar.gz` and launch `Echo360 Subtitle Backend.app`;
-- Windows: extract `echo360-online-subtitle-translator-backend-windows-x64.zip` and launch `Echo360SubtitleBackend\echo360-subtitle-backend.exe`.
+- macOS: extract `echo360-online-subtitle-translator-backend-macos-*.tar.gz`, move `Echo360 Subtitle Backend.app` to Applications, and open it at least once;
+- Windows: extract `echo360-online-subtitle-translator-backend-windows-x64.zip`, then run `Echo360SubtitleBackend\install-and-launch-echo360-subtitle-backend.cmd` once. It registers the launch protocol for the current user only and does not require administrator rights.
 
 The program listens only on `127.0.0.1:8765` by default, so the extension keeps using its existing Backend URL. Quit the program to stop the backend. Translation cache files go to the current user's platform cache directory rather than the application directory.
 
-On first launch, the read-only bundled Argos models are copied into the current user's application-data directory, so that launch can take longer than subsequent ones. The workflow artifacts are intended for testing and internal distribution until Windows Authenticode signing and Apple Developer ID notarization credentials are added. The user starts this standalone program explicitly; browser-managed startup would require a separate installer and Native Messaging integration and is outside this environment-free packaging change.
+On first launch, the read-only bundled Argos models are copied into the current user's application-data directory, so that launch can take longer than subsequent ones. After the one-time installation/registration above, the extension checks `/health` whenever Argos is selected, used, or needed as the Google 429 fallback. If the backend is not running, it asks Windows/macOS to open `echo360-subtitle-backend://start` and waits up to 20 seconds. Automatic startup supports only the default `http://127.0.0.1:8765` endpoint (`localhost` and `[::1]` are equivalent); custom ports still require a manual launch. The workflow artifacts are intended for testing and internal distribution until Windows Authenticode signing and Apple Developer ID notarization credentials are added.
 
 After a backend update, rebuild with one command on each target operating system (PyInstaller does not cross-compile):
 
@@ -269,7 +269,7 @@ npm run test:python
 - target: `ZH`
 - max_paragraphs: `6` (the Google web endpoint refreshes progress per cue)
 - max_chars: `1200`
-- concurrency: `96` (the 1.4.2 profile is tried first; recovery lowers it only after a failed run)
+- concurrency: the shared setting defaults to `96`; Google Translate is capped at `48`, with other providers unchanged
 - rps: `0` (no added pacing on the first run; recovery uses `3` RPS only after a failed run)
 - retries: `1`
 - timeout: `10`
@@ -295,11 +295,11 @@ Language notes:
 Google Translate provider:
 - `google-web` uses an unofficial web endpoint and does not require an API key, so it is useful for quick first-run testing
 - The store build calls it directly from the extension frontend; the dev build can optionally proxy it through the local backend
-- The backend/script path restores the 1.4.2 speed profile: default `concurrency=96, rps=0` (no added pacing), while keeping `max_chars=1200, max_paragraphs=1` for independent incremental updates
+- The backend/script path caps Google concurrency at `48` (half of the former `96`) while retaining `rps=0, max_chars=1200, max_paragraphs=1`
 - This endpoint is unofficial, so stability, availability, and translation quality are not guaranteed
 - For better subtitle translation quality, use an AI/API provider such as `deepseek`, `openai`, `gemini`, or `deepl` with your own API key
 
-For the direct extension path, `google-web` restores the 1.4.2 default speed profile: up to `96` workers with default `rps=0` (no added pacing). An explicitly supplied positive `rps` is still honored. Each cue is handled independently; `HTTP 429` uses `Retry-After` or exponential backoff, failed cues keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports the effective concurrency/RPS, progress, retries, 429s, queue waits, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly.
+For the direct extension path, `google-web` uses at most `48` workers, half of the former `96`-worker cap, with default `rps=0` (no added pacing). An explicitly supplied positive `rps` is still honored. Each cue is handled independently. Isolated `HTTP 429` responses still use `Retry-After` or exponential backoff, but five 429 responses within ten seconds open a circuit breaker: new Google requests and retries stop, the old adaptive Google recovery is skipped, and the local backend is launched so Argos can take over. The Python backend uses the same threshold and preserves Google cues that already succeeded while Argos fills the unfinished cues. Any cues that still fail keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports the effective concurrency/RPS, progress, circuit breaker, fallback, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly.
 
 Argos Translate provider (development build only):
 

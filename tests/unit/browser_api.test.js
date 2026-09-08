@@ -13,6 +13,7 @@ function chromeApiMock() {
     },
     tabs: {
       create: vi.fn((properties, callback) => callback({ id: 7, ...properties })),
+      remove: vi.fn((tabId, callback) => callback(tabId)),
     },
     storage: {
       local: {
@@ -45,6 +46,7 @@ describe("shared WebExtension API adapter", () => {
       id: 7,
       url: "chrome-extension://test/options.html",
     });
+    await expect(api.tabs.remove(7)).resolves.toBe(7);
   });
 
   it("preserves a specific nested diagnosis instead of a generic boundary code", () => {

@@ -4,7 +4,7 @@
 
 用于 Echo360 录播课和 Canvas 内嵌 Instructure Media 视频的 Chrome/Safari 扩展，用来加载并显示翻译字幕；本地 FastAPI 后端保留为开发调试、fallback 和批处理路径。
 
-当前扩展版本：**1.5.0**
+当前扩展版本：**1.5.1**
 
 ## 功能概览
 
@@ -172,12 +172,12 @@ Invoke-WebRequest http://127.0.0.1:8765/health
 
 发布产物把 Python、FastAPI、翻译脚本、Argos/CTranslate2 运行时、`en→zh`、`en→zt` 和英语 MiniSBD 模型打包在同一个应用目录中。最终用户不需要安装 Python、pip、venv 或 Argos 模型：
 
-- macOS：解压 `echo360-online-subtitle-translator-backend-macos-*.tar.gz`，启动 `Echo360 Subtitle Backend.app`；
-- Windows：解压 `echo360-online-subtitle-translator-backend-windows-x64.zip`，启动 `Echo360SubtitleBackend\echo360-subtitle-backend.exe`。
+- macOS：解压 `echo360-online-subtitle-translator-backend-macos-*.tar.gz`，把 `Echo360 Subtitle Backend.app` 放进“应用程序”并至少打开一次；
+- Windows：解压 `echo360-online-subtitle-translator-backend-windows-x64.zip`，首次运行 `Echo360SubtitleBackend\install-and-launch-echo360-subtitle-backend.cmd`，它只在当前用户下注册启动协议，不需要管理员权限。
 
 程序默认只监听 `127.0.0.1:8765`，扩展继续使用现有 Backend URL。关闭程序即可停止后端。翻译缓存写入当前用户的系统缓存目录，不会写入应用安装目录。
 
-首次启动会把只读应用包中的 Argos 模型复制到当前用户的应用数据目录，因此会比后续启动慢一些。当前工作流产出的包用于测试和内部发布，尚未配置 Windows Authenticode 或 Apple Developer ID 公证；面向公众分发时应在工作流中接入对应签名凭据。这个独立程序需要由用户启动；浏览器自动拉起后端需要另做安装器和 Native Messaging 集成，不属于当前免环境打包方案。
+首次启动会把只读应用包中的 Argos 模型复制到当前用户的应用数据目录，因此会比后续启动慢一些。完成上述一次性安装/注册后，扩展在选择 Argos、开始 Argos 翻译或执行 Google 429 备份时会先检查 `/health`；后端未运行就通过 `echo360-subtitle-backend://start` 请求 Windows/macOS 拉起程序，并等待最多 20 秒。自动启动只支持默认的 `http://127.0.0.1:8765`（`localhost`/`[::1]` 等价）；自定义端口仍需手动启动。当前工作流产出的包用于测试和内部发布，尚未配置 Windows Authenticode 或 Apple Developer ID 公证；面向公众分发时应在工作流中接入对应签名凭据。
 
 后端更新后，在目标系统上一条命令即可重建原生包（PyInstaller 不能跨系统构建）：
 
@@ -278,7 +278,7 @@ npm run test:python
 - target: `ZH`
 - max_paragraphs: `6`（Google 网页端点会按单条字幕刷新进度）
 - max_chars: `1200`
-- concurrency: `96`（首次请求沿用 1.4.2；失败时才自动尝试低并发恢复）
+- concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `48`，其他 provider 不变
 - rps: `0`（首次请求不额外限速；失败时才自动尝试 `3` RPS 恢复）
 - retries: `1`
 - timeout: `10`
@@ -307,11 +307,11 @@ Google Translate provider：
 
 - `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用
 - store 构建会由扩展前端直接请求；dev 构建可选择通过本地后端转发
-- 后端/脚本路径恢复 1.4.2 的速度配置：默认 `concurrency=96, rps=0`（不增加请求间隔），同时保持 `max_chars=1200, max_paragraphs=1` 以便逐条显示增量进度
+- 后端/脚本路径的 Google 并发上限为 `48`（原 `96` 的一半），仍保持 `rps=0, max_chars=1200, max_paragraphs=1`
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量，建议改用 AI/API provider（如 `deepseek`/`openai`/`gemini`/`deepl`）并填写自己的 API Key
 
-`google-web` 的直接扩展路径恢复 1.4.2 的默认速度：最多 `96` 个 worker，默认 `rps=0`（不增加请求间隔）；显式设置正数 `rps` 时仍会按该值排队。每条字幕独立处理，遇到 `HTTP 429` 会按 `Retry-After` 或指数退避重试；最终失败的字幕保留原文、列入 `failed_items`，并且部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、重试、429、队列等待和最终失败摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
+`google-web` 的直接扩展路径最多使用 `48` 个 worker，是原 `96` 上限的一半；默认 `rps=0`（不增加请求间隔），显式设置正数 `rps` 时仍会按该值排队。每条字幕独立处理；零星 `HTTP 429` 仍按 `Retry-After` 或指数退避重试，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试、跳过原来的 Google 低并发恢复，并自动拉起本地后端改用 Argos。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
 
 Argos Translate provider（仅开发版）：
 

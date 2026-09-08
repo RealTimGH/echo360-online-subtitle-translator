@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from collections import deque
 import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List
@@ -58,12 +60,14 @@ GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE = 1
-# Match the 1.4.2 Google Web speed profile. A zero RPS means that the
-# translator does not add a pacing delay between requests.
-GOOGLE_WEB_DEFAULT_CONCURRENCY = 96
+# Run Google Web at half of the former 96-worker cap. A zero RPS means that
+# the translator does not add a pacing delay between requests.
+GOOGLE_WEB_DEFAULT_CONCURRENCY = 48
 GOOGLE_WEB_DEFAULT_RPS = 0.0
 GOOGLE_WEB_MAX_RPS = 0.0
 GOOGLE_WEB_MAX_RETRIES = 2
+GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5
+GOOGLE_WEB_429_WINDOW_SECONDS = 10.0
 GOOGLE_WEB_DEFAULT_MAX_CHARS = 1200
 GOOGLE_WEB_DEFAULT_MAX_PARAGRAPHS = 1
 WEB_TRANSLATOR_DEFAULT_MAX_RETRIES = 1
@@ -124,6 +128,7 @@ CLI_ERROR_CODES = {
     "TRANSLATOR_PROCESS_FAILED",
     "ARGOS_DEPENDENCY_MISSING",
     "ARGOS_MODEL_MISSING",
+    "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
 }
 
 TIMECODE_RE = re.compile(
@@ -228,6 +233,74 @@ def _http_error(status_code: int) -> RuntimeError:
     error = RuntimeError(f"HTTP {int(status_code)}")
     error.status_code = int(status_code)
     return error
+
+
+class GoogleWebRateLimitCircuitOpen(RuntimeError):
+    """Raised when the shared Google Web 429 circuit has opened.
+
+    A separate exception keeps an item that was never sent after the circuit
+    opened distinguishable from the cue that received the 429 which tripped
+    the circuit. It still carries status 429 so the existing diagnostics can
+    present the rate-limit context to callers.
+    """
+
+    code = "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN"
+
+    def __init__(self, count: int, threshold: int):
+        self.status_code = 429
+        self.count = int(count)
+        self.threshold = int(threshold)
+        super().__init__(
+            f"{self.code}: {self.count} HTTP 429 responses within the short window; "
+            f"threshold={self.threshold}"
+        )
+
+
+class GoogleWebRateLimitCircuit:
+    """Thread-safe short-window circuit shared by all Google Web workers."""
+
+    def __init__(
+        self,
+        threshold: int = GOOGLE_WEB_429_CIRCUIT_THRESHOLD,
+        window_seconds: float = GOOGLE_WEB_429_WINDOW_SECONDS,
+    ):
+        self.threshold = max(1, int(threshold))
+        self.window_seconds = max(0.1, float(window_seconds))
+        self._lock = threading.Lock()
+        self._events: deque[float] = deque()
+        self._total_429 = 0
+        self._open = False
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - self.window_seconds
+        while self._events and self._events[0] < cutoff:
+            self._events.popleft()
+
+    def record_429(self) -> bool:
+        """Record one HTTP 429 and return whether the circuit is open."""
+        now = time.monotonic()
+        with self._lock:
+            self._total_429 += 1
+            if not self._open:
+                self._prune_locked(now)
+                self._events.append(now)
+                if len(self._events) >= self.threshold:
+                    self._open = True
+            return self._open
+
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._open
+
+    def raise_if_open(self) -> None:
+        with self._lock:
+            if self._open:
+                raise GoogleWebRateLimitCircuitOpen(self._total_429, self.threshold)
+
+    @property
+    def total_429_responses(self) -> int:
+        with self._lock:
+            return self._total_429
 
 
 def _failure_codes(items: list[dict]) -> dict[str, int]:
@@ -382,7 +455,7 @@ def build_text_batches(
 
 
 def provider_defaults(provider: str) -> dict[str, int | str]:
-    provider_name = (provider or "deepl").strip().lower()
+    provider_name = (provider or "google-web").strip().lower()
     if provider_name == "google-web":
         return {
             "chunk": WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE,
@@ -605,6 +678,7 @@ def google_web_translate_batch(
     base_delay: float = 1.0,
     request_timeout: float = 30.0,
     rps: float = GOOGLE_WEB_DEFAULT_RPS,
+    circuit: GoogleWebRateLimitCircuit | None = None,
 ) -> List[str]:
     # Unofficial endpoint used only for local experimental testing. It can break or rate-limit.
     target = _resolve_web_target_lang(target_lang, "google-web")
@@ -629,10 +703,14 @@ def google_web_translate_batch(
         )
         attempt = 0
         while True:
+            if circuit:
+                circuit.raise_if_open()
             if effective_rps > 0:
                 wait_for = next_request_at - time.monotonic()
                 if wait_for > 0:
                     time.sleep(wait_for)
+                if circuit:
+                    circuit.raise_if_open()
                 next_request_at = max(next_request_at, time.monotonic()) + (1.0 / effective_rps)
             try:
                 resp = session.get(url, timeout=request_timeout)
@@ -645,6 +723,8 @@ def google_web_translate_batch(
                         error.retry_after = max(0.0, min(float(retry_after), retry_after_cap))
                     except (TypeError, ValueError):
                         error.retry_after = None
+                    if resp.status_code == 429 and circuit:
+                        circuit.record_429()
                     raise error
                 data = resp.json()
                 translated = "".join(
@@ -656,6 +736,19 @@ def google_web_translate_batch(
                 out.append(translated)
                 break
             except Exception as exc:
+                if circuit and circuit.is_open():
+                    # The response which trips the circuit remains an
+                    # ordinary HTTP 429 failure for its own cue. All other
+                    # workers/retries stop before issuing another request.
+                    if getattr(exc, "status_code", None) != 429:
+                        raise GoogleWebRateLimitCircuitOpen(
+                            circuit.total_429_responses,
+                            circuit.threshold,
+                        ) from exc
+                    if attempt >= effective_retries:
+                        raise
+                    # Do not sleep/retry the cue that received the fifth 429.
+                    raise
                 if attempt >= effective_retries:
                     code = (
                         f"HTTP_{getattr(exc, 'status_code', '')}"
@@ -1111,10 +1204,10 @@ def gemini_translate_batch(
 def translate_lines_native(
     lines: List[str],
     api_key: str,
-    provider: str = "deepl",
-    endpoint: str = "https://api-free.deepl.com/v2/translate",
+    provider: str = "google-web",
+    endpoint: str = "",
     target_lang: str = "ZH",
-    model: str = OPENAI_DEFAULT_MODEL,
+    model: str = "",
     bilingual: bool = False,
     every: int = 10,
     chunk: int = DEEPL_DEFAULT_CHUNK_SIZE,
@@ -1138,7 +1231,7 @@ def translate_lines_native(
     deepl_formality: str = "",
     outcome_callback: Callable[[dict], None] | None = None,
 ) -> List[str]:
-    provider_name = (provider or "deepl").strip().lower()
+    provider_name = (provider or "google-web").strip().lower()
     if provider_name not in {"deepl", "openai", "deepseek", "gemini", "google-web", "argos"}:
         raise ValueError(f"UNSUPPORTED_PROVIDER: Unsupported provider: {provider_name}")
     target_code = str(target_lang or "ZH").strip().upper()
@@ -1155,6 +1248,7 @@ def translate_lines_native(
     if provider_name == "argos":
         _resolve_argos_target_lang(target_code)
     target_lang = target_code
+    google_circuit = GoogleWebRateLimitCircuit() if provider_name == "google-web" else None
 
     effective_rps = rps
     if provider_name == "google-web":
@@ -1199,6 +1293,8 @@ def translate_lines_native(
     provider_results = 0
     target_results = 0
     unchanged_results = 0
+    fallback_provider_name: str | None = None
+    fallback_provider_results = 0
     cue_index_by_line: dict[int, int] = {}
     cue_index = 0
     for line_index, line in enumerate(lines):
@@ -1214,6 +1310,11 @@ def translate_lines_native(
         max_paragraphs=max(0, max_paragraphs),
         text_for_len=source_texts,
     )
+    batch_number_by_line = {
+        line_idx: bstart + 1
+        for bstart, _bend, batch_ids in batches
+        for line_idx in batch_ids
+    }
     workers = max(1, min(int(concurrency or 1), len(batches) or 1))
     fallback_mode = (fallback_mode or "immediate").strip().lower()
     if fallback_mode not in FALLBACK_MODES:
@@ -1271,6 +1372,7 @@ def translate_lines_native(
                 max_retries=max_retries,
                 request_timeout=request_timeout,
                 rps=effective_rps,
+                circuit=google_circuit,
             )
         if provider_name == "argos":
             return argos_translate_batch(batch_texts, target_lang=target_lang)
@@ -1326,6 +1428,7 @@ def translate_lines_native(
                 max_retries=max_retries,
                 request_timeout=request_timeout,
                 rps=effective_rps,
+                circuit=google_circuit,
             )
         if provider_name == "argos":
             return argos_translate_batch(batch_texts, target_lang=target_lang)
@@ -1535,6 +1638,151 @@ def translate_lines_native(
         if progress_callback:
             progress_callback(completed, total)
 
+    def _failure_status(error_code: str, message: str) -> int | None:
+        status_match = re.search(r"\bHTTP[_\s]+(\d{3})\b", str(message or ""), re.IGNORECASE)
+        status = int(status_match.group(1)) if status_match else (
+            int(error_code[-3:]) if re.fullmatch(r"HTTP_\d{3}", error_code) else None
+        )
+        return status if status is not None and 100 <= status <= 599 else None
+
+    def _remove_failure_for_line(line_idx: int) -> None:
+        failed_items[:] = [
+            item for item in failed_items
+            if item.get("line") != line_idx + 1
+        ]
+
+    def _record_argos_fallback_failure(line_idx: int, error_text: object) -> None:
+        """Keep exactly one failure item for a cue that Argos could not repair."""
+        safe_error = _safe_error_text(error_text or "Argos fallback failed; original text kept")
+        failure_code = _error_code_from_text(safe_error)
+        failure_status = _failure_status(failure_code, safe_error)
+        replacement = {
+            "batch": batch_number_by_line.get(line_idx, 0),
+            "line": line_idx + 1,
+            "cue": cue_index_by_line.get(line_idx),
+            "code": failure_code,
+            "message": safe_error,
+        }
+        if failure_status is not None:
+            replacement["status"] = failure_status
+        existing = next(
+            (item for item in failed_items if item.get("line") == line_idx + 1),
+            None,
+        )
+        _remove_failure_for_line(line_idx)
+        failed_items.append(existing or replacement)
+        if existing is not None:
+            existing.clear()
+            existing.update(replacement)
+        out_lines[line_idx] = lines[line_idx]
+
+    def _apply_argos_fallback_item(line_idx: int, translated_text: object) -> bool:
+        """Apply one Argos result and return whether it is target-valid."""
+        nonlocal provider_results, target_results, unchanged_results, fallback_provider_results
+        normalized = str(translated_text or "").strip()
+        if not normalized:
+            _record_argos_fallback_failure(
+                line_idx,
+                "INVALID_PROVIDER_OUTPUT: Argos returned an empty item",
+            )
+            return False
+        target_requires_cjk = str(target_lang or "ZH").strip().upper() in CJK_TARGET_CODES
+        if target_requires_cjk and not re.search(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]",
+            normalized,
+        ):
+            _record_argos_fallback_failure(
+                line_idx,
+                "NO_TARGET_TRANSLATION: Argos returned a result without recognizable target-language text",
+            )
+            return False
+
+        prefix, _body, suffix = line_parts[line_idx]
+        if bilingual:
+            out_lines[line_idx] = lines[line_idx] + "\n" + f"{prefix}{normalized}{suffix}"
+        elif prefix or suffix:
+            out_lines[line_idx] = f"{prefix}{normalized}{suffix}"
+        else:
+            out_lines[line_idx] = normalized
+        _remove_failure_for_line(line_idx)
+        provider_results += 1
+        fallback_provider_results += 1
+        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", normalized):
+            target_results += 1
+        if normalized.casefold() == str(source_texts[line_idx]).strip().casefold():
+            unchanged_results += 1
+        return True
+
+    def run_google_argos_fallback() -> None:
+        """Repair only unresolved Google cues after the shared 429 circuit opens."""
+        nonlocal completed, fallback_provider_name
+        if not google_circuit or not google_circuit.is_open():
+            return
+
+        deferred_ids = {
+            line_idx
+            for _bstart, _bend, batch_ids, _err_text in deferred_failures
+            for line_idx in batch_ids
+        }
+        pending_ids = set(deferred_ids)
+        for item in failed_items:
+            raw_line = item.get("line")
+            if isinstance(raw_line, int) and raw_line > 0:
+                pending_ids.add(raw_line - 1)
+        ordered_ids = [line_idx for line_idx in translatable_idx if line_idx in pending_ids]
+        if not ordered_ids:
+            deferred_failures.clear()
+            return
+
+        # Argos has an explicit English-source target map. A Google circuit
+        # must not silently switch to an unsupported Argos target.
+        if target_code not in ARGOS_TARGET_MAP:
+            deferred_error = (
+                "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN: Argos fallback is not "
+                f"available for target={target_code}"
+            )
+            for line_idx in sorted(deferred_ids):
+                if not any(item.get("line") == line_idx + 1 for item in failed_items):
+                    _record_argos_fallback_failure(line_idx, deferred_error)
+            completed += len(deferred_ids)
+            deferred_failures.clear()
+            if deferred_ids:
+                report_progress()
+            return
+
+        fallback_provider_name = "argos"
+        print(
+            f"[fallback] Google Web 429 circuit opened after "
+            f"{google_circuit.total_429_responses} response(s); "
+            f"repairing {len(ordered_ids)} unresolved cue(s) with Argos",
+            flush=True,
+        )
+        fallback_batches = build_text_batches(
+            lines,
+            ordered_ids,
+            chunk_size=ARGOS_DEFAULT_CHUNK_SIZE,
+            max_chars=ARGOS_DEFAULT_MAX_CHARS,
+            max_paragraphs=ARGOS_DEFAULT_MAX_PARAGRAPHS,
+            text_for_len=source_texts,
+        )
+        for _start, _end, batch_ids in fallback_batches:
+            batch_texts = [source_texts[line_idx] for line_idx in batch_ids]
+            try:
+                translated = _validate_provider_batch_output(
+                    argos_translate_batch(batch_texts, target_lang=target_lang),
+                    len(batch_ids),
+                )
+            except Exception as argos_error:
+                for line_idx in batch_ids:
+                    _record_argos_fallback_failure(line_idx, argos_error)
+            else:
+                for line_idx, translated_text in zip(batch_ids, translated):
+                    _apply_argos_fallback_item(line_idx, translated_text)
+            completed += sum(1 for line_idx in batch_ids if line_idx in deferred_ids)
+            report_progress()
+        deferred_failures.clear()
+
+
     if workers == 1:
         for bstart, bend, batch_ids in batches:
             if stop_check and not stop_check():
@@ -1553,23 +1801,6 @@ def translate_lines_native(
             report_progress()
             if log_progress and ((completed == total) or (completed % every == 0) or (bstart == 0)):
                 print(f"[{completed}/{total}] Translating...", flush=True)
-
-        if fallback_mode == "immediate":
-            if outcome_callback:
-                outcome_callback({
-                    "total": total,
-                    "processed": completed,
-                    "translated": max(0, provider_results),
-                    "failed": len(failed_items),
-                    "failed_items": failed_items[:50],
-                    "failed_batches": len({item.get("batch") for item in failed_items if item.get("batch") is not None}),
-                    "failure_codes": _failure_codes(failed_items),
-                    "failureCodes": _failure_codes(failed_items),
-                    "provider_results": provider_results,
-                    "target_results": target_results,
-                    "unchanged_results": unchanged_results,
-                })
-            return out_lines
 
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1603,6 +1834,11 @@ def translate_lines_native(
                 report_progress()
                 if log_progress and ((completed == total) or (completed % every == 0) or completed <= chunk):
                     print(f"[{completed}/{total}] Translating...", flush=True)
+
+    # A tripped Google circuit must bypass the existing deferred Google repair
+    # phase; it would otherwise issue more Google attempts after the breaker
+    # opened. Argos repairs the unresolved lines once, serially.
+    run_google_argos_fallback()
 
     if fallback_mode == "deferred" and deferred_failures:
         print(
@@ -1719,6 +1955,10 @@ def translate_lines_native(
             "provider_results": provider_results,
             "target_results": target_results,
             "unchanged_results": unchanged_results,
+            "google429Responses": google_circuit.total_429_responses if google_circuit else 0,
+            "googleCircuitTripped": google_circuit.is_open() if google_circuit else False,
+            "fallback_provider": fallback_provider_name,
+            "fallback_provider_results": fallback_provider_results,
         })
     return out_lines
 
@@ -1729,6 +1969,39 @@ class CliArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         _emit_cli_error("INVALID_REQUEST", message, phase="config")
         raise SystemExit(2)
+
+
+# The backend reads the previous snapshot while the translator publishes the
+# next one.  Windows can briefly deny the replace while that reader still has
+# the destination open (WinError 5/32).  A short retry window removes this
+# expected cross-process race without hiding a persistent permission error.
+PROGRESS_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.4)
+
+
+def write_progress_snapshot(progress_path: Path, partial_lines: List[str]) -> None:
+    """Atomically publish a partial VTT, tolerating a transient Windows lock."""
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = progress_path.with_name(
+        f".{progress_path.name}.{os.getpid()}.tmp"
+    )
+    try:
+        temporary_path.write_text("\n".join(partial_lines), encoding="utf-8")
+        for attempt, delay in enumerate((0.0, *PROGRESS_REPLACE_RETRY_DELAYS)):
+            try:
+                os.replace(temporary_path, progress_path)
+                return
+            except OSError as exc:
+                retryable_lock = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32}
+                if not retryable_lock or attempt >= len(PROGRESS_REPLACE_RETRY_DELAYS):
+                    raise
+                time.sleep(delay)
+    finally:
+        # os.replace removes the temporary path on success.  If all retries
+        # fail, clean it up so a later progress callback can start cleanly.
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
 
 
 def main():
@@ -1742,13 +2015,13 @@ def main():
     )
     ap.add_argument(
         "--provider",
-        default="deepl",
+        default="google-web",
         choices=["deepl", "openai", "deepseek", "gemini", "google-web", "argos"],
         help="Translation provider",
     )
     ap.add_argument(
         "--endpoint",
-        default="https://api-free.deepl.com/v2/translate",
+        default="",
         help="Provider endpoint (DeepL Free/Pro, OpenAI Responses, or Chat Completions endpoint)",
     )
     ap.add_argument("--model", default="", help="Model name for openai/deepseek/gemini")
@@ -1894,12 +2167,7 @@ def main():
         if not progress_path:
             return
         try:
-            progress_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = progress_path.with_name(
-                f".{progress_path.name}.{os.getpid()}.tmp"
-            )
-            temporary_path.write_text("\n".join(partial_lines), encoding="utf-8")
-            os.replace(temporary_path, progress_path)
+            write_progress_snapshot(progress_path, partial_lines)
         except OSError as exc:
             warning = _safe_error_text(
                 f"TRANSLATOR_PROGRESS_WRITE_FAILED: unable to write progress snapshot: {exc}",
