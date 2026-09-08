@@ -143,6 +143,21 @@ describe("assessment_guard", () => {
     expect(init).not.toHaveBeenCalled();
   });
 
+  it("reports a missing isolated-world guard instead of failing silently", () => {
+    const init = vi.fn();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    window.Echo360Translator = makeFullNs({ controller: { init } });
+
+    evalModule("content.js");
+
+    expect(init).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "[echo360-translator][content] assessment guard was not injected",
+      { href: window.location.href }
+    );
+    consoleError.mockRestore();
+  });
+
   it("initializes the controller after the course-page bridge verifies an ambiguous referrer", async () => {
     const init = vi.fn();
     window.Echo360Translator = makeFullNs({ controller: { init } });

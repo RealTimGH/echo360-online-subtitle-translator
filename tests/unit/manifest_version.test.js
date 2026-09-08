@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PROJECT_ROOT } from "../helpers/load-module.js";
 
-const EXPECTED_VERSION = "1.5.0";
+const EXPECTED_VERSION = "1.5.1";
 
 describe("extension release metadata", () => {
   it("keeps manifest and README version declarations in sync", () => {
@@ -36,10 +36,19 @@ describe("extension release metadata", () => {
     for (const script of mediaScripts) {
       expect(script.matches).toContain("*://*.instructuremedia.com/*");
       expect(script.matches).not.toContain("*://canvas.sydney.edu.au/*");
-      expect(script.js[0]).toBe("assessment_guard.js");
     }
+    const main = mediaScripts.find((script) => script.world === "MAIN").js;
     const isolated = mediaScripts.find((script) => script.world !== "MAIN").js;
+    expect(main[0]).toBe("assessment_guard_main.js");
+    expect(isolated[0]).toBe("assessment_guard.js");
+    expect(main.filter((scriptPath) => isolated.includes(scriptPath))).toEqual([]);
     expect(isolated).toContain("host_support.js");
     expect(isolated).toContain("player_caption_renderer.js");
+  });
+
+  it("keeps the MAIN and ISOLATED assessment guards behaviorally identical", () => {
+    const isolatedGuard = readFileSync(resolve(PROJECT_ROOT, "extension/assessment_guard.js"), "utf8");
+    const mainGuard = readFileSync(resolve(PROJECT_ROOT, "extension/assessment_guard_main.js"), "utf8");
+    expect(mainGuard).toBe(isolatedGuard);
   });
 });

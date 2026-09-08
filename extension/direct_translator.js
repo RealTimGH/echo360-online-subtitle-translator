@@ -10,11 +10,11 @@ globalThis.Echo360DirectTranslator = (() => {
   const CJK_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
   const CJK_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE"]);
   const SUPPORTED_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU", "AR", "HI"]);
-  // Match the 1.4.2 Google Web speed profile: up to 96 workers and no
-  // default request pacing (rps=0).  `maxParagraphs=1` is still applied
+  // Run Google Web at half of the former 96-worker cap, with no default
+  // request pacing (rps=0). `maxParagraphs=1` is still applied
   // below so each cue can produce an independent partial update; it is a
   // batching/display choice, not a request-rate limit.
-  const GOOGLE_WEB_CONCURRENCY_CAP = 96;
+  const GOOGLE_WEB_CONCURRENCY_CAP = 48;
   const GOOGLE_WEB_DEFAULT_RPS = 0;
   // 0 means unlimited, matching 1.4.2. Explicit positive rps values are
   // still honored when a caller deliberately supplies one.
@@ -24,6 +24,8 @@ globalThis.Echo360DirectTranslator = (() => {
   const GOOGLE_WEB_RETRY_MAX_MS = 30000;
   const GOOGLE_WEB_RECOVERY_CONCURRENCY = 3;
   const GOOGLE_WEB_RECOVERY_RPS = 3;
+  const GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5;
+  const GOOGLE_WEB_429_CIRCUIT_WINDOW_MS = 10000;
   const DIRECT_LOG_TAG = "[echo360-translator][direct]";
   const PROVIDER_ADAPTERS = {
     openai: {
@@ -449,6 +451,54 @@ globalThis.Echo360DirectTranslator = (() => {
     return error;
   }
 
+  function createGoogleRateLimitCircuit() {
+    let rateLimitTimestamps = [];
+    let circuitError = null;
+
+    function prune(now = Date.now()) {
+      rateLimitTimestamps = rateLimitTimestamps.filter(
+        (timestamp) => now - timestamp <= GOOGLE_WEB_429_CIRCUIT_WINDOW_MS
+      );
+    }
+
+    function record(error) {
+      if (getErrorStatus(error) !== 429) return circuitError;
+      if (circuitError) return circuitError;
+      const now = Date.now();
+      prune(now);
+      rateLimitTimestamps.push(now);
+      if (!circuitError && rateLimitTimestamps.length >= GOOGLE_WEB_429_CIRCUIT_THRESHOLD) {
+        circuitError = makeTranslationError(
+          "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+          `Google Web 在 ${GOOGLE_WEB_429_CIRCUIT_WINDOW_MS / 1000} 秒内返回了至少 ${GOOGLE_WEB_429_CIRCUIT_THRESHOLD} 次 HTTP 429，已停止继续请求并准备切换到 Argos`,
+          {
+            status: 429,
+            retryable: false,
+            google429Responses: rateLimitTimestamps.length,
+            googleCircuitTripped: true,
+          }
+        );
+      }
+      return circuitError;
+    }
+
+    return {
+      record,
+      isOpen: () => !!circuitError,
+      error: () => circuitError,
+      snapshot: () => {
+        prune();
+        return {
+          google429Responses: rateLimitTimestamps.length,
+          googleCircuitTripped: !!circuitError,
+        };
+      },
+      throwIfOpen() {
+        if (circuitError) throw circuitError;
+      },
+    };
+  }
+
   function isNonRecoverableError(error) {
     const status = getErrorStatus(error);
     if (status === 401 || status === 403) return true;
@@ -465,6 +515,7 @@ globalThis.Echo360DirectTranslator = (() => {
       "NO_TARGET_TRANSLATION",
       "EMPTY_TRANSLATABLE_VTT",
       "INCONSISTENT_TRANSLATION_RESULT",
+      "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
     ].includes(code) || String(error?.message || error || "").includes("reasoning_effort");
   }
 
@@ -737,6 +788,7 @@ globalThis.Echo360DirectTranslator = (() => {
     const target = resolveWebTargetLang(cfg.target);
     const out = [];
     for (let index = 0; index < texts.length; index += 1) {
+      cfg.googleRateLimitCircuit?.throwIfOpen?.();
       const text = texts[index];
       const url = `${endpoint}?client=gtx&sl=auto&tl=${encodeURIComponent(target)}&dt=t&q=${encodeURIComponent(text)}`;
       try {
@@ -756,7 +808,10 @@ globalThis.Echo360DirectTranslator = (() => {
           }),
           cfg.retries,
           {
-            shouldRetry: isRetryableError,
+            shouldRetry: (error) => !cfg.googleRateLimitCircuit?.isOpen?.() && isRetryableError(error),
+            onError: ({ error }) => {
+              cfg.googleRateLimitCircuit?.record?.(error);
+            },
             onRetry: ({ attempt, delayMs, error }) => {
               const status = getErrorStatus(error);
               if (status === 429) cfg.waitForRequest?.backoff?.(delayMs);
@@ -775,6 +830,9 @@ globalThis.Echo360DirectTranslator = (() => {
         const translated = extractGoogleWebText(data);
         out.push(translated);
       } catch (error) {
+        if (cfg.googleRateLimitCircuit?.isOpen?.()) {
+          throw cfg.googleRateLimitCircuit.error() || error;
+        }
         if (isNonRecoverableError(error)) throw error;
         out.push(text);
         options.onItemFailure?.({ index, error });
@@ -882,6 +940,12 @@ globalThis.Echo360DirectTranslator = (() => {
         return await fn(attempt);
       } catch (err) {
         lastErr = err;
+        options.onError?.({
+          attempt: attempt + 1,
+          maxRetries,
+          status: getErrorStatus(err),
+          error: err,
+        });
         const canRetry = (options.shouldRetry || isRetryableError)(err);
         if (attempt >= maxRetries || !canRetry) break;
         const delayMs = Math.max(0, Number(options.getDelayMs?.(err, attempt) ?? retryDelayMs(err, attempt)) || 0);
@@ -967,6 +1031,7 @@ globalThis.Echo360DirectTranslator = (() => {
       rps: effectiveRps,
       retries: effectiveRetries,
       waitForRequest: createRateLimiter(effectiveRps),
+      googleRateLimitCircuit: isGoogleWeb ? createGoogleRateLimitCircuit() : null,
     };
     const lines = String(payload.vtt_text || "").replace(/\r/g, "").split("\n");
     const items = [];
@@ -1035,6 +1100,8 @@ globalThis.Echo360DirectTranslator = (() => {
       targetResults: 0,
       unchangedResults: 0,
       elapsedMs: 0,
+      google429Responses: 0,
+      googleCircuitTripped: false,
     };
 
     function addWarning(message) {
@@ -1043,8 +1110,10 @@ globalThis.Echo360DirectTranslator = (() => {
     }
 
     function progressDetails() {
+      const circuit = cfg.googleRateLimitCircuit?.snapshot?.() || {};
       return {
         ...metrics,
+        ...circuit,
         processed: completed,
         translated: translatedCount,
         failed: failedItems.length,
@@ -1317,6 +1386,7 @@ globalThis.Echo360DirectTranslator = (() => {
 
     async function worker() {
       while (nextBatch < batches.length) {
+        cfg.googleRateLimitCircuit?.throwIfOpen?.();
         const batchNo = nextBatch;
         nextBatch += 1;
         const batch = batches[batchNo];
@@ -1364,7 +1434,15 @@ globalThis.Echo360DirectTranslator = (() => {
     }
 
     try {
-      await Promise.all(Array.from({ length: workers }, () => worker()));
+      // Wait for every worker to observe the shared circuit before returning
+      // an abort. Promise.all() rejects immediately and leaves sibling workers
+      // running in the background, which can leak Google requests into the
+      // subsequent Argos fallback (or even the next translation job).
+      const workerResults = await Promise.allSettled(
+        Array.from({ length: workers }, () => worker())
+      );
+      const rejected = workerResults.find((result) => result.status === "rejected");
+      if (rejected) throw rejected.reason;
     } catch (error) {
       const enriched = attachFailureContext(error);
       directLog("error", "translation aborted", {
@@ -1443,6 +1521,7 @@ globalThis.Echo360DirectTranslator = (() => {
     metrics.translated = translatedCount;
     metrics.failed = failedItems.length;
     metrics.elapsedMs = Math.round(performance.now() - startedAt);
+    Object.assign(metrics, cfg.googleRateLimitCircuit?.snapshot?.() || {});
     const targetRequiresCjk = CJK_TARGET_CODES.has(target);
     const allItemsFailed = failedItems.length >= items.length;
     if (allItemsFailed || (targetRequiresCjk && (!CJK_RE.test(translatedVtt) || metrics.targetResults === 0))) {
@@ -1456,7 +1535,12 @@ globalThis.Echo360DirectTranslator = (() => {
       // bounded recovery attempt makes the default fast again while still
       // recovering from the common Safari/Google Load failed or HTTP 429
       // failure mode.
-      if (isGoogleWeb && (allItemsFailed || noTargetTranslations) && !payload.__googleWebRecoveryAttempt) {
+      if (
+        isGoogleWeb &&
+        !cfg.googleRateLimitCircuit?.isOpen?.() &&
+        (allItemsFailed || noTargetTranslations) &&
+        !payload.__googleWebRecoveryAttempt
+      ) {
         const recoverySettings = {
           concurrency: Math.min(GOOGLE_WEB_RECOVERY_CONCURRENCY, items.length),
           rps: GOOGLE_WEB_RECOVERY_RPS,

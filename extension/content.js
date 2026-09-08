@@ -3,6 +3,14 @@
   const assessmentGuard = window.Echo360AssessmentGuard;
 
   async function start() {
+    if (!assessmentGuard) {
+      console.error(
+        "[echo360-translator][content] assessment guard was not injected",
+        { href: location.href }
+      );
+      return;
+    }
+
     const allowed = assessmentGuard?.isAllowedDocument?.() ||
       await assessmentGuard?.verifyAllowedDocument?.();
     if (!allowed) return;

@@ -185,6 +185,10 @@
         }
         return callApi(rawApi.tabs.create, rawApi.tabs, [createProperties], "RUNTIME_MESSAGE_ERROR");
       },
+      remove(tabId) {
+        if (typeof rawApi.tabs?.remove !== "function") return Promise.resolve();
+        return callApi(rawApi.tabs.remove, rawApi.tabs, [tabId], "RUNTIME_MESSAGE_ERROR");
+      },
     },
     storage: {
       local: {

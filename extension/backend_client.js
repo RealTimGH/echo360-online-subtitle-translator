@@ -155,6 +155,17 @@
     return response.data;
   }
 
+  async function ensureArgosBackend(backendUrl) {
+    const response = await extensionApi.runtime.sendMessage({
+      type: "ensure-argos-backend",
+      backendUrl,
+    });
+    if (!response || !response.ok) {
+      throw errorFromResponse(response, "无法启动本地 Argos 后端", "ARGOS_BACKEND_START_FAILED");
+    }
+    return response.data || { ready: true };
+  }
+
   function friendlyErrorMessage(raw) {
     if (ns.errorUtils?.friendlyErrorMessage) {
       return ns.errorUtils.friendlyErrorMessage(raw, { phase: "translation" });
@@ -1031,6 +1042,7 @@
   ns.backendClient = {
     proxyRequest,
     proxyTranslateSync,
+    ensureArgosBackend,
     friendlyErrorMessage,
     waitJob,
     createDirectTranslateJob,

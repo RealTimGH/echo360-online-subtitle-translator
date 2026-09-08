@@ -6,6 +6,9 @@ spacy==3.7.5
 argostranslate==1.11.0
 # Freeze the native inference stack so a later rebuild does not silently pick
 # incompatible wheels or produce materially different platform artifacts.
+# PyTorch stopped publishing Intel macOS wheels after 2.2.2. That release has
+# CPython 3.9-3.12 wheels for macOS ARM64/x86_64 and Windows x64, and satisfies
+# Stanza 1.10.1's torch>=1.3 runtime requirement on every packaged target.
 ctranslate2==4.8.2
 sentencepiece==0.2.2
 stanza==1.10.1
@@ -13,4 +16,4 @@ sacremoses==0.1.1
 minisbd==0.9.5
 onnxruntime==1.19.2
 numpy==1.26.4
-torch==2.8.0
+torch==2.2.2

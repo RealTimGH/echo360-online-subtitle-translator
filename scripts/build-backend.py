@@ -19,6 +19,9 @@ DIST_ROOT = REPO_ROOT / "dist"
 PYINSTALLER_DIST = DIST_ROOT / "backend"
 PYINSTALLER_WORK = BUILD_ROOT / "pyinstaller"
 DEFAULT_ARGOS_TARGETS = ("zh", "zt")
+WINDOWS_BACKEND_EXECUTABLE = "echo360-subtitle-backend.exe"
+WINDOWS_INSTALL_SCRIPT_NAME = "install-and-launch-echo360-subtitle-backend.cmd"
+BACKEND_URL_SCHEME = "echo360-subtitle-backend"
 
 
 def normalized_platform_name() -> str:
@@ -147,6 +150,36 @@ for target in sorted(targets):
     write_argos_manifest(targets)
 
 
+def write_windows_install_script(package_dir: Path) -> Path:
+    """Add a one-time, no-elevation URL-handler installer to a Windows build."""
+    script_path = package_dir / WINDOWS_INSTALL_SCRIPT_NAME
+    script = f"""@echo off
+setlocal EnableExtensions
+set "BACKEND_EXE=%~dp0{WINDOWS_BACKEND_EXECUTABLE}"
+set "BACKEND_URL={BACKEND_URL_SCHEME}://start"
+
+if not exist "%BACKEND_EXE%" (
+  echo Backend executable not found: "%BACKEND_EXE%"
+  exit /b 1
+)
+
+echo Registering the {BACKEND_URL_SCHEME}:// URL scheme for the current user...
+"%BACKEND_EXE%" --register-url-scheme
+if errorlevel 1 (
+  echo URL scheme registration failed.
+  exit /b 1
+)
+
+echo Starting the Echo360 Subtitle Backend...
+start "" "%BACKEND_EXE%" "%BACKEND_URL%"
+endlocal
+"""
+    # Keep the generated file native to Windows even when an archive is
+    # assembled by a tool that normalizes text line endings.
+    script_path.write_bytes(script.replace("\n", "\r\n").encode("utf-8"))
+    return script_path
+
+
 def archive_output() -> Path:
     system = normalized_platform_name()
     arch = normalized_architecture()
@@ -159,6 +192,8 @@ def archive_output() -> Path:
         return archive
 
     source = PYINSTALLER_DIST / "Echo360SubtitleBackend"
+    if platform.system() == "Windows":
+        write_windows_install_script(source)
     archive_base = DIST_ROOT / base_name
     return Path(shutil.make_archive(str(archive_base), "zip", root_dir=source.parent, base_dir=source.name))
 

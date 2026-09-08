@@ -19,6 +19,7 @@ beforeAll(() => {
     proxyRequest: vi.fn(),
     proxyTranslateSync: vi.fn(),
     waitJob: vi.fn(),
+    ensureArgosBackend: vi.fn(),
     // translation_service.js deliberately fails closed when the shared
     // boundary validators are unavailable. Keep this unit-test double
     // faithful to the production dependency contract.
@@ -353,6 +354,71 @@ describe("translateWithConfig (store build)", () => {
     await expect(svc.translateWithBackend("http://127.0.0.1:8765", { vtt_text: "WEBVTT" }))
       .rejects.toMatchObject({ code: "HTTP_503", status: 503 });
     expect(backendClientMock.proxyTranslateSync).not.toHaveBeenCalled();
+  });
+
+  it("stops a Google 429 burst and reruns the source through the Argos backend", async () => {
+    window.Echo360Translator.buildConfig.enableLocalBackend = true;
+    backendClientMock.createDirectTranslateJob.mockResolvedValue({ job_id: "google-job" });
+    backendClientMock.waitDirectJob.mockRejectedValue(Object.assign(new Error("rate limit circuit open"), {
+      code: "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+      metrics: { google429Responses: 5, googleCircuitTripped: true },
+    }));
+    backendClientMock.ensureArgosBackend.mockResolvedValue({ ready: true, launched: true });
+    backendClientMock.proxyRequest.mockResolvedValue({ job_id: "argos-job" });
+    backendClientMock.waitJob.mockResolvedValue({
+      translated_vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n你好\n",
+      warnings: [],
+      metrics: { total: 1, translated: 1, failed: 0 },
+    });
+
+    try {
+      const result = await svc.translateWithConfig(
+        { useLocalBackend: false, provider: "google-web" },
+        "http://127.0.0.1:8765",
+        {
+          provider: "google-web",
+          target: "ZH",
+          vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+        }
+      );
+
+      expect(backendClientMock.ensureArgosBackend).toHaveBeenCalledWith("http://127.0.0.1:8765");
+      expect(backendClientMock.proxyRequest).toHaveBeenCalledWith(
+        "http://127.0.0.1:8765",
+        "/translate-async",
+        "POST",
+        expect.objectContaining({ provider: "argos", concurrency: 1, retries: 0 })
+      );
+      expect(result.warnings[0]).toContain("改用本机 Argos");
+      expect(result.metrics).toMatchObject({
+        initialProvider: "google-web",
+        fallbackProvider: "argos",
+        google429Responses: 5,
+        googleCircuitTripped: true,
+      });
+    } finally {
+      window.Echo360Translator.buildConfig.enableLocalBackend = false;
+    }
+  });
+
+  it("ensures the Argos program is running before an explicitly selected Argos translation", async () => {
+    window.Echo360Translator.buildConfig.enableLocalBackend = true;
+    backendClientMock.ensureArgosBackend.mockResolvedValue({ ready: true, launched: false });
+    backendClientMock.proxyRequest.mockResolvedValue({ job_id: "argos-job" });
+    backendClientMock.waitJob.mockResolvedValue({ translated_vtt: "WEBVTT\n\n" });
+
+    try {
+      await svc.translateWithConfig(
+        { useLocalBackend: true, provider: "argos" },
+        "http://127.0.0.1:8765",
+        { provider: "argos", target: "ZH", vtt_text: "WEBVTT\n\n" }
+      );
+      expect(backendClientMock.ensureArgosBackend).toHaveBeenCalledTimes(1);
+      expect(backendClientMock.proxyRequest).toHaveBeenCalledTimes(1);
+      expect(backendClientMock.createDirectTranslateJob).not.toHaveBeenCalled();
+    } finally {
+      window.Echo360Translator.buildConfig.enableLocalBackend = false;
+    }
   });
 });
 

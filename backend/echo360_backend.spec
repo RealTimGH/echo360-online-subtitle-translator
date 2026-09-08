@@ -92,7 +92,10 @@ executable = EXE(
     upx=False,
     console=True,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    # Finder/browser URL opens are delivered as argv values on macOS.  Keep
+    # the launch URL available to backend.launcher so it can be discarded
+    # before argparse processes normal server flags.
+    argv_emulation=True,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
@@ -118,5 +121,12 @@ if sys.platform == "darwin":
             "CFBundleDisplayName": "Echo360 Subtitle Backend",
             "CFBundleName": "Echo360 Subtitle Backend",
             "LSMinimumSystemVersion": "12.0",
+            "CFBundleURLTypes": [
+                {
+                    "CFBundleTypeRole": "Viewer",
+                    "CFBundleURLName": "io.github.realtim.echo360-subtitle-backend",
+                    "CFBundleURLSchemes": ["echo360-subtitle-backend"],
+                }
+            ],
         },
     )

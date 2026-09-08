@@ -271,6 +271,16 @@ async function saveConfig() {
       appearance: getInputValue("appearance", "auto") || "auto",
     };
     await extensionApi.storage.local.set({ [STORAGE_KEY]: config });
+    if (provider === "argos") {
+      setStatus("设置已保存，正在启动 Argos 后端…");
+      const response = await extensionApi.runtime.sendMessage({
+        type: "ensure-argos-backend",
+        backendUrl: config.backendUrl,
+      });
+      if (!response?.ok) {
+        throw extensionApi.toError(response, "ARGOS_BACKEND_START_FAILED", "Argos 设置已保存，但后端启动失败");
+      }
+    }
     clearError();
     setStatus("已保存。请回到 Echo360 页面，点击“加载翻译字幕”。");
     setTimeout(() => {
