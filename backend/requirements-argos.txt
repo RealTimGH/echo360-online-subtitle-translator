@@ -4,3 +4,13 @@
 # system-Python baseline; otherwise pip falls back to a slow, failing source build.
 spacy==3.7.5
 argostranslate==1.11.0
+# Freeze the native inference stack so a later rebuild does not silently pick
+# incompatible wheels or produce materially different platform artifacts.
+ctranslate2==4.8.2
+sentencepiece==0.2.2
+stanza==1.10.1
+sacremoses==0.1.1
+minisbd==0.9.5
+onnxruntime==1.19.2
+numpy==1.26.4
+torch==2.8.0

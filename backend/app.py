@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-CACHE_DIR = Path(__file__).resolve().parent / ".cache"
+CACHE_DIR = Path(os.getenv("ECHO360_CACHE_DIR", str(Path(__file__).resolve().parent / ".cache")))
 CACHE_SCHEMA_VERSION = 2
 DEFAULT_TRANSLATOR_SCRIPT = Path(__file__).resolve().parent.parent / "translator" / "translate_vtt_zh_deepl_native.py"
 TRANSLATOR_SCRIPT = Path(os.getenv("TRANSLATOR_SCRIPT", str(DEFAULT_TRANSLATOR_SCRIPT)))
@@ -488,12 +488,11 @@ def allowed_reasoning_for_model(model: str) -> set[str]:
 
 @lru_cache(maxsize=1)
 def get_supported_args() -> set[str]:
-    if not TRANSLATOR_SCRIPT.exists():
+    if not translator_runtime_available():
         return set()
-    python_bin = get_translator_python()
     try:
         proc = subprocess.run(
-            [python_bin, str(TRANSLATOR_SCRIPT), "--help"],
+            [*get_translator_command(), "--help"],
             check=True,
             capture_output=True,
             text=True,
@@ -523,6 +522,17 @@ def get_translator_python() -> str:
     if configured:
         return configured
     return sys.executable or "python3"
+
+
+def get_translator_command() -> list[str]:
+    """Return the source or frozen command used for the translator subprocess."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--translator"]
+    return [get_translator_python(), str(TRANSLATOR_SCRIPT)]
+
+
+def translator_runtime_available() -> bool:
+    return bool(getattr(sys, "frozen", False)) or TRANSLATOR_SCRIPT.exists()
 
 
 def redact_args(args: list[str]) -> list[str]:
@@ -578,13 +588,10 @@ def build_translator_args(
         )
 
     args = [
-        get_translator_python(),
-        str(TRANSLATOR_SCRIPT),
+        *get_translator_command(),
         str(input_path),
         "--out",
         str(out_vtt),
-        "--key",
-        req.api_key,
         "--provider",
         provider_name,
         "--model",
@@ -1215,7 +1222,7 @@ def run_translation(
     limit_key = web_provider_limit_key(provider_name)
     if provider_name not in KEYLESS_PROVIDERS and not (req.api_key or "").strip():
         raise_problem(400, "PROVIDER_API_KEY_MISSING", f"Provider '{req.provider}' 需要 API Key", phase="config")
-    if not TRANSLATOR_SCRIPT.exists():
+    if not translator_runtime_available():
         raise_problem(500, "TRANSLATOR_SCRIPT_MISSING", "本地翻译脚本不存在", phase="backend")
     if provider_name == "google-web":
         warnings.append(f"{limit_key} is experimental and uses an unofficial web endpoint; stability is not guaranteed")
@@ -1313,8 +1320,11 @@ def run_translation(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 env=proc_env,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
             output_lines: list[str] = []
             assert proc.stdout is not None

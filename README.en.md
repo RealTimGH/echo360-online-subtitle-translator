@@ -162,6 +162,39 @@ Windows (PowerShell) health check:
 Invoke-WebRequest http://127.0.0.1:8765/health
 ```
 
+### Standalone backend (no Python installation required)
+
+Release artifacts bundle Python, FastAPI, the translator, the Argos/CTranslate2 runtime, `en→zh`, `en→zt`, and the English MiniSBD model in one application directory. End users do not install Python, pip, a virtual environment, or Argos models:
+
+- macOS: extract `echo360-online-subtitle-translator-backend-macos-*.tar.gz` and launch `Echo360 Subtitle Backend.app`;
+- Windows: extract `echo360-online-subtitle-translator-backend-windows-x64.zip` and launch `Echo360SubtitleBackend\echo360-subtitle-backend.exe`.
+
+The program listens only on `127.0.0.1:8765` by default, so the extension keeps using its existing Backend URL. Quit the program to stop the backend. Translation cache files go to the current user's platform cache directory rather than the application directory.
+
+On first launch, the read-only bundled Argos models are copied into the current user's application-data directory, so that launch can take longer than subsequent ones. The workflow artifacts are intended for testing and internal distribution until Windows Authenticode signing and Apple Developer ID notarization credentials are added. The user starts this standalone program explicitly; browser-managed startup would require a separate installer and Native Messaging integration and is outside this environment-free packaging change.
+
+After a backend update, rebuild with one command on each target operating system (PyInstaller does not cross-compile):
+
+```bash
+python3 -m venv .backend-build-venv
+source .backend-build-venv/bin/activate
+python -m pip install -r backend/requirements-build.txt
+npm run build:backend
+python scripts/smoke-backend.py --check-argos
+```
+
+Windows PowerShell:
+
+```powershell
+py -3.12 -m venv .backend-build-venv
+.backend-build-venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements-build.txt
+npm run build:backend
+python scripts\smoke-backend.py --check-argos
+```
+
+Simplified and Traditional Chinese models are bundled by default. Repeat `--argos-target` to change the set, for example `npm run build:backend -- --argos-target zh --argos-target ja`; use `--refresh-models` to update the models in the build cache. The repository's `Build packaged backend` GitHub Actions workflow builds Windows x64, macOS Apple Silicon, and macOS Intel natively, then smoke-tests `/health`, frozen translator dispatch, and a real Argos translation.
+
 ## Extension Setup
 
 1. Open `chrome://extensions`.
@@ -189,7 +222,7 @@ Build outputs:
 - `dist/extension-store/`
 - `dist/echo360-online-subtitle-translator-store.zip`
 
-The store build disables and hides the local backend entry, and removes `localhost` / `127.0.0.1` permissions from `manifest.json`.
+The store build retains the optional local-backend entry and the `localhost` / `127.0.0.1` permissions so both the Chrome release and Safari containing app can connect to the standalone Argos backend. Direct translation remains the default when that option is disabled.
 
 For local development:
 
@@ -197,9 +230,9 @@ For local development:
 npm run build:dev
 ```
 
-The dev build keeps the local backend entry and localhost permissions.
+The dev build also keeps the local backend entry and localhost permissions, with a development name so it can be installed alongside the release build.
 
-`extension/` is the single source of business logic shared by Chrome and Safari. The Safari/Xcode project references generated release resources in `dist/extension-store/`, not a second manually maintained source tree. This build layer intentionally transforms `build_config.js`, `manifest.json`, and `options.html` to remove the local-backend UI and permissions.
+`extension/` is the single source of business logic shared by Chrome and Safari. The Safari/Xcode project references generated release resources in `dist/extension-store/`, not a second manually maintained source tree. The build generates target-specific `build_config.js` and manifest files while preserving standalone local-backend support.
 
 Before opening Xcode or using Build/Run, run:
 
@@ -270,7 +303,7 @@ For the direct extension path, `google-web` restores the 1.4.2 default speed pro
 
 Argos Translate provider (development build only):
 
-`argos` loads local Argos models directly inside the existing Python translator subprocess. It does not require a second LibreTranslate service and does not send subtitle text to a third party. The runtime uses one worker to avoid model contention and duplicate CTranslate2 memory use. Install the optional dependency and the models you need in the backend virtual environment:
+`argos` loads local Argos models directly inside the existing Python translator subprocess. It does not require a second LibreTranslate service and does not send subtitle text to a third party. The runtime uses one worker to avoid model contention and duplicate CTranslate2 memory use. Standalone backend artifacts already contain the Simplified and Traditional Chinese models; only source development requires installing the optional dependency and models in the backend virtual environment:
 
 ```bash
 cd backend
@@ -294,7 +327,7 @@ See [PRIVACY.md](PRIVACY.md). The extension sends subtitle text to the translati
 The backend builds an argument list directly instead of shell-parsing a command string. By default it uses:
 
 ```text
-python translator/translate_vtt_zh_deepl_native.py input.vtt --out translated.vtt --key ... --provider deepseek --model deepseek-v4-flash --target ZH
+TRANSLATOR_API_KEY=... python translator/translate_vtt_zh_deepl_native.py input.vtt --out translated.vtt --provider deepseek --model deepseek-v4-flash --target ZH
 ```
 
 Optional environment overrides:
@@ -315,7 +348,7 @@ Unsupported optional flags are skipped with a warning instead of being sent to t
 
 ## Caching
 
-The backend stores translated VTT files in `backend/.cache/`, which is ignored by git.
+Source mode stores translated VTT files in the git-ignored `backend/.cache/`; the standalone backend uses the current user's platform cache directory. Set `ECHO360_CACHE_DIR` to override it explicitly.
 
 Cache identity is based on content-affecting inputs:
 

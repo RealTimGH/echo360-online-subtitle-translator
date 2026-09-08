@@ -168,6 +168,39 @@ Windows (PowerShell) 健康检查：
 Invoke-WebRequest http://127.0.0.1:8765/health
 ```
 
+### 免 Python 环境的独立后端
+
+发布产物把 Python、FastAPI、翻译脚本、Argos/CTranslate2 运行时、`en→zh`、`en→zt` 和英语 MiniSBD 模型打包在同一个应用目录中。最终用户不需要安装 Python、pip、venv 或 Argos 模型：
+
+- macOS：解压 `echo360-online-subtitle-translator-backend-macos-*.tar.gz`，启动 `Echo360 Subtitle Backend.app`；
+- Windows：解压 `echo360-online-subtitle-translator-backend-windows-x64.zip`，启动 `Echo360SubtitleBackend\echo360-subtitle-backend.exe`。
+
+程序默认只监听 `127.0.0.1:8765`，扩展继续使用现有 Backend URL。关闭程序即可停止后端。翻译缓存写入当前用户的系统缓存目录，不会写入应用安装目录。
+
+首次启动会把只读应用包中的 Argos 模型复制到当前用户的应用数据目录，因此会比后续启动慢一些。当前工作流产出的包用于测试和内部发布，尚未配置 Windows Authenticode 或 Apple Developer ID 公证；面向公众分发时应在工作流中接入对应签名凭据。这个独立程序需要由用户启动；浏览器自动拉起后端需要另做安装器和 Native Messaging 集成，不属于当前免环境打包方案。
+
+后端更新后，在目标系统上一条命令即可重建原生包（PyInstaller 不能跨系统构建）：
+
+```bash
+python3 -m venv .backend-build-venv
+source .backend-build-venv/bin/activate
+python -m pip install -r backend/requirements-build.txt
+npm run build:backend
+python scripts/smoke-backend.py --check-argos
+```
+
+Windows PowerShell：
+
+```powershell
+py -3.12 -m venv .backend-build-venv
+.backend-build-venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements-build.txt
+npm run build:backend
+python scripts\smoke-backend.py --check-argos
+```
+
+默认打包简体和繁体中文模型。可重复传入 `--argos-target` 改变语言集合，例如 `npm run build:backend -- --argos-target zh --argos-target ja`；使用 `--refresh-models` 更新构建缓存中的模型。仓库的 `Build packaged backend` GitHub Actions 工作流会分别原生构建 Windows x64、macOS Apple Silicon 和 macOS Intel，并对 `/health`、冻结后的翻译器分派以及真实 Argos 翻译执行冒烟测试。
+
 
 
 ## 扩展安装
@@ -198,7 +231,7 @@ npm run build:store
 - `dist/extension-store/`
 - `dist/echo360-online-subtitle-translator-store.zip`
 
-store 构建会禁用并隐藏本地后端入口，同时从 `manifest.json` 移除 `localhost` / `127.0.0.1` 权限。
+store 构建保留可选的本地后端入口以及 `localhost` / `127.0.0.1` 权限，使 Chrome 发布包与 Safari containing app 都能连接独立 Argos 后端；未启用该选项时，扩展仍默认使用前端直连翻译。
 
 本地开发测试可使用：
 
@@ -206,9 +239,9 @@ store 构建会禁用并隐藏本地后端入口，同时从 `manifest.json` 移
 npm run build:dev
 ```
 
-dev 构建保留本地后端入口和 localhost 权限。
+dev 构建同样保留本地后端入口和 localhost 权限，并使用开发版名称方便并行安装。
 
-`extension/` 是 Chrome 与 Safari 共用的唯一业务源码。Safari/Xcode 工程引用的是由它生成的 `dist/extension-store/` 发布态资源，而不是另一套需要手工维护的源码；这层构建产物会有意改写 `build_config.js`、`manifest.json` 和 `options.html`，以移除本地后端入口与权限。
+`extension/` 是 Chrome 与 Safari 共用的唯一业务源码。Safari/Xcode 工程引用的是由它生成的 `dist/extension-store/` 发布态资源，而不是另一套需要手工维护的源码；构建过程会生成目标专用的 `build_config.js` 和清单，同时保留独立本地后端能力。
 
 打开 Xcode 或 Build/Run 前先执行：
 
@@ -282,7 +315,7 @@ Google Translate provider：
 
 Argos Translate provider（仅开发版）：
 
-`argos` 直接在现有 Python 翻译子进程中加载本机 Argos 模型，不需要再启动 LibreTranslate 服务，也不会把字幕发送到第三方。为了避免 CTranslate2 模型竞争和重复占用内存，运行时固定为单 worker。先在后端虚拟环境安装可选依赖和所需模型：
+`argos` 直接在现有 Python 翻译子进程中加载本机 Argos 模型，不需要再启动 LibreTranslate 服务，也不会把字幕发送到第三方。为了避免 CTranslate2 模型竞争和重复占用内存，运行时固定为单 worker。独立后端发布包已经包含简体/繁体中文模型；只有源码开发模式需要在后端虚拟环境安装可选依赖和所需模型：
 
 ```bash
 cd backend
@@ -308,7 +341,7 @@ python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["
 后端直接构造参数列表，不通过 shell 拼接命令。默认调用方式：
 
 ```text
-python translator/translate_vtt_zh_deepl_native.py input.vtt --out translated.vtt --key ... --provider deepseek --model deepseek-v4-flash --target ZH
+TRANSLATOR_API_KEY=... python translator/translate_vtt_zh_deepl_native.py input.vtt --out translated.vtt --provider deepseek --model deepseek-v4-flash --target ZH
 ```
 
 可选环境变量覆盖：
@@ -329,7 +362,7 @@ export TRANSLATOR_PYTHON_BIN=/absolute/path/to/python
 
 ## 缓存策略
 
-后端会将翻译后的 VTT 存到 `backend/.cache/`，该目录已被 git 忽略。
+源码模式会将翻译后的 VTT 存到已被 git 忽略的 `backend/.cache/`；独立后端使用当前用户的系统缓存目录。可用 `ECHO360_CACHE_DIR` 显式覆盖。
 
 后端缓存身份基于会影响内容的输入：
 
