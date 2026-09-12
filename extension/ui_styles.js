@@ -55,12 +55,31 @@
        * is busy - it won't fix the underlying page-side lag, but our own UI
        * stops adding to the perceived stutter.
        */
-      #echo360-translator-ball {
+      #echo360-translator-ball-group {
         position: fixed;
         right: 6px;
         bottom: 120px;
+        width: 84px;
+        height: 52px;
+        display: flex;
+        align-items: stretch;
+        justify-content: flex-end;
+        z-index: 2147483647;
+        pointer-events: auto;
+        /* Keep at least 24 px of the primary target visible while docked. */
+        transform: translateX(28px);
+        will-change: transform, opacity;
+        transition: transform 0.28s cubic-bezier(0.34,1.4,0.64,1), opacity 0.2s ease;
+      }
+      #echo360-translator-ball-group:hover,
+      #echo360-translator-ball-group:focus-within {
+        transform: translateX(0);
+      }
+      #echo360-translator-ball {
+        position: relative;
         width: 52px;
         height: 52px;
+        flex: 0 0 52px;
         border-radius: 50%;
         background: var(--echo360-ball-bg);
         color: var(--echo360-ball-fg);
@@ -70,43 +89,90 @@
         align-items: center;
         justify-content: center;
         cursor: pointer;
-        z-index: 2147483647;
-        pointer-events: auto;
         box-shadow: -3px 2px 14px var(--echo360-ball-shadow);
-        transform: translateX(32px);
-        will-change: transform;
-        transition: transform 0.28s cubic-bezier(0.34,1.4,0.64,1),
-                    opacity 0.2s ease,
-                    box-shadow 0.2s;
+        transition: transform 0.15s ease, box-shadow 0.2s, opacity 0.2s;
         user-select: none;
         outline: none;
       }
       #echo360-translator-ball:hover {
-        transform: translateX(0);
         box-shadow: -5px 4px 22px var(--echo360-ball-shadow-hover);
       }
       /* Immediate, JS-independent press feedback so clicks feel responsive
          even if the actual click handler has to wait behind a busy main thread. */
-      #echo360-translator-ball:hover:active {
-        transform: translateX(0) scale(0.92);
+      #echo360-translator-ball:active {
+        transform: scale(0.92);
       }
       /*
        * Extend the hover-sensitive zone 30 px to the right.
        * Without this, the 6 px gap between the ball and the viewport edge
        * causes the ball to flicker (mouseleave → retract → re-enter → repeat).
        */
-      #echo360-translator-ball::after {
+      #echo360-translator-ball-group::after {
         content: "";
         position: absolute;
         top: -10px;
         right: -30px;
         bottom: -10px;
         left: 0;
+        pointer-events: none;
       }
-      #echo360-translator-ball.echo360-ball-hidden {
+      #echo360-translator-ball-group.echo360-ball-hidden {
         transform: translateX(70px);
         opacity: 0;
         pointer-events: none;
+      }
+      .echo360-ball-secondary {
+        width: 30px;
+        height: 52px;
+        margin-right: 2px;
+        display: grid;
+        grid-template-rows: 1fr 1fr;
+        gap: 2px;
+      }
+      .echo360-ball-secondary button {
+        min-width: 30px;
+        min-height: 25px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--echo360-ball-fg);
+        background: var(--echo360-ball-bg);
+        border: 1px solid var(--echo360-ball-border);
+        cursor: pointer;
+        outline: none;
+      }
+      .echo360-ball-secondary button:first-child { border-radius: 10px 10px 4px 4px; }
+      .echo360-ball-secondary button:last-child { border-radius: 4px 4px 10px 10px; }
+      .echo360-ball-secondary button:hover,
+      .echo360-ball-secondary button:focus-visible {
+        box-shadow: 0 0 0 2px var(--echo360-ball-shadow-hover);
+      }
+      .echo360-ball-secondary button:disabled {
+        cursor: default;
+        opacity: 0.42;
+      }
+      #echo360-translator-ball-group.echo360-ball-busy #echo360-translator-ball svg {
+        animation: echo360-ball-busy-spin 1.1s linear infinite;
+      }
+      #echo360-translator-ball-group[data-kind="success"] #echo360-translator-ball {
+        box-shadow: 0 0 0 2px #25b36a, -3px 2px 14px var(--echo360-ball-shadow);
+      }
+      #echo360-translator-ball-group[data-kind="warning"] #echo360-translator-ball,
+      #echo360-translator-ball-group[data-kind="error"] #echo360-translator-ball {
+        box-shadow: 0 0 0 2px #e5a225, -3px 2px 14px var(--echo360-ball-shadow);
+      }
+      @keyframes echo360-ball-busy-spin { to { transform: rotate(360deg); } }
+      @media (hover: none) {
+        #echo360-translator-ball-group { transform: translateX(0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #echo360-translator-ball-group,
+        #echo360-translator-ball,
+        #echo360-translator-ball-group.echo360-ball-pulse #echo360-translator-ball::before {
+          transition: none;
+          animation: none;
+        }
       }
 
       /* ===== First-run onboarding ===== */
@@ -119,7 +185,7 @@
          look, but scale+opacity can run on the compositor thread instead of
          forcing a main-thread repaint every frame.
          Loops until the user dismisses the onboarding bubble (no auto-hide timer). */
-      #echo360-translator-ball.echo360-ball-pulse::before {
+      #echo360-translator-ball-group.echo360-ball-pulse #echo360-translator-ball::before {
         content: "";
         position: absolute;
         inset: 0;
@@ -291,6 +357,57 @@
         border-color: var(--echo360-diagnostic-warning-border);
         color: var(--echo360-diagnostic-warning-muted);
       }
+      .echo360-panel-btn--secondary {
+        background: var(--echo360-btn-collapse-bg);
+        color: var(--echo360-btn-collapse-fg);
+      }
+      .echo360-manual-translation {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid var(--echo360-divider-color);
+      }
+      .echo360-manual-translation[hidden] { display: none; }
+      .echo360-manual-translation p {
+        margin: 0 0 8px;
+        font-size: 11px;
+        line-height: 1.45;
+        opacity: .82;
+      }
+      .echo360-manual-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .echo360-manual-row button,
+      .echo360-manual-link {
+        min-width: 0;
+        padding: 7px 8px;
+        border: 1px solid var(--echo360-popover-border-color);
+        border-radius: 7px;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+        font: 11px/1.3 ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+      }
+      .echo360-manual-link {
+        width: 100%;
+        margin: 6px 0;
+        border: 0;
+        text-decoration: underline;
+        opacity: .72;
+      }
+      .echo360-manual-row button:disabled,
+      .echo360-manual-link:disabled { cursor: default; opacity: .42; }
+      .echo360-manual-status {
+        min-height: 16px;
+        margin-top: 6px;
+        font-size: 11px;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+      }
+      .echo360-manual-status[data-kind="error"] { color: var(--echo360-diagnostic-error); }
+      .echo360-manual-status[data-kind="warning"] { color: var(--echo360-diagnostic-warning); }
 
       /* ===== Settings popover ===== */
       #echo360-translator-popover {

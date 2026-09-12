@@ -241,6 +241,33 @@
     }
     validateSourceVtt(vttText, "source");
 
+    // A translated browser track is syntactically valid WebVTT, so the normal
+    // header/cue checks cannot catch a source-selection loop. Reject the
+    // high-confidence bilingual shape defensively at the source boundary. The
+    // primary fix is still source_finder's explicit exclusion of extension
+    // tracks; this guard protects old DOM remnants, cached player state, and
+    // future source adapters from feeding output back into translation.
+    const bilingualShape = ns.vtt.inspectProbableBilingualVtt?.(vttText);
+    if (bilingualShape?.probable) {
+      const error = makeSourceError(
+        `检测到字幕源已经包含成对的中英文/目标语言文字（${bilingualShape.mixedCueCount}/${bilingualShape.cueCount} 个 cue），已阻止重复翻译`,
+        "SOURCE_ALREADY_TRANSLATED",
+        {
+          phase: "source",
+          sourceMeta,
+          details: {
+            sourceStructure: bilingualShape,
+            action: "remove-translated-track-and-resolve-original-source",
+          },
+        }
+      );
+      console.error("[echo360-translator][source] rejected probable translated source", {
+        sourceId: ns.errorUtils?.redactUrl?.(sourceId) || sourceId,
+        sourceStructure: bilingualShape,
+      });
+      throw error;
+    }
+
     const stats = sourceMeta?.stats || ns.vtt.parseVttStats(vttText);
     console.info("[echo360-translator][source] resolved subtitle source", {
       hostType: isInstructureMedia ? "instructure-media" : "echo360",
@@ -262,6 +289,13 @@
   }
 
   function buildTranslatePayload(cfg, vttText, forceRefresh) {
+    if (typeof vttText !== "string" || !vttText.trim()) {
+      const error = new Error("翻译请求缺少有效的带时间轴字幕 vtt_text");
+      error.code = "INVALID_SOURCE_VTT";
+      error.phase = "source";
+      error.details = { field: "vtt_text", reason: "required_non_empty_string" };
+      throw error;
+    }
     return {
       vtt_text: vttText,
       // api_key is intentionally omitted — the service worker injects it from
@@ -285,6 +319,7 @@
       slow_split_threshold: Number(cfg.slowSplitThreshold) || 0,
       deepseek_thinking_mode: cfg.deepseekThinkingMode || "disabled",
       deepl_formality: cfg.deeplFormality || "",
+      azure_region: cfg.azureRegion || "",
       force_refresh: !!forceRefresh,
     };
   }
@@ -419,9 +454,9 @@
       error.cause = googleError;
       throw error;
     }
-    await ns.backendClient.ensureArgosBackend(backendUrl);
+    const ready = await ns.backendClient.ensureArgosBackend(backendUrl);
     const result = await translateWithBackend(
-      backendUrl,
+      ready?.backendUrl || backendUrl,
       buildArgosFallbackPayload(payload),
       options
     );
@@ -449,10 +484,10 @@
           throw error;
         }
         options.onProgress?.(0, 0, "正在启动 Argos 离线翻译后端…", { phase: "argos-startup" });
-        await ns.backendClient.ensureArgosBackend(backendUrl);
-        return await translateWithBackend(backendUrl, payload, options);
+        const ready = await ns.backendClient.ensureArgosBackend(backendUrl);
+        return await translateWithBackend(ready?.backendUrl || backendUrl, payload, options);
       }
-      if (cfg.useLocalBackend && ns.buildConfig?.enableLocalBackend !== false) {
+      if (String(payload?.provider || cfg?.provider || "").toLowerCase() === "custom-backend") {
         return await translateWithBackend(backendUrl, payload, options);
       }
       return await translateInExtension(payload, options);

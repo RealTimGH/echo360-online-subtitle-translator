@@ -245,6 +245,7 @@ describe("renderer Canvas Instructure Media mode", () => {
       originalVtt: ORIG_VTT,
       translatedVtt: TRANS_VTT,
       bilingual: false,
+      nativeInjection: false,
     }));
     expect(video.querySelectorAll("track").length).toBe(0);
 
@@ -253,6 +254,30 @@ describe("renderer Canvas Instructure Media mode", () => {
       video,
       originalVtt: ORIG_VTT,
       translatedVtt: TRANS_VTT,
+    }));
+  });
+
+  it("occupies Vidstack's caption position only for explicit native-CC injection", () => {
+    const playerCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => false),
+      mount: vi.fn(() => true),
+      update: vi.fn(() => true),
+      unmount: vi.fn(),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer } = setupRenderer({ playerCaptionRenderer });
+
+    expect(renderer.renderTranslatedTrack(
+      TRANS_VTT, ORIG_VTT, true, "medium", false, null, false,
+      { browserBilingual: false, browserReverseOrder: false }
+    )).toBe(true);
+
+    expect(playerCaptionRenderer.mount).toHaveBeenCalledWith(expect.objectContaining({
+      bilingual: true,
+      nativeInjection: true,
     }));
   });
 

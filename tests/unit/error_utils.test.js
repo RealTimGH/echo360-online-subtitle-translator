@@ -8,6 +8,16 @@ function loadErrors() {
 }
 
 describe("structured error model", () => {
+  it("recognizes only conservative unchanged neutral captions for a Chinese target", () => {
+    const errors = loadErrors();
+    expect(errors.isTargetNeutralText("F.", "F.", "ZH")).toBe(true);
+    expect(errors.isTargetNeutralText("2026", "2026", "ZH")).toBe(true);
+    expect(errors.isTargetNeutralText("ITLS6111", "ITLS6111", "ZH")).toBe(true);
+    expect(errors.isTargetNeutralText("unchanged", "unchanged", "ZH")).toBe(false);
+    expect(errors.isTargetNeutralText("a normal sentence", "a normal sentence", "ZH")).toBe(false);
+    expect(errors.isTargetNeutralText("F.", "F.", "EN")).toBe(false);
+  });
+
   it("explains Google 429 recovery with metrics and an actionable recommendation", () => {
     const errors = loadErrors();
     const model = errors.normalizeError({

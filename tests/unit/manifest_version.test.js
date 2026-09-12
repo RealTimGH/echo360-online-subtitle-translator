@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PROJECT_ROOT } from "../helpers/load-module.js";
 
-const EXPECTED_VERSION = "1.5.1";
+const EXPECTED_VERSION = "1.6.0";
 
 describe("extension release metadata", () => {
   it("keeps manifest and README version declarations in sync", () => {
@@ -17,9 +17,12 @@ describe("extension release metadata", () => {
 
   it("declares the Canvas/Instructure Media frame support needed by the player adapter", () => {
     const manifest = JSON.parse(readFileSync(resolve(PROJECT_ROOT, "extension/manifest.json"), "utf8"));
+    expect(manifest.permissions).toEqual(expect.arrayContaining(["storage", "clipboardRead", "clipboardWrite"]));
     expect(manifest.host_permissions).toContain("*://*.instructuremedia.com/*");
     expect(manifest.host_permissions).not.toContain("*://canvas.sydney.edu.au/*");
     expect(manifest.host_permissions).toContain("http://[::1]:8765/*");
+    expect(manifest.host_permissions).toContain("https://api.cognitive.microsofttranslator.com/*");
+    expect(manifest.host_permissions).toContain("https://*.cognitiveservices.azure.com/*");
     expect(manifest.content_scripts).toHaveLength(3);
     const courseBridge = manifest.content_scripts.find((script) => script.js.includes("canvas_course_bridge.js"));
     expect(courseBridge).toMatchObject({

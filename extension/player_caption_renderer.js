@@ -4,6 +4,8 @@
   const OVERLAY_ATTR = "data-echo360-instructure-caption";
   const LINE_ATTR = "data-echo360-instructure-caption-line";
   const SIZE_MAP = { small: "0.88em", medium: "1em", large: "1.14em" };
+  const DEFAULT_BOTTOM_PADDING = "calc(var(--media-controls-height, 48px) + 2%)";
+  const NATIVE_CAPTION_GAP_PX = 8;
 
   let state = null;
 
@@ -99,7 +101,38 @@
     return -1;
   }
 
-  function styleOverlay(overlay) {
+  function isElementVisiblyRendered(element) {
+    if (!element?.isConnected || element.hidden || element.getAttribute?.("aria-hidden") === "true") return false;
+    try {
+      const style = getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" ||
+        (style.opacity !== "" && Number(style.opacity) === 0)) return false;
+    } catch (_) {}
+    const rect = element.getBoundingClientRect?.();
+    return !!rect && rect.width > 0 && rect.height > 0;
+  }
+
+  function nativeCaptionTop(surface, player) {
+    if (!isElementVisiblyRendered(surface)) return null;
+    const playerRect = player?.getBoundingClientRect?.();
+    if (!playerRect || playerRect.height <= 0) return null;
+    // Vidstack's captions surface commonly covers the entire player, so its
+    // own rectangle cannot identify the visible cue box. Prefer known cue
+    // parts, then visibly rendered leaf nodes for older player versions.
+    const preferred = Array.from(surface.querySelectorAll?.(
+      '[data-part="cue"], [data-part="cue-display"], [data-part="cue-box"], [data-part="caption-cue"]'
+    ) || []);
+    const candidates = preferred.length > 0
+      ? preferred
+      : Array.from(surface.querySelectorAll?.("*") || []).filter((node) => node.childElementCount === 0);
+    const tops = candidates
+      .filter(isElementVisiblyRendered)
+      .map((node) => node.getBoundingClientRect().top)
+      .filter((top) => Number.isFinite(top) && top >= playerRect.top && top <= playerRect.bottom);
+    return tops.length > 0 ? Math.min(...tops) : null;
+  }
+
+  function styleOverlay(overlay, player, surface) {
     overlay.style.display = "flex";
     overlay.style.position = "absolute";
     overlay.style.inset = "0";
@@ -114,7 +147,15 @@
     // a sibling of Vidstack's native captions surface: that surface is often
     // display:none/aria-hidden while the CC toggle is off, which would make
     // any child translation invisible as well.
-    overlay.style.padding = "0 0.35em calc(var(--media-controls-height, 48px) + 2%)";
+    const nativeTop = state?.nativeInjection ? null : nativeCaptionTop(surface, player);
+    const playerRect = nativeTop == null ? null : player?.getBoundingClientRect?.();
+    const nativeOffset = playerRect && Number.isFinite(playerRect.bottom)
+      ? Math.max(0, Math.ceil(playerRect.bottom - nativeTop + NATIVE_CAPTION_GAP_PX))
+      : 0;
+    overlay.style.paddingTop = "0";
+    overlay.style.paddingRight = "0.35em";
+    overlay.style.paddingBottom = nativeOffset > 0 ? `${nativeOffset}px` : DEFAULT_BOTTOM_PADDING;
+    overlay.style.paddingLeft = "0.35em";
     overlay.style.boxSizing = "border-box";
     overlay.style.pointerEvents = "none";
     overlay.style.textAlign = "center";
@@ -181,7 +222,8 @@
       restoreNativeCaptionSurface(state.surface);
       state.surface = surface;
     }
-    hideNativeCaptionSurface(surface);
+    if (state.nativeInjection) hideNativeCaptionSurface(surface);
+    else restoreNativeCaptionSurface(surface);
     let overlay = state.overlay?.isConnected && state.overlay.parentElement === player
       ? state.overlay
       : player.querySelector(`:scope > [${OVERLAY_ATTR}="1"]`);
@@ -190,7 +232,7 @@
       overlay.setAttribute(OVERLAY_ATTR, "1");
       player.appendChild(overlay);
     }
-    styleOverlay(overlay);
+    styleOverlay(overlay, player, surface);
     state.overlay = overlay;
     return overlay;
   }
@@ -239,7 +281,13 @@
     }
 
     const lines = [];
-    if (state.bilingual) {
+    // When Vidstack is already showing the original CC, keep the extension
+    // layer translation-only so bilingual mode does not duplicate the same
+    // English line. If native CC is off, the user's bilingual preference still
+    // works entirely inside the independent overlay.
+    const nativeOriginalVisible = !state.nativeInjection &&
+      nativeCaptionTop(state.surface, state.player) != null;
+    if (state.bilingual && !nativeOriginalVisible) {
       const ordered = state.reverseOrder
         ? [["original", cue.original], ["translated", cue.translated]]
         : [["translated", cue.translated], ["original", cue.original]];
@@ -270,7 +318,7 @@
     });
   }
 
-  function update({ video, originalVtt, translatedVtt, size, bilingual, reverseOrder } = {}) {
+  function update({ video, originalVtt, translatedVtt, size, bilingual, reverseOrder, nativeInjection } = {}) {
     if (!state) return false;
     // Incremental updates can race with a SPA replacing the player. Never
     // report success after updating the detached video; the orchestrator will
@@ -285,12 +333,13 @@
     if (size) state.size = SIZE_MAP[size] ? size : "medium";
     if (bilingual !== undefined) state.bilingual = !!bilingual;
     if (reverseOrder !== undefined) state.reverseOrder = !!reverseOrder;
+    if (nativeInjection !== undefined) state.nativeInjection = !!nativeInjection;
     state.currentCueIndex = -1;
     render();
     return true;
   }
 
-  function mount({ video, originalVtt, translatedVtt, size, bilingual = false, reverseOrder = false }) {
+  function mount({ video, originalVtt, translatedVtt, size, bilingual = false, reverseOrder = false, nativeInjection = false }) {
     if (!isSupportedVideo(video)) return false;
     const player = findPlayer(video);
     const surface = findSurface(video);
@@ -311,6 +360,7 @@
       size: SIZE_MAP[size] ? size : "medium",
       bilingual: !!bilingual,
       reverseOrder: !!reverseOrder,
+      nativeInjection: !!nativeInjection,
       visible: true,
       currentCueIndex: -1,
       overlay: null,
@@ -390,6 +440,7 @@
       currentCueIndex: state.currentCueIndex,
       visible: state.visible,
       bilingual: state.bilingual,
+      nativeInjection: state.nativeInjection,
       surfaceAttached: !!state.surface?.isConnected,
       overlayAttached: !!state.overlay?.isConnected,
     };

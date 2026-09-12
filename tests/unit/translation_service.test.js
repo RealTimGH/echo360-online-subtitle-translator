@@ -196,6 +196,14 @@ describe("resolveSourceVtt", () => {
 });
 
 describe("buildTranslatePayload", () => {
+  it("rejects a missing source instead of emitting vtt_text: undefined", () => {
+    expect(() => svc.buildTranslatePayload({ provider: "argos", target: "ZH" }, undefined, false))
+      .toThrowError(expect.objectContaining({
+        code: "INVALID_SOURCE_VTT",
+        phase: "source",
+      }));
+  });
+
   it("maps non-zero config fields to snake_case payload", () => {
     const payload = svc.buildTranslatePayload(
       {
@@ -216,6 +224,7 @@ describe("buildTranslatePayload", () => {
         slowSplitThreshold: 1,
         deepseekThinkingMode: "enabled",
         deeplFormality: "more",
+        azureRegion: "australiaeast",
       },
       "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n",
       false
@@ -238,6 +247,7 @@ describe("buildTranslatePayload", () => {
     expect(payload.slow_split_threshold).toBe(1);
     expect(payload.deepseek_thinking_mode).toBe("enabled");
     expect(payload.deepl_formality).toBe("more");
+    expect(payload.azure_region).toBe("australiaeast");
     expect(payload.bilingual).toBe(false);
     expect(payload.force_refresh).toBe(false);
   });
@@ -301,6 +311,11 @@ describe("buildTranslatePayload", () => {
     expect(payload.deepl_formality).toBe("");
   });
 
+  it("passes azureRegion fallback to empty string", () => {
+    const payload = svc.buildTranslatePayload({}, "WEBVTT\n\n", false);
+    expect(payload.azure_region).toBe("");
+  });
+
   it("force_refresh=true when forceRefresh is truthy", () => {
     expect(svc.buildTranslatePayload({}, "WEBVTT\n\n", true).force_refresh).toBe(true);
     expect(svc.buildTranslatePayload({}, "WEBVTT\n\n", false).force_refresh).toBe(false);
@@ -345,6 +360,27 @@ describe("translateWithConfig (store build)", () => {
       onProgress,
       onPartialVtt: expect.any(Function),
     }));
+  });
+
+  it("routes only the explicit custom-backend provider through the backend contract", async () => {
+    backendClientMock.proxyRequest.mockResolvedValue({ job_id: "custom-job" });
+    backendClientMock.waitJob.mockResolvedValue({ translated_vtt: "WEBVTT\n\n" });
+    const payload = { provider: "custom-backend", target: "ZH", vtt_text: "WEBVTT\n\n" };
+
+    await svc.translateWithConfig(
+      { provider: "custom-backend" },
+      "https://translator.example/api",
+      payload
+    );
+
+    expect(backendClientMock.proxyRequest).toHaveBeenCalledWith(
+      "https://translator.example/api",
+      "/translate-async",
+      "POST",
+      payload
+    );
+    expect(backendClientMock.createDirectTranslateJob).not.toHaveBeenCalled();
+    expect(backendClientMock.ensureArgosBackend).not.toHaveBeenCalled();
   });
 
   it("does not convert a non-404 async creation failure into a second translation", async () => {

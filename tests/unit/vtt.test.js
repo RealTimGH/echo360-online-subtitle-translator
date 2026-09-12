@@ -191,6 +191,68 @@ describe("parseVttStats", () => {
     expect(s.ranges[0][0]).toBeCloseTo(1);
     expect(s.ranges[0][1]).toBeCloseTo(3);
   });
+
+  it("reports physical subtitle-line structure for source diagnostics", () => {
+    const s = vtt.parseVttStats([
+      "WEBVTT",
+      "",
+      "00:00:01.000 --> 00:00:02.000",
+      "中文",
+      "English",
+      "",
+    ].join("\n"));
+    expect(s).toMatchObject({
+      cueCount: 1,
+      textLineCount: 2,
+      multilineCueCount: 1,
+      emptyCueCount: 0,
+    });
+  });
+});
+
+describe("inspectProbableBilingualVtt", () => {
+  it("detects the extension's bilingual output shape", () => {
+    const bilingual = [
+      "WEBVTT",
+      "",
+      "1",
+      "00:00:00.000 --> 00:00:01.000",
+      "第一句",
+      "First sentence",
+      "",
+      "2",
+      "00:00:01.000 --> 00:00:02.000",
+      "第二句",
+      "Second sentence",
+      "",
+      "3",
+      "00:00:02.000 --> 00:00:03.000",
+      "第三句",
+      "Third sentence",
+    ].join("\n");
+    expect(vtt.inspectProbableBilingualVtt(bilingual)).toMatchObject({
+      probable: true,
+      cueCount: 3,
+      mixedCueCount: 3,
+      multilineCueCount: 3,
+    });
+  });
+
+  it("does not reject an ordinary single-language multiline caption", () => {
+    const source = [
+      "WEBVTT",
+      "",
+      "1",
+      "00:00:00.000 --> 00:00:01.000",
+      "First line",
+      "Second line",
+      "",
+      "2",
+      "00:00:01.000 --> 00:00:02.000",
+      "Third line",
+    ].join("\n");
+    expect(vtt.inspectProbableBilingualVtt(source).probable).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

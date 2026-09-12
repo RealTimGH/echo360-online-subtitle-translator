@@ -286,7 +286,9 @@
             <option value="gemini">Gemini</option>
             <option value="openai">OpenAI</option>
             <option value="deepl">DeepL</option>
+            <option value="azure">Azure AI Translator F0</option>
             <option value="argos" data-local-backend-only>Argos Translate（本地）</option>
+            <option value="custom-backend">自定义后端</option>
           </select>
           <div id="providerHint" class="hint"></div>
 
@@ -308,28 +310,21 @@
             <option value="HI">印地语 (हिन्दी)</option>
           </select>
 
-          <label for="apiKey">API Key</label>
+          <label for="apiKey" data-direct-provider-field>API Key</label>
           <input id="apiKey" type="password" autocomplete="off" placeholder="Google Translate 不需要 API Key" />
           <div id="apiKeyHint" class="hint"></div>
 
-          <label for="model">Model</label>
+          <label for="model" data-direct-provider-field>Model</label>
           <input id="model" placeholder="deepseek-v4-flash" />
 
-          <label for="endpoint">Endpoint（可选）</label>
+          <label for="endpoint" data-direct-provider-field>Endpoint（可选）</label>
           <input id="endpoint" placeholder="通常保持为空" />
 
-          <!-- LOCAL_BACKEND_START -->
-          <div id="localBackendSection">
-            <label>
-              <input id="useLocalBackend" type="checkbox" />
-              使用本地后端
-            </label>
-            <div id="backendHint" class="hint">关闭时扩展会直接调用所选服务。仅当你需要本地脚本、后端缓存或调试时开启。</div>
-
-            <label for="backendUrl">Backend URL</label>
-            <input id="backendUrl" placeholder="http://127.0.0.1:8765" />
+          <div id="customBackendSection" hidden>
+            <label for="customBackendUrl">自定义后端 URL</label>
+            <input id="customBackendUrl" placeholder="http://127.0.0.1:8765" />
+            <div id="backendHint" class="hint">需兼容本扩展的 /translate-async、任务轮询和 /translate 接口。远程地址必须使用 HTTPS；权限只会按你填写的站点单独申请。</div>
           </div>
-          <!-- LOCAL_BACKEND_END -->
 
           <button id="saveBtn">保存设置</button>
           <div id="status" role="status" aria-live="polite"></div>
@@ -430,6 +425,12 @@
                 <option value="prefer_more">prefer_more</option>
                 <option value="prefer_less">prefer_less</option>
               </select>
+            </div>
+
+            <div data-provider-advanced="azure" hidden>
+              <label for="azureRegion">Azure Region（可选）</label>
+              <input id="azureRegion" placeholder="例如 australiaeast；全局 Translator 资源留空" />
+              <div class="hint">多服务或区域型 Azure 资源需要填写 Location/Region；全局 Translator 资源通常只需要订阅密钥。</div>
             </div>
           </div>
         </details>

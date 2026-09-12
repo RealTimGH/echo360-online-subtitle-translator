@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+from fastapi import HTTPException
+
 from backend import app as backend
 from backend import launcher
 from backend import runtime
@@ -13,6 +15,12 @@ from translator import translate_vtt_zh_deepl_native as translator
 
 
 SAMPLE_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n"
+BILINGUAL_SAMPLE_VTT = "WEBVTT\n\n" + "\n\n".join(
+    [
+        f"00:00:0{index}.000 --> 00:00:0{index + 1}.000\n中文第 {index}\nEnglish line {index}"
+        for index in range(3)
+    ]
+) + "\n"
 
 
 class BackendRuntimeTests(unittest.TestCase):
@@ -132,6 +140,48 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertEqual(backend.translatable_line_count(SAMPLE_VTT), 1)
         self.assertEqual(backend.timed_cue_ranges(SAMPLE_VTT), [(0, 1000)])
 
+    def test_async_job_exposes_known_total_while_worker_is_preparing(self):
+        request = backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="argos")
+        with mock.patch.object(backend.threading.Thread, "start"):
+            created = backend.translate_async(request)
+        job = backend.translate_async_status(created["job_id"])
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["progress"]["current"], 0)
+        self.assertEqual(job["progress"]["total"], 1)
+        self.assertEqual(job["progress"]["stage"], "preparing")
+
+    def test_target_coverage_accepts_neutral_unchanged_caption_but_not_ordinary_english(self):
+        self.assertTrue(backend.is_target_neutral_text("F.", "F.", "ZH"))
+        self.assertTrue(backend.is_target_neutral_text("2026", "2026", "ZH"))
+        self.assertTrue(backend.is_target_neutral_text("ITLS6111", "ITLS6111", "ZH"))
+        self.assertFalse(backend.is_target_neutral_text("unchanged", "unchanged", "ZH"))
+        self.assertFalse(backend.is_target_neutral_text("F.", "F.", "EN"))
+        neutral_vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nF.\n"
+        self.assertTrue(backend.has_cjk_in_every_timed_cue(
+            neutral_vtt,
+            source_text=neutral_vtt,
+            target="ZH",
+        ))
+
+    def test_bilingual_source_detector_blocks_accumulated_rendered_tracks(self):
+        structure = backend.inspect_probable_bilingual_source(BILINGUAL_SAMPLE_VTT)
+        self.assertTrue(structure["probable"])
+        self.assertEqual(structure["cueCount"], 3)
+        self.assertEqual(structure["mixedCueCount"], 3)
+        self.assertEqual(structure["textLineCount"], 6)
+        self.assertEqual(backend.translator_error_status("SOURCE_ALREADY_TRANSLATED"), 422)
+
+        request = backend.TranslateRequest(
+            vtt_text=BILINGUAL_SAMPLE_VTT,
+            provider="argos",
+            target="ZH",
+        )
+        with self.assertRaises(HTTPException) as caught:
+            backend.run_translation(BILINGUAL_SAMPLE_VTT, request, force_refresh=True)
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "SOURCE_ALREADY_TRANSLATED")
+        self.assertEqual(caught.exception.detail["details"]["sourceStructure"]["textLineCount"], 6)
+
     def test_problem_payload_redacts_credentials_and_preserves_typed_status(self):
         problem = backend.problem_payload(
             429,
@@ -247,6 +297,46 @@ class TranslatorRuntimeTests(unittest.TestCase):
             translator._resolve_argos_target_lang("YUE")
         with self.assertRaisesRegex(ValueError, "English as its source"):
             translator._resolve_argos_target_lang("EN")
+
+    def test_translator_source_detector_blocks_bilingual_input_before_provider_call(self):
+        structure = translator.inspect_probable_bilingual_source(BILINGUAL_SAMPLE_VTT.splitlines())
+        self.assertTrue(structure["probable"])
+        self.assertEqual(structure["mixedCueCount"], 3)
+        with self.assertRaisesRegex(ValueError, "SOURCE_ALREADY_TRANSLATED"):
+            translator.translate_lines_native(
+                BILINGUAL_SAMPLE_VTT.splitlines(),
+                api_key="",
+                provider="argos",
+                target_lang="ZH",
+                log_progress=False,
+            )
+
+    def test_argos_accepts_an_unchanged_neutral_caption_without_partial_failure(self):
+        lines = [
+            "WEBVTT",
+            "",
+            "00:00:00.000 --> 00:00:01.000",
+            "F.",
+            "",
+        ]
+        outcome = {}
+        with mock.patch.object(translator, "argos_translate_batch", side_effect=lambda texts, target_lang: list(texts)):
+            translated = translator.translate_lines_native(
+                lines,
+                api_key="",
+                provider="argos",
+                target_lang="ZH",
+                concurrency=1,
+                max_paragraphs=1,
+                max_chars=1200,
+                outcome_callback=outcome.update,
+                log_progress=False,
+            )
+        self.assertEqual(translated, lines)
+        self.assertEqual(outcome["failed"], 0)
+        self.assertEqual(outcome["provider_results"], 1)
+        self.assertEqual(outcome["target_results"], 1)
+        self.assertEqual(outcome["unchanged_results"], 1)
 
     def test_argos_batch_uses_an_installed_translation_without_network(self):
         class FakeTranslation:

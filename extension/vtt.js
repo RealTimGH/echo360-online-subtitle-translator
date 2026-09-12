@@ -59,7 +59,22 @@
       if (e > maxEnd) maxEnd = e;
       ranges.push([s, e]);
     }
-    return { cueCount, maxEnd, ranges };
+    // Keep the source identity useful for diagnostics as well as ranking. A
+    // clean Echo360 source normally has one text line per cue; a rendered
+    // bilingual/accumulated track has two or more. These counters are
+    // observational only and do not change the line-based translation model.
+    const cues = parseVttCues(vttText);
+    const textLineCounts = cues.map((cue) => String(cue.text || "")
+      .split("\n")
+      .filter((line) => line.trim()).length);
+    return {
+      cueCount,
+      maxEnd,
+      ranges,
+      textLineCount: textLineCounts.reduce((sum, count) => sum + count, 0),
+      multilineCueCount: textLineCounts.filter((count) => count > 1).length,
+      emptyCueCount: textLineCounts.filter((count) => count === 0).length,
+    };
   }
 
   function parseVttBlocks(vttText) {
@@ -169,6 +184,34 @@
 
   function hasCjk(text) {
     return /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/.test(String(text || ""));
+  }
+
+  // A source snapshot must be single-language. A rendered bilingual track is
+  // still valid WebVTT, so syntax validation alone cannot distinguish it from
+  // the original. Detect the high-confidence contamination pattern used by
+  // this extension's own renderer: most cues contain both CJK and non-CJK text
+  // lines. This is deliberately a conservative detector; one multilingual
+  // cue or an ordinary line-wrapped English cue is not enough to reject input.
+  function inspectProbableBilingualVtt(vttText, {
+    minimumCues = 3,
+    minimumRatio = 0.6,
+  } = {}) {
+    const cues = parseVttCues(vttText);
+    const mixedCues = cues.filter((cue) => {
+      const lines = String(cue.text || "").split("\n").map((line) => line.trim()).filter(Boolean);
+      return lines.length >= 2 && lines.some(hasCjk) && lines.some((line) => !hasCjk(line));
+    }).length;
+    const multilineCueCount = cues.filter((cue) =>
+      String(cue.text || "").split("\n").filter((line) => line.trim()).length > 1
+    ).length;
+    const ratio = cues.length > 0 ? mixedCues / cues.length : 0;
+    return {
+      probable: cues.length >= minimumCues && mixedCues >= minimumCues && ratio >= minimumRatio,
+      cueCount: cues.length,
+      mixedCueCount: mixedCues,
+      multilineCueCount,
+      ratio,
+    };
   }
 
   function reorderCueTextZhFirst(text) {
@@ -282,6 +325,7 @@
     parseVttTimestamp,
     parseVttTimingLine,
     parseVttCues,
+    inspectProbableBilingualVtt,
     isAlreadyBilingualVtt,
     normalizeBilingualOrderZhFirst,
     extractPrimaryTranslatedVtt,

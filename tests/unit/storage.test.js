@@ -5,7 +5,7 @@
  *   getContextKey      – /lesson/:id path vs other pathname
  *   buildConfigSignature – all fields contribute to signature
  *   askApiKeyIfNeeded  – keyless provider, provider+key, provider+no key
- *   getConfig          – enableLocalBackend false → force useLocalBackend=false
+ *   getConfig          – provider-owned backend routing and legacy migration
  *   getPrefs           – useNativeSubtitles true/false, size "tiny", unknown size
  *   savePrefs          – bilingual/reverseOrder normalization
  *   getCacheStore      – valid object vs null/non-object
@@ -73,6 +73,7 @@ describe("buildConfigSignature", () => {
     reasoningEffort: "medium",
     deepseekThinkingMode: "disabled",
     deeplFormality: "default",
+    azureRegion: "australiaeast",
   });
 
   it("is deterministic", () => {
@@ -107,6 +108,21 @@ describe("buildConfigSignature", () => {
     const withEmpty   = storage.buildConfigSignature({ ...base(), endpoint: "" });
     const withMissing = storage.buildConfigSignature({ ...base(), endpoint: undefined });
     expect(withEmpty).toBe(withMissing);
+  });
+
+  it("invalidates only Azure caches when the Azure region changes", () => {
+    const azure = { ...base(), provider: "azure", model: "", endpoint: "" };
+    expect(storage.buildConfigSignature({ ...azure, azureRegion: "australiaeast" }))
+      .not.toBe(storage.buildConfigSignature({ ...azure, azureRegion: "eastus" }));
+    expect(storage.buildConfigSignature({ ...base(), azureRegion: "australiaeast" }))
+      .toBe(storage.buildConfigSignature({ ...base(), azureRegion: "eastus" }));
+  });
+
+  it("invalidates a custom-backend cache when its server URL changes", () => {
+    const custom = { ...base(), provider: "custom-backend", model: "", endpoint: "" };
+    const first = storage.buildConfigSignature({ ...custom, customBackendUrl: "https://one.example/api" });
+    const second = storage.buildConfigSignature({ ...custom, customBackendUrl: "https://two.example/api" });
+    expect(first).not.toBe(second);
   });
 
   it("treats missing optional fields without throwing", () => {
@@ -158,7 +174,7 @@ describe("askApiKeyIfNeeded", () => {
 // getConfig (store build — extension-only, no local backend)
 // ---------------------------------------------------------------------------
 describe("getConfig", () => {
-  it("forces useLocalBackend=false on store build even if stored as true", async () => {
+  it("ignores the removed useLocalBackend flag for direct providers", async () => {
     const { storage } = setupStorage({
       storageData: {
         echo360TranslatorConfig: { provider: "deepseek", useLocalBackend: true },
@@ -166,7 +182,8 @@ describe("getConfig", () => {
       enableLocalBackend: false,
     });
     const cfg = await storage.getConfig();
-    expect(cfg.useLocalBackend).toBe(false);
+    expect(cfg.useLocalBackend).toBeUndefined();
+    expect(cfg.backendUrl).toBe("http://127.0.0.1:8765");
   });
 
   it("falls back to Google Web when a store build sees a stale Argos setting", async () => {
@@ -182,11 +199,11 @@ describe("getConfig", () => {
       model: "",
       endpoint: "",
       apiKey: "",
-      useLocalBackend: false,
+      backendUrl: "http://127.0.0.1:8765",
     });
   });
 
-  it("forces the local backend on for Argos in a development build", async () => {
+  it("routes Argos to the fixed packaged endpoint in a development build", async () => {
     const { storage } = setupStorage({
       storageData: {
         echo360TranslatorConfig: { provider: "argos", useLocalBackend: false, apiKey: "stale" },
@@ -194,8 +211,40 @@ describe("getConfig", () => {
       enableLocalBackend: true,
     });
     const cfg = await storage.getConfig();
-    expect(cfg.useLocalBackend).toBe(true);
+    expect(cfg.useLocalBackend).toBeUndefined();
+    expect(cfg.backendUrl).toBe("http://127.0.0.1:8765");
     expect(cfg.apiKey).toBe("");
+  });
+
+  it("uses a configurable URL only for the custom-backend provider", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "custom-backend",
+          customBackendUrl: "https://translator.example/api",
+          useLocalBackend: false,
+        },
+      },
+      enableLocalBackend: true,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.backendUrl).toBe("https://translator.example/api");
+    expect(cfg.useLocalBackend).toBeUndefined();
+  });
+
+  it("migrates a legacy custom provider backendUrl before applying the new default", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "custom-backend",
+          backendUrl: "https://legacy-translator.example/v1",
+        },
+      },
+      enableLocalBackend: true,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.customBackendUrl).toBe("https://legacy-translator.example/v1");
+    expect(cfg.backendUrl).toBe("https://legacy-translator.example/v1");
   });
 
   it("returns default config when nothing is stored", async () => {

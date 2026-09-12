@@ -52,9 +52,10 @@ describe("shared preferences UI", () => {
     expect(Object.isFrozen(DEFAULT_CONFIG)).toBe(true);
     expect(PROVIDER_DEFAULTS.openai.model).toBe("gpt-5-nano");
     expect(createModelPresets().map((item) => item.provider)).toEqual([
-      "google-web", "deepseek", "gemini", "openai", "deepl", "argos",
+      "google-web", "deepseek", "gemini", "openai", "deepl", "azure", "argos", "custom-backend",
     ]);
     expect(createModelPresets({ includeLocalOnly: false }).map((item) => item.provider)).not.toContain("argos");
+    expect(createModelPresets({ includeLocalOnly: false }).map((item) => item.provider)).toContain("custom-backend");
   });
 
   it("uses the shared extension adapter to preserve a specific nested error code", () => {

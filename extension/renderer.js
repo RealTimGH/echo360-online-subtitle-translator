@@ -379,7 +379,11 @@
     // native surface is hidden by the CC toggle, while keeping the same VTT
     // timing and incremental update lifecycle.
     if (customCaptionMode) {
-      const displayBilingual = !!fallbackBilingual;
+      // The preference name is historical: false means the user explicitly
+      // selected native-CC injection. Instructure Media otherwise gets an
+      // independent overlay which coexists with Vidstack's own CC surface.
+      const nativeInjection = !useNativeSubtitles;
+      const displayBilingual = nativeInjection ? true : !!fallbackBilingual;
       if (incremental && ns.playerCaptionRenderer.isMounted()) {
         if (ns.playerCaptionRenderer.update({
           video,
@@ -388,6 +392,7 @@
           size,
           bilingual: displayBilingual,
           reverseOrder: fallbackReverseOrder,
+          nativeInjection,
         })) {
           lastTranslatedTrack = { mode: "instructure-caption" };
           commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
@@ -404,6 +409,7 @@
         size,
         bilingual: displayBilingual,
         reverseOrder: fallbackReverseOrder,
+        nativeInjection,
       });
       if (mounted) {
         lastTranslatedTrack = { mode: "instructure-caption" };

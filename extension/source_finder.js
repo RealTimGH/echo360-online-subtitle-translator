@@ -94,6 +94,22 @@
     }
   }
 
+  // A translated track is an output surface, never a source candidate. The
+  // renderer marks its injected <track> explicitly, but the corresponding
+  // TextTrack object does not expose that data attribute. Keep the label check
+  // as a second signal for tracks that survived a SPA transition or were
+  // created by an older extension build.
+  function isExtensionTranslatedTrack(track) {
+    const element = track?.nodeType === 1 ? track : track?.element;
+    if (element?.hasAttribute?.("data-echo360-translated")) return true;
+    const labels = [
+      track?.label,
+      element?.label,
+      element?.getAttribute?.("label"),
+    ].map((value) => String(value || "").trim());
+    return labels.some((label) => /(?:翻译字幕|translated\s+subtitle)/i.test(label));
+  }
+
   function collectTextTrackObjects(video) {
     const player = getPlayerForVideo(video);
     const lists = [
@@ -108,7 +124,7 @@
     const seen = new Set();
     for (const list of lists) {
       for (const track of asArray(list)) {
-        if (!track || seen.has(track)) continue;
+        if (!track || isExtensionTranslatedTrack(track) || seen.has(track)) continue;
         seen.add(track);
         tracks.push(track);
       }
@@ -136,6 +152,7 @@
       ...asArray(player?.querySelectorAll?.("track")),
     ];
     for (const track of trackEls) {
+      if (isExtensionTranslatedTrack(track)) continue;
       add(track.getAttribute?.("src"));
       add(track.src);
       add(track.getAttribute?.("data-src"));
@@ -167,8 +184,9 @@
   }
 
   function findBestTrackElement(video) {
-    const hasUsableSrc = (track) => !!String(track?.getAttribute?.("src") || "").trim();
-    const tracks = Array.from(video.querySelectorAll("track")).filter(hasUsableSrc);
+    const hasUsableSrc = (track) =>
+      !!String(track?.getAttribute?.("src") || "").trim() && !isExtensionTranslatedTrack(track);
+    const tracks = Array.from(video?.querySelectorAll?.("track") || []).filter(hasUsableSrc);
     if (tracks.length > 0) return tracks[0];
     const textTracks = Array.from(document.querySelectorAll("track")).filter(hasUsableSrc);
     return textTracks[0] || null;
@@ -203,10 +221,10 @@
   function hasNativeCaptionCapability(video) {
     if (!video) return false;
     const nativeTrackEls = Array.from(video.querySelectorAll("track[src]")).filter(
-      (t) => !!String(t.getAttribute("src") || "").trim() && !t.hasAttribute("data-echo360-translated")
+      (t) => !!String(t.getAttribute("src") || "").trim() && !isExtensionTranslatedTrack(t)
     );
     if (nativeTrackEls.length > 0) return true;
-    if (Array.from(video.textTracks || []).some((t) => !(t.label || "").includes("翻译"))) return true;
+    if (collectTextTrackObjects(video).length > 0) return true;
     return !!findCaptionToggleButton(video);
   }
 
@@ -617,6 +635,7 @@
 
   ns.sourceFinder = {
     findBestTrackElement,
+    isExtensionTranslatedTrack,
     hasNativeCaptionCapability,
     exportVttFromTextTracks,
     collectCandidateSubtitleUrls,

@@ -4,14 +4,16 @@ const enableLocalBackend = buildConfig.enableLocalBackend !== false;
 const { DEFAULT_CONFIG: defaultConfig, createModelPresets, createErrorPresenter } =
   globalThis.Echo360PreferencesUi;
 const modelPresets = createModelPresets({ includeLocalOnly: enableLocalBackend });
-const { isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = globalThis.Echo360ConfigKeys;
+const { API_KEYS_STORAGE_KEY, isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = globalThis.Echo360ConfigKeys;
 const providerHints = {
   "google-web": "免费、无需 API Key，适合先试用；质量通常不如 AI/API 模型。",
   deepseek: "需要 DeepSeek API Key，适合更高质量字幕翻译；Thinking 默认关闭。",
   gemini: "需要 Gemini API Key，适合更高质量字幕翻译。",
   openai: "需要 OpenAI API Key，适合更高质量字幕翻译。",
   deepl: "需要 DeepL API Key，适合常规机器翻译。",
-  argos: "本机离线翻译，无需 API Key；使用英语源字幕并需要本地后端和已安装模型。"
+  azure: "需要 Azure Translator F0 订阅密钥；支持简体、繁体和粤语，Region 可在完整设置中填写。",
+  argos: "本机离线翻译，无需 API Key；后端会在开始翻译时自动启动。",
+  "custom-backend": "使用完整设置中配置的兼容后端地址；不会影响其他翻译服务的直连路径。"
 };
 
 const extensionApi = globalThis.Echo360ExtensionApi;
@@ -81,13 +83,19 @@ function refreshProviderUi() {
   const apiKeyEl = document.getElementById("apiKey");
   document.getElementById("providerHint").textContent = providerHints[provider] || "";
   document.getElementById("apiKeyHint").textContent = isKeyless
-    ? provider === "argos"
+    ? provider === "custom-backend"
+      ? "地址和站点权限请在“完整设置”中配置。"
+      : provider === "argos"
       ? "Argos 不需要 API Key；会使用本机后端和已安装的离线模型。"
       : "Google Translate 不需要 API Key；如果翻译质量不理想，请切换到 AI/API 模型。"
     : "API Key 只保存在 Chrome 本地 storage。";
   apiKeyEl.disabled = isKeyless;
   apiKeyEl.placeholder = isKeyless
-    ? provider === "argos" ? "Argos 不需要 API Key" : "Google Translate 不需要 API Key"
+    ? provider === "argos"
+      ? "Argos 不需要 API Key"
+      : provider === "custom-backend"
+        ? "自定义后端不使用 API Key"
+        : "Google Translate 不需要 API Key"
     : "请输入你的 API Key";
   if (isKeyless) {
     apiKeyEl.value = "";
@@ -100,8 +108,9 @@ function refreshProviderUi() {
 
 async function loadConfig() {
   const { [STORAGE_KEY]: value } = await storageGet(STORAGE_KEY);
+  const { [API_KEYS_STORAGE_KEY]: separateKeys } = await storageGet(API_KEYS_STORAGE_KEY);
   const config = { ...defaultConfig, ...(value || {}) };
-  localApiKeys = buildKeyMap(config);
+  localApiKeys = { ...buildKeyMap(config), ...(separateKeys || {}) };
   const selectedPreset = ensurePresetOption(config);
   renderModelOptions(selectedPreset);
   refreshProviderUi();
@@ -112,9 +121,7 @@ async function loadConfig() {
 // providers or closes the popup without clicking "保存".
 async function persistApiKeysOnly() {
   try {
-    const { [STORAGE_KEY]: value } = await storageGet(STORAGE_KEY);
-    const merged = { ...defaultConfig, ...(value || {}), apiKeys: { ...(value?.apiKeys || {}), ...localApiKeys } };
-    await storageSet({ [STORAGE_KEY]: merged });
+    await storageSet({ [API_KEYS_STORAGE_KEY]: { ...localApiKeys } });
   } catch (error) {
     const typed = typedPopupError(error);
     console.error("[echo360-translator][popup] API key persistence failed", globalThis.Echo360Error?.serializeError?.(typed, { phase: "preferences" }) || typed);
@@ -135,8 +142,12 @@ function handleExternalConfigChange(newConfig) {
 }
 
 extensionApi.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes[STORAGE_KEY]) return;
-  handleExternalConfigChange(changes[STORAGE_KEY].newValue);
+  if (area !== "local") return;
+  if (changes[API_KEYS_STORAGE_KEY]?.newValue) {
+    localApiKeys = { ...localApiKeys, ...changes[API_KEYS_STORAGE_KEY].newValue };
+  }
+  if (changes[STORAGE_KEY]) handleExternalConfigChange(changes[STORAGE_KEY].newValue);
+  else if (!isEditingApiKey()) refreshProviderUi();
 });
 
 function openOptionsPage() {
@@ -174,14 +185,18 @@ async function saveConfig() {
       model,
       endpoint,
       ...resolveForSave(mergedKeys, provider),
-      useLocalBackend: enableLocalBackend && (provider === "argos" || !!(value || {}).useLocalBackend),
     };
-    await storageSet({ [STORAGE_KEY]: config });
+    delete config.useLocalBackend;
+    delete config.backendUrl;
+    await storageSet({
+      [STORAGE_KEY]: config,
+      [API_KEYS_STORAGE_KEY]: { ...mergedKeys },
+    });
     if (provider === "argos") {
       status.textContent = "设置已保存，正在启动 Argos 后端…";
       const response = await extensionApi.runtime.sendMessage({
         type: "ensure-argos-backend",
-        backendUrl: config.backendUrl,
+        backendUrl: "http://127.0.0.1:8765",
       });
       if (!response?.ok) {
         throw extensionApi.toError(response, "ARGOS_BACKEND_START_FAILED", "Argos 设置已保存，但后端启动失败");

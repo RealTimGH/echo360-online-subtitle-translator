@@ -12,6 +12,7 @@ Core user-facing behavior:
 - Translates subtitles with the selected provider.
 - Displays translated or bilingual subtitles in the Echo360 or Canvas embedded player.
 - Caches the latest translated subtitle locally for quicker reloads.
+- Downloads one compact full-course `.translate.json` and copies a short prompt for manual AI translation. The JSON keeps only the session, target language, and cue ID-to-text map; the extension validates the returned complete result before loading it.
 
 ## Recommended Short Description
 
@@ -20,12 +21,15 @@ Translate Echo360 lecture subtitles and display them on recorded videos.
 ## Permission Justification
 
 - `storage`: Saves extension settings, optional API key, subtitle display preferences, and local subtitle cache.
+- `clipboardRead`: Lets the user-activated manual AI import action read a returned `.translated.json` or WebVTT from the system clipboard; a separate user-activated file chooser remains available when clipboard import is unavailable.
+- `clipboardWrite`: Lets the manual AI workflow copy the generated prompt to the system clipboard, including after asynchronous subtitle preparation.
 - `https://translate.googleapis.com/*`: Google Translate provider.
 - `https://api.deepseek.com/*`: DeepSeek provider.
 - `https://api.openai.com/*`: OpenAI provider.
 - `https://generativelanguage.googleapis.com/*`: Gemini provider.
 - `https://api-free.deepl.com/*`, `https://api.deepl.com/*`: DeepL provider.
-- `http://localhost:8765/*`, `http://127.0.0.1:8765/*`: Optional connection to the separately installed, loopback-only Argos backend. It is never contacted unless the user enables the local backend option.
+- `https://api.cognitive.microsofttranslator.com/*`, `https://*.cognitiveservices.azure.com/*`: Azure AI Translator provider, including the global endpoint and Azure custom-domain resources.
+- `http://localhost:8765/*`, `http://127.0.0.1:8765/*`: Optional connection to the separately installed, loopback-only Argos backend. It is contacted only when the user selects Argos or Google fallback needs it.
 - Echo360 and Instructure Media host permissions: Required to find subtitle sources, observe lecture-player state, and attach translated subtitle tracks. Canvas access is limited to the content-script match `canvas.sydney.edu.au/courses/*/pages/*`; the broad Canvas host is not present in `host_permissions`.
 - Canvas assessment safety: the Canvas page script is a data-free, isolated proof bridge limited to `/courses/*/pages/*`. Quiz, assignment, New Quizzes, taking, and ambiguous Canvas contexts fail closed before probes, UI, storage reads, or translation requests start.
 

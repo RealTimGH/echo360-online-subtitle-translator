@@ -88,6 +88,7 @@ export function makeFullNs(overrides = {}) {
         gemini: "Gemini",
         openai: "OpenAI",
         deepl: "DeepL",
+        azure: "Azure AI Translator F0",
       },
       TARGET_OPTIONS: ["ZH", "ZH-HK", "YUE", "EN", "JA"],
       TARGET_LABELS: {

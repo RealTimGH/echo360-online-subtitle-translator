@@ -27,6 +27,172 @@ async function openSettings() {
   await Promise.resolve();
 }
 
+describe("manual AI workflow controls", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("starts preparation when AI manual translation is opened and removes the old two-step controls", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    const prepare = vi.fn(async () => {});
+    window.Echo360Translator.ui.ensurePanel({ onManualPrepare: prepare });
+
+    const manualButton = document.getElementById("echo360-translator-manual-btn");
+    manualButton.click();
+    await Promise.resolve();
+
+    const manual = document.getElementById("echo360-manual-translation");
+    expect(manual.hidden).toBe(false);
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(manual.textContent).not.toContain("字幕会在视频载入后预先准备");
+    expect(manual.textContent).not.toContain("准备当前字幕");
+    expect(manual.textContent).not.toContain("一键导出");
+    expect(manual.querySelector("button").textContent).toBe("手动下载 JSON 翻译包");
+    window.Echo360Translator.ui.setManualBusy("正在处理…");
+    expect(() => window.Echo360Translator.ui.setManualMessage("剪贴板不可用", "warning")).not.toThrow();
+  });
+
+  it("shows saved progress and switches the completed workflow to VTT download", () => {
+    setupUi({ enabled: true, size: "medium" });
+    const download = vi.fn();
+    const ui = window.Echo360Translator.ui;
+    ui.ensurePanel({ onManualDownloadVtt: download });
+    ui.setManualReady({ cueCount: 82, targetLabel: "简体中文", progress: { completed: 80, total: 82, part: "2/2", complete: false } });
+    const panel = document.getElementById("echo360-manual-translation");
+    const copy = Array.from(panel.querySelectorAll("button")).find((button) => button.textContent === "复制本批材料");
+    expect(panel.textContent).toContain("已完成 80/82 条");
+    expect(copy.disabled).toBe(false);
+    ui.setManualReady({ cueCount: 82, targetLabel: "简体中文", progress: { completed: 82, total: 82, part: "2/2", complete: true } });
+    expect(copy.disabled).toBe(true);
+    const downloadButton = Array.from(panel.querySelectorAll("button")).find((button) => button.textContent === "下载完整译文 VTT");
+    expect(downloadButton.disabled).toBe(false);
+    downloadButton.click();
+    expect(download).toHaveBeenCalledOnce();
+  });
+
+  it("offers one file export by default and an explicit batch fallback", () => {
+    setupUi({ enabled: true, size: "medium" });
+    const prepare = vi.fn(), toggle = vi.fn();
+    const ui = window.Echo360Translator.ui;
+    ui.ensurePanel({ onManualPrepare: prepare, onManualToggleMode: toggle });
+    ui.setManualReady({ cueCount: 1522, targetLabel: "简体中文", mode: "file", progress: { completed: 0, total: 1522, complete: false } });
+    const panel = document.getElementById("echo360-manual-translation");
+    expect(panel.textContent).toContain("一次交给 AI");
+    const button = (label) => Array.from(panel.querySelectorAll("button")).find((item) => item.textContent === label);
+    button("导出待译材料").click();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(button("复制任务说明").disabled).toBe(false);
+    button("AI 不能处理文件？改用逐批模式").click();
+    expect(toggle).toHaveBeenCalledOnce();
+  });
+
+  it("keeps file import as a separate real-user action when clipboard import is unusable", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    const importResult = vi.fn(async () => false);
+    window.Echo360Translator.ui.ensurePanel({ onManualImport: importResult });
+    window.Echo360Translator.ui.setManualReady({ cueCount: 2, targetLabel: "简体中文" });
+    document.getElementById("echo360-translator-manual-btn").click();
+    const fileClick = vi.spyOn(HTMLInputElement.prototype, "click").mockImplementation(() => {});
+
+    const importButton = document.querySelector("#echo360-manual-translation .echo360-panel-btn--secondary");
+    importButton.click();
+    await Promise.resolve();
+    expect(importResult).toHaveBeenCalledOnce();
+    expect(fileClick).not.toHaveBeenCalled();
+    const fileButton = Array.from(document.querySelectorAll("#echo360-manual-translation button"))
+      .find((button) => button.textContent === "从文件导入");
+    expect(document.activeElement).toBe(fileButton);
+    fileButton.click();
+    expect(fileClick).toHaveBeenCalledOnce();
+    expect(document.querySelector("#echo360-manual-translation").textContent).toContain("从剪贴板导入");
+  });
+
+  it("does not open the file chooser after a successful clipboard import", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    const importResult = vi.fn(async () => true);
+    window.Echo360Translator.ui.ensurePanel({ onManualImport: importResult });
+    window.Echo360Translator.ui.setManualReady({ cueCount: 2, targetLabel: "简体中文" });
+    const fileClick = vi.spyOn(HTMLInputElement.prototype, "click").mockImplementation(() => {});
+
+    document.querySelector("#echo360-manual-translation .echo360-panel-btn--secondary").click();
+    await Promise.resolve();
+    expect(importResult).toHaveBeenCalledOnce();
+    expect(fileClick).not.toHaveBeenCalled();
+  });
+
+  it("uses the split floating control for quick translation, panel disclosure, and AI import", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    const quick = vi.fn(async () => {});
+    const importResult = vi.fn(async () => true);
+    window.Echo360Translator.ui.ensurePanel({ onQuickTranslate: quick, onManualImport: importResult });
+
+    const primary = document.getElementById("echo360-translator-ball");
+    const disclosure = document.getElementById("echo360-translator-ball-panel");
+    const quickImport = document.getElementById("echo360-translator-ball-import");
+    expect(primary.getAttribute("aria-label")).toContain("一键加载翻译字幕");
+    expect(disclosure.querySelector('svg[data-icon="controls"]')).not.toBeNull();
+    expect(quickImport.querySelector('svg[data-icon="import"]')).not.toBeNull();
+    expect(quickImport.querySelector("rect")).not.toBeNull();
+    expect(disclosure.getAttribute("aria-controls")).toBe("echo360-translator-panel");
+    expect(quickImport.disabled).toBe(true);
+
+    primary.click();
+    await Promise.resolve();
+    expect(quick).toHaveBeenCalledOnce();
+    expect(document.getElementById("echo360-translator-panel").classList.contains("echo360-panel-visible")).toBe(false);
+
+    disclosure.click();
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+    expect(document.getElementById("echo360-translator-panel").classList.contains("echo360-panel-visible")).toBe(true);
+    document.getElementById("echo360-translator-collapse-btn").click();
+
+    window.Echo360Translator.ui.setManualReady({ cueCount: 2, targetLabel: "简体中文" });
+    expect(quickImport.disabled).toBe(false);
+    quickImport.click();
+    await Promise.resolve();
+    expect(importResult).toHaveBeenCalledOnce();
+
+    importResult.mockResolvedValueOnce(false);
+    quickImport.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.getElementById("echo360-translator-panel").classList.contains("echo360-panel-visible")).toBe(true);
+    expect(document.activeElement.textContent).toBe("从文件导入");
+  });
+});
+
 function changeCheckbox(id, checked) {
   const input = document.getElementById(id);
   input.checked = checked;
@@ -661,6 +827,7 @@ describe("translation failure actions", () => {
     expect(current.querySelector(".echo360-error-announcement").getAttribute("aria-live")).toBe("polite");
     expect(current.querySelector(".echo360-error-close").getAttribute("aria-label")).toBe("返回当前问题");
     expect(current.querySelector('[data-action="retry"]').hidden).toBe(true);
+    expect(current.querySelector(".echo360-error-details").open).toBe(true);
     expect(history.querySelector(".echo360-error-history-item.is-selected")).not.toBeNull();
 
     current.querySelector(".echo360-error-close").click();

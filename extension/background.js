@@ -1,9 +1,10 @@
-importScripts("build_config.js", "browser_api.js", "error_utils.js", "direct_translator.js");
+importScripts("build_config.js", "browser_api.js", "error_utils.js", "backend_startup.js", "direct_translator.js");
 
 const extensionApi = globalThis.Echo360ExtensionApi;
 const buildConfig = globalThis.Echo360BuildConfig || {};
 const STORAGE_KEY = "echo360TranslatorConfig";
-const KEYLESS_PROVIDERS_BG = new Set(["google-web", "argos"]);
+const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
+const KEYLESS_PROVIDERS_BG = new Set(["google-web", "argos", "custom-backend"]);
 const DIRECT_CACHE_KEY = "echo360DirectTranslateCache";
 const DIRECT_CACHE_SCHEMA = 3;
 const DIRECT_CACHE_MAX_ENTRIES = 10;
@@ -12,7 +13,7 @@ const DIRECT_JOB_TTL_MS = 60 * 60 * 1000;
 const DIRECT_JOB_MAX_COUNT = 100;
 const directJobs = new Map();
 const INSTRUCTURE_MEDIA_HOST_RE = /(^|\.)instructuremedia\.com$/i;
-const SUPPORTED_PROVIDER_CODES_BG = new Set(["google-web", "deepl", "openai", "deepseek", "gemini", "argos"]);
+const SUPPORTED_PROVIDER_CODES_BG = new Set(["google-web", "deepl", "azure", "openai", "deepseek", "gemini", "argos", "custom-backend"]);
 const SUPPORTED_TARGET_CODES_BG = globalThis.Echo360Translator?.errorUtils?.SUPPORTED_TARGET_CODES || new Set([
   "ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE",
   "ES", "IT", "PT", "RU", "AR", "HI",
@@ -20,8 +21,6 @@ const SUPPORTED_TARGET_CODES_BG = globalThis.Echo360Translator?.errorUtils?.SUPP
 
 const DIRECT_LOG_TAG = "[echo360-translator][background]";
 const ARGOS_BACKEND_LAUNCH_URL = "echo360-subtitle-backend://start";
-const ARGOS_BACKEND_START_TIMEOUT_MS = 20000;
-let argosBackendStartPromise = null;
 
 function backgroundLog(level, event, details = {}) {
   const logger = console?.[level] || console?.log;
@@ -146,6 +145,29 @@ function countTranslatableLines(value) {
     return text && !/^WEBVTT\b/i.test(text) && !/^\d+$/.test(text) &&
       !timing.test(text) && !/^(?:NOTE|STYLE|REGION)\b/i.test(text);
   }).length;
+}
+
+function ensureOriginalSource(payload) {
+  const target = String(payload?.target || "ZH").trim().toUpperCase();
+  if (!CJK_TARGET_CODES_BG.has(target)) return;
+  const inspect = globalThis.Echo360DirectTranslator?.inspectProbableBilingualVtt ||
+    globalThis.Echo360Translator?.errorUtils?.inspectProbableBilingualVtt;
+  if (typeof inspect !== "function") return;
+  const sourceStructure = inspect(payload?.vtt_text || "");
+  if (!sourceStructure?.probable) return;
+  throw Object.assign(new Error(
+    `检测到字幕源已经包含成对的中英文/目标语言文字（${sourceStructure.mixedCueCount}/${sourceStructure.cueCount} 个 cue），已阻止重复翻译`
+  ), {
+    code: "SOURCE_ALREADY_TRANSLATED",
+    status: 422,
+    phase: "source",
+    provider: String(payload?.provider || "").trim().toLowerCase(),
+    target,
+    details: {
+      sourceStructure,
+      action: "remove-translated-track-and-resolve-original-source",
+    },
+  });
 }
 
 function hasCjkInEveryTimedCue(value, options = {}) {
@@ -427,11 +449,13 @@ function validateDirectTranslationResult(result, payload) {
     }
     const cjkCoverage = hasCjkInSuccessfulTimedCues(translatedVtt, failedItems, failed, {
       bilingual: payload?.bilingual === true,
+      sourceVtt: payload?.vtt_text || null,
+      target,
     });
     if (cjkCoverage === false || (failed > 0 && failed <= 50 && cjkCoverage === null)) {
       const error = new Error(cjkCoverage === null
         ? "翻译报告了失败字幕，但失败明细没有可用于标记对应字幕文字行的位置"
-        : "翻译统计报告了中文结果，但成功字幕文字行实际不包含可识别的中文字符");
+        : "翻译统计报告了中文结果，但成功字幕文字行实际不包含中文或可合法保留的中性文字");
       error.code = cjkCoverage === null
         ? "TRANSLATION_FAILURE_DETAILS_MISSING"
         : "INCONSISTENT_TRANSLATION_RESULT";
@@ -468,38 +492,12 @@ function isAllowedBackendUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
     const hostname = String(url.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
-    return (url.protocol === "http:" || url.protocol === "https:") &&
-      ["localhost", "127.0.0.1", "::1"].includes(hostname);
+    const local = ["localhost", "127.0.0.1", "::1"].includes(hostname);
+    return !url.username && !url.password && !url.search && !url.hash &&
+      (url.protocol === "https:" || (url.protocol === "http:" && local));
   } catch (_) {
     return false;
   }
-}
-
-function normalizeAutoLaunchBackendUrl(rawUrl) {
-  let url;
-  try {
-    url = new URL(rawUrl || "http://127.0.0.1:8765");
-  } catch (_) {
-    throw Object.assign(new Error("Argos 自动启动收到的 Backend 地址无效"), {
-      code: "BACKEND_URL_INVALID",
-      status: 400,
-    });
-  }
-  const hostname = String(url.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
-  if (url.protocol !== "http:" || !["localhost", "127.0.0.1", "::1"].includes(hostname)) {
-    throw Object.assign(new Error("Argos 自动启动只允许使用本机 HTTP Backend 地址"), {
-      code: "BACKEND_URL_INVALID",
-      status: 400,
-    });
-  }
-  const port = Number(url.port || 80);
-  if (port !== 8765) {
-    throw Object.assign(new Error("Argos 自动启动当前只支持默认端口 8765"), {
-      code: "ARGOS_BACKEND_PORT_UNSUPPORTED",
-      status: 400,
-    });
-  }
-  return `http://${hostname === "::1" ? "[::1]" : hostname}:8765`;
 }
 
 async function argosBackendHealth(backendUrl, timeoutMs = 900) {
@@ -521,55 +519,23 @@ async function argosBackendHealth(backendUrl, timeoutMs = 900) {
   }
 }
 
-async function startAndWaitForArgosBackend(rawBackendUrl) {
-  const backendUrl = normalizeAutoLaunchBackendUrl(rawBackendUrl);
-  if (await argosBackendHealth(backendUrl)) {
-    return { ready: true, launched: false, backendUrl };
-  }
+const argosBackendStartup = globalThis.Echo360BackendStartup.createManager({
+  healthCheck: (backendUrl) => argosBackendHealth(backendUrl, 900),
+  launch: () => extensionApi.tabs.create({
+    url: `${ARGOS_BACKEND_LAUNCH_URL}?port=8765`,
+    // Edge does not let an ordinary extension suppress its external-protocol
+    // confirmation. Keep that security boundary, but make the confirmation
+    // visible instead of stranding it in a background tab.
+    active: true,
+  }),
+  close: (tab) => {
+    const tabId = Number(tab?.id);
+    return Number.isInteger(tabId) ? extensionApi.tabs.remove(tabId) : Promise.resolve();
+  },
+});
 
-  let launchTab = null;
-  try {
-    launchTab = await extensionApi.tabs.create({
-      url: `${ARGOS_BACKEND_LAUNCH_URL}?port=8765`,
-      active: false,
-    });
-  } catch (error) {
-    throw Object.assign(new Error(
-      "无法调用 Argos 后端启动协议；请先安装并至少启动一次 Echo360 Subtitle Backend"
-    ), {
-      code: "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
-      phase: "backend",
-      cause: error,
-    });
-  }
-
-  const startedAt = Date.now();
-  try {
-    while (Date.now() - startedAt < ARGOS_BACKEND_START_TIMEOUT_MS) {
-      if (await argosBackendHealth(backendUrl, 700)) {
-        return { ready: true, launched: true, backendUrl };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
-  } finally {
-    if (Number.isInteger(Number(launchTab?.id))) {
-      await extensionApi.tabs.remove(Number(launchTab.id)).catch(() => {});
-    }
-  }
-  throw Object.assign(new Error(
-    "已请求操作系统启动 Argos 后端，但 20 秒内没有连接成功"
-  ), {
-    code: "ARGOS_BACKEND_START_TIMEOUT",
-    phase: "backend",
-  });
-}
-
-async function ensureArgosBackend(rawBackendUrl) {
-  if (!argosBackendStartPromise) {
-    argosBackendStartPromise = startAndWaitForArgosBackend(rawBackendUrl)
-      .finally(() => { argosBackendStartPromise = null; });
-  }
-  return argosBackendStartPromise;
+function ensureArgosBackend(rawBackendUrl) {
+  return argosBackendStartup.ensure(rawBackendUrl);
 }
 
 async function fetchAllowedTextResource(rawUrl) {
@@ -636,6 +602,9 @@ async function buildDirectCacheKey(payload) {
     reasoning_effort: normalizedString(payload.reasoning_effort),
     deepseek_thinking_mode: normalizedString(payload.deepseek_thinking_mode),
     deepl_formality: normalizedString(payload.deepl_formality),
+    azure_region: normalizedString(payload.provider).toLowerCase() === "azure"
+      ? normalizedString(payload.azure_region)
+      : "",
     fallback_mode: normalizedString(payload.fallback_mode, "immediate").toLowerCase(),
     repair_concurrency: normalizedNumber(payload.repair_concurrency, 1),
     slow_split_threshold: normalizedNumber(payload.slow_split_threshold, 0),
@@ -784,6 +753,7 @@ function normalizeDirectRequestPayload(rawPayload) {
     reasoning_effort: readOptionalString("reasoning_effort", null),
     deepseek_thinking_mode: readOptionalString("deepseek_thinking_mode", "disabled"),
     deepl_formality: readOptionalString("deepl_formality"),
+    azure_region: readOptionalString("azure_region"),
     fallback_mode: fallbackMode,
     max_paragraphs: readNumber("max_paragraphs", 6, { integer: true, min: 0 }),
     max_chars: readNumber("max_chars", 1200, { integer: true, min: 0 }),
@@ -828,7 +798,11 @@ async function getDirectCacheEntry(cacheKey, sourceVtt = "", target = "", biling
   if (!entry.translated_vtt || !validTranslatedVtt(entry.translated_vtt, sourceVtt) ||
     (!bilingual && cachedTextCount !== sourceTextCount) ||
     (bilingual && cachedTextCount < sourceTextCount) ||
-    (targetRequiresCjk && !hasCjkInEveryTimedCue(entry.translated_vtt, { bilingual }))) {
+    (targetRequiresCjk && hasCjkInEveryTimedCue(entry.translated_vtt, {
+      bilingual,
+      sourceVtt,
+      target: targetCode,
+    }) !== true)) {
     throw Object.assign(new Error("本地翻译缓存不是有效的带时间轴 WebVTT，已忽略"), {
       code: "INVALID_TRANSLATION_CACHE",
       phase: "cache",
@@ -875,7 +849,11 @@ async function setDirectCacheEntry(cacheKey, translatedVtt, sourceVtt = "", targ
   if (!translatedVtt || !validTranslatedVtt(translatedVtt, sourceVtt) ||
     ((!bilingual && countTranslatableLines(translatedVtt) !== countTranslatableLines(sourceVtt)) ||
       (bilingual && countTranslatableLines(translatedVtt) < countTranslatableLines(sourceVtt))) ||
-    (targetRequiresCjk && !hasCjkInEveryTimedCue(translatedVtt, { bilingual }))) {
+    (targetRequiresCjk && hasCjkInEveryTimedCue(translatedVtt, {
+      bilingual,
+      sourceVtt,
+      target: targetCode,
+    }) !== true)) {
     return { ok: false, error: Object.assign(new Error("拒绝缓存无效的 translated_vtt"), { code: "INVALID_TRANSLATED_VTT" }) };
   }
   if (translatedVtt.length > DIRECT_CACHE_MAX_CHARS) {
@@ -933,8 +911,13 @@ async function resolveApiKey(provider) {
   if (!normalizedProvider || KEYLESS_PROVIDERS_BG.has(normalizedProvider)) return "";
   let config;
   try {
-    const obj = await extensionApi.storage.local.get(STORAGE_KEY);
-    config = obj[STORAGE_KEY];
+    const [configObj, keysObj] = await Promise.all([
+      extensionApi.storage.local.get(STORAGE_KEY),
+      extensionApi.storage.local.get(API_KEYS_STORAGE_KEY),
+    ]);
+    config = configObj[STORAGE_KEY];
+    const separateKeys = keysObj[API_KEYS_STORAGE_KEY] || {};
+    if (config) config = { ...config, apiKeys: { ...(config.apiKeys || {}), ...separateKeys } };
   } catch (error) {
     throw Object.assign(new Error("读取翻译服务 API Key 失败"), {
       code: "STORAGE_ERROR",
@@ -963,12 +946,18 @@ async function resolveApiKey(provider) {
 
 function createDirectJob(payload) {
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const initialTotal = countTranslatableLines(payload.vtt_text || "");
   const job = {
     jobId,
     provider: payload.provider || "",
     target: payload.target || "ZH",
     status: "queued",
-    progress: { current: 0, total: 0 },
+    progress: {
+      current: 0,
+      total: initialTotal,
+      line: initialTotal > 0 ? "正在准备翻译…" : "",
+      stage: "preparing",
+    },
     partial_vtt: "",
     result: null,
     error: "",
@@ -1008,6 +997,10 @@ function createDirectJob(payload) {
           phase: "source",
         });
       }
+      // Check before cache-key creation/cache lookup. A bilingual result from
+      // an earlier extension version must never become a cache hit or another
+      // provider request.
+      ensureOriginalSource(payload);
       const cacheKey = await buildDirectCacheKey(payload);
       const preTranslationWarnings = [];
       if (!payload.force_refresh) {
@@ -1210,18 +1203,10 @@ function pruneDirectJobs() {
 }
 
 async function proxyBackendRequest(message) {
-  if (buildConfig.enableLocalBackend === false) {
-    return backgroundErrorResponse(
-      Object.assign(new Error("本地后端在当前构建中已禁用"), { code: "BACKEND_DISABLED", status: 503 }),
-      { phase: "backend" },
-      "BACKEND_DISABLED"
-    );
-  }
-
   const { backendUrl } = message;
   if (!backendUrl) {
     return backgroundErrorResponse(
-      Object.assign(new Error("未配置本地后端地址"), { code: "BACKEND_URL_MISSING", status: 400 }),
+      Object.assign(new Error("未配置后端地址"), { code: "BACKEND_URL_MISSING", status: 400 }),
       { phase: "backend" },
       "BACKEND_URL_MISSING"
     );
@@ -1230,7 +1215,7 @@ async function proxyBackendRequest(message) {
   try {
     if (!isAllowedBackendUrl(backendUrl)) {
       return backgroundErrorResponse(
-        Object.assign(new Error("本地后端地址只允许使用 HTTP/HTTPS 的 localhost、127.0.0.1 或 [::1]"), {
+        Object.assign(new Error("后端地址必须是本机 HTTP 地址或远程 HTTPS 地址，且不能包含账号、查询参数或片段"), {
           code: "BACKEND_URL_INVALID",
           status: 400,
         }),
@@ -1378,6 +1363,7 @@ extensionApi.runtime.addOnMessageListener(async (message) => {
       // Normalize and validate the request before cache lookup. A cached VTT
       // must never turn an unsupported provider/target into a false success.
       const payload = normalizeDirectRequestPayload(rawPayload);
+      ensureOriginalSource(payload);
       const api_key = await resolveApiKey(payload.provider);
       const jobId = createDirectJob({ ...payload, api_key });
       return { ok: true, data: { job_id: jobId } };

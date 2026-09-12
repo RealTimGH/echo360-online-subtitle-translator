@@ -18,6 +18,9 @@
       gemini: "Gemini",
       openai: "OpenAI",
       deepl: "DeepL",
+      azure: "Azure AI Translator F0",
+      argos: "Argos Translate（本地）",
+      "custom-backend": "自定义后端",
     },
     TARGET_OPTIONS: ["ZH", "ZH-HK", "YUE", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU", "AR", "HI"],
     TARGET_LABELS: {

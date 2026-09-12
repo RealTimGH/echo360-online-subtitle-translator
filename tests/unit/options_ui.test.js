@@ -17,11 +17,14 @@ async function flushAsyncLoad() {
 }
 
 describe("options page provider and fallback controls", () => {
+  let stored;
+  let permissions;
+
   beforeEach(async () => {
     vi.restoreAllMocks();
     installOptionsDocument();
 
-    const stored = {
+    stored = {
       echo360TranslatorConfig: {
         provider: "deepseek",
         model: "custom-deepseek-model",
@@ -34,6 +37,13 @@ describe("options page provider and fallback controls", () => {
     const changeListeners = [];
     globalThis.Echo360BuildConfig = { enableLocalBackend: true };
     globalThis.Echo360ExtensionApi = {
+      permissions: {
+        contains: vi.fn(async () => false),
+        request: vi.fn(async () => true),
+      },
+      runtime: {
+        sendMessage: vi.fn(async () => ({ ok: true })),
+      },
       storage: {
         local: {
           get: vi.fn(async (key) => ({ [key]: stored[key] })),
@@ -44,6 +54,7 @@ describe("options page provider and fallback controls", () => {
         },
       },
     };
+    permissions = globalThis.Echo360ExtensionApi.permissions;
     globalThis.Echo360Error = {
       normalizeError(error) {
         return {
@@ -81,15 +92,69 @@ describe("options page provider and fallback controls", () => {
     expect(values).toEqual(["immediate", "deferred", "deferred-fastpath"]);
   });
 
-  it("forces the local backend and clears key fields when Argos is selected", () => {
+  it("shows and saves the optional Azure region while keeping Model disabled", async () => {
+    const provider = document.getElementById("provider");
+    provider.value = "azure";
+    provider.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(document.querySelector('[data-provider-advanced="azure"]').hidden).toBe(false);
+    expect(document.getElementById("model").disabled).toBe(true);
+    document.getElementById("apiKey").value = "azure-key";
+    document.getElementById("azureRegion").value = " australiaeast ";
+    document.getElementById("saveBtn").click();
+    await flushAsyncLoad();
+    await flushAsyncLoad();
+
+    expect(stored.echo360TranslatorConfig).toMatchObject({
+      provider: "azure",
+      apiKey: "azure-key",
+      azureRegion: "australiaeast",
+      model: "",
+      endpoint: "",
+    });
+  });
+
+  it("selects Argos without exposing a generic local-backend switch", () => {
     const provider = document.getElementById("provider");
     provider.value = "argos";
     provider.dispatchEvent(new Event("change", { bubbles: true }));
 
-    expect(document.getElementById("useLocalBackend").checked).toBe(true);
-    expect(document.getElementById("useLocalBackend").disabled).toBe(true);
+    expect(document.getElementById("useLocalBackend")).toBeNull();
+    expect(document.getElementById("customBackendSection").hidden).toBe(true);
     expect(document.getElementById("apiKey").disabled).toBe(true);
     expect(document.getElementById("model").value).toBe("");
     expect(document.getElementById("endpoint").value).toBe("");
+  });
+
+  it("shows the backend URL only for the explicit custom-backend provider", () => {
+    const provider = document.getElementById("provider");
+    provider.value = "custom-backend";
+    provider.dispatchEvent(new Event("change", { bubbles: true }));
+
+    expect(document.getElementById("customBackendSection").hidden).toBe(false);
+    expect(document.getElementById("apiKey").hidden).toBe(true);
+    expect(document.getElementById("model").hidden).toBe(true);
+    expect(document.getElementById("endpoint").hidden).toBe(true);
+  });
+
+  it("requests only the configured custom-backend origin and saves provider-owned routing", async () => {
+    const provider = document.getElementById("provider");
+    provider.value = "custom-backend";
+    provider.dispatchEvent(new Event("change", { bubbles: true }));
+    document.getElementById("customBackendUrl").value = "https://translator.example/api/";
+
+    document.getElementById("saveBtn").click();
+    await flushAsyncLoad();
+    await flushAsyncLoad();
+
+    expect(permissions.contains).toHaveBeenCalledWith({ origins: ["https://translator.example/*"] });
+    expect(permissions.request).toHaveBeenCalledWith({ origins: ["https://translator.example/*"] });
+    expect(stored.echo360TranslatorConfig).toMatchObject({
+      provider: "custom-backend",
+      customBackendUrl: "https://translator.example/api",
+      apiKey: "",
+      model: "",
+      endpoint: "",
+    });
   });
 });

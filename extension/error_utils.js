@@ -11,6 +11,7 @@
     gemini: "Gemini",
     openai: "OpenAI",
     deepl: "DeepL",
+    azure: "Azure AI Translator F0",
     argos: "Argos Translate（本地）",
   };
 
@@ -36,6 +37,76 @@
   // boundary.  A label-only map is not enough: an unknown target could
   // otherwise fall through to a successful-looking non-CJK result.
   const SUPPORTED_TARGET_CODES = new Set(Object.keys(TARGET_LABELS));
+  const CJK_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE"]);
+  const CJK_TEXT_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
+  const TARGET_NEUTRAL_CODE_STOPWORDS = new Set([
+    "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
+    "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
+    "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
+  ]);
+
+  // Some captions are valid target-language output even when they contain no
+  // CJK character: a number, URL, file/code token, a grade/label, or text
+  // already written in the target script.  This is intentionally a narrow
+  // exception. An ordinary English word or sentence that a provider returns
+  // unchanged must still be reported as NO_TARGET_TRANSLATION.
+  let LETTER_RE;
+  try {
+    // Construct this at runtime so an older embedded WebView can fall back
+    // without failing to parse the whole extension bundle.
+    LETTER_RE = new RegExp("\\p{L}", "u");
+  } catch (_) {
+    LETTER_RE = /[A-Za-z]/;
+  }
+
+  function captionPlainText(value) {
+    return String(value ?? "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function comparableCaption(value) {
+    const text = captionPlainText(value);
+    try {
+      return text.normalize("NFKC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+    } catch (_) {
+      return text.toLowerCase().replace(/\s+/g, " ").trim();
+    }
+  }
+
+  function isTargetNeutralText(sourceValue, translatedValue, target = "ZH") {
+    const targetCode = String(target || "ZH").trim().toUpperCase();
+    if (!CJK_TARGET_CODES.has(targetCode)) return false;
+    const source = captionPlainText(sourceValue);
+    const translated = captionPlainText(translatedValue);
+    if (!source || !translated || comparableCaption(source) !== comparableCaption(translated)) return false;
+    if (CJK_TEXT_RE.test(source)) return true;
+
+    // Pure numbers, punctuation and symbols have no linguistic target to
+    // translate. This also covers timestamps and short numeric labels.
+    if (!LETTER_RE.test(source)) return true;
+
+    if (/^(?:(?:https?|ftp):\/\/|www\.)\S+$/i.test(source) ||
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(source)) {
+      return true;
+    }
+
+    // Uppercase abbreviations, course codes, file names and software tokens
+    // are routinely kept verbatim by subtitle translators. Exclude common
+    // English words so an unchanged "NO"/"OK" is not silently accepted.
+    if (/^[A-Z0-9][A-Z0-9._:/+#&()'’-]*$/.test(source)) {
+      const upper = source.toUpperCase();
+      const hasDigit = /\d/.test(source);
+      const allUpper = source === upper;
+      if ((hasDigit || (allUpper && source.length <= 32)) &&
+        !TARGET_NEUTRAL_CODE_STOPWORDS.has(upper.replace(/[.)]+$/, ""))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
 
   const PHASE_LABELS = {
     prepare: "准备翻译",
@@ -214,14 +285,34 @@
     return entries;
   }
 
+  function targetCompatibleText(outputText, sourceText, options = {}) {
+    if (CJK_TEXT_RE.test(String(outputText || ""))) return true;
+    return sourceText != null && isTargetNeutralText(sourceText, outputText, options.target || "ZH");
+  }
+
+  function targetCompatibleBilingualBlock(outputBlock, sourceBlock, options = {}) {
+    if (CJK_TEXT_RE.test(String(outputBlock || ""))) return true;
+    if (sourceBlock == null) return false;
+    const sourceLines = String(sourceBlock || "").split("\n").map((line) => line.trim()).filter(Boolean);
+    const outputLines = String(outputBlock || "").split("\n").map((line) => line.trim()).filter(Boolean);
+    return sourceLines.length > 0 && outputLines.length > 0 &&
+      outputLines.every((outputLine) => sourceLines.some((sourceLine) =>
+        isTargetNeutralText(sourceLine, outputLine, options.target || "ZH")
+      ));
+  }
+
   function hasCjkInEveryTimedCue(vtt, options = {}) {
     const entries = timedCueTextEntries(vtt);
     if (entries.length === 0) return false;
+    const sourceEntries = options?.sourceVtt == null ? [] : timedCueTextEntries(options.sourceVtt);
     if (options?.bilingual === true) {
       const blocks = timedCueTextBlocks(vtt);
-      return blocks.length > 0 && blocks.every((block) => /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(block));
+      const sourceBlocks = options?.sourceVtt == null ? [] : timedCueTextBlocks(options.sourceVtt);
+      return blocks.length > 0 && blocks.every((block, index) =>
+        targetCompatibleBilingualBlock(block, sourceBlocks[index], options)
+      );
     }
-    return entries.every((entry) => /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(entry.text));
+    return entries.every((entry, index) => targetCompatibleText(entry.text, sourceEntries[index]?.text, options));
   }
 
   function hasCjkInSuccessfulTimedCues(vtt, failedItems = [], expectedFailedCount = null, options = {}) {
@@ -243,6 +334,7 @@
     // that explicit format.
     if (options?.bilingual === true) {
       const blocks = timedCueTextBlocks(vtt);
+      const sourceBlocks = options?.sourceVtt == null ? [] : timedCueTextBlocks(options.sourceVtt);
       const failedCues = new Set();
       for (const item of failures) {
         const cue = positiveInteger(item?.cue, null);
@@ -250,11 +342,12 @@
         failedCues.add(cue);
       }
       return blocks.every((block, index) => failedCues.has(index + 1) ||
-        /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(block));
+        targetCompatibleBilingualBlock(block, sourceBlocks[index], options));
     }
 
     const failedLines = new Set();
     const entriesByLine = new Map(entries.map((entry) => [entry.line, entry]));
+    const sourceEntries = options?.sourceVtt == null ? [] : timedCueTextEntries(options.sourceVtt);
     for (const item of failures) {
       const cue = positiveInteger(item?.cue, null);
       const line = positiveInteger(item?.line, null);
@@ -274,8 +367,8 @@
       if (cueEntries.length !== 1) return null;
       failedLines.add(cueEntries[0].line);
     }
-    return entries.every((entry) => failedLines.has(entry.line) ||
-      /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(entry.text));
+    return entries.every((entry, index) => failedLines.has(entry.line) ||
+      targetCompatibleText(entry.text, sourceEntries[index]?.text, options));
   }
 
   // A failed_items entry is also a rendering contract: the UI must be able
@@ -841,6 +934,10 @@
     "INVALID_REASONING_EFFORT",
     "PROVIDER_CONFIG_ERROR",
     "PROVIDER_API_KEY_MISSING",
+    "SOURCE_ALREADY_TRANSLATED",
+    "MANUAL_SESSION_SOURCE_INVALID",
+    "MANUAL_IMPORT_EMPTY",
+    "MANUAL_IMPORT_CUE_TEXT_LINE_COUNT_MISMATCH",
     "ARGOS_DEPENDENCY_MISSING",
     "ARGOS_MODEL_MISSING",
     "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
@@ -960,6 +1057,16 @@
       title = "没有找到可用字幕源";
       summary = "页面没有提供可解析的 WebVTT/SRT 字幕，翻译尚未开始。";
       recommendation = "确认视频已经加载，并打开页面的 Captions/Transcript；如果字幕可见但仍失败，请保留诊断详情。";
+    } else if (code === "SOURCE_ALREADY_TRANSLATED") {
+      title = "检测到译文被当作原文";
+      summary = message && message !== "Unknown translation error"
+        ? message
+        : "当前字幕源多数 cue 同时包含目标语言和原文，扩展已阻止重复翻译。";
+      recommendation = "已阻止本次请求，避免字幕条数和文件大小继续累加；刷新视频或关闭旧的翻译轨道后，再从原始单语字幕重新开始。";
+    } else if (code === "MANUAL_SESSION_SOURCE_INVALID") {
+      title = "手动翻译原字幕校验失败";
+      summary = message || "当前课程的原字幕快照已经不是有效 WebVTT。";
+      recommendation = "重新打开视频并点击“AI 手动翻译”，重新生成 JSON 翻译包和提示词。";
     } else if (code === "SUBTITLE_ACCESS_DENIED") {
       title = "字幕文件访问被拒绝";
       summary = "播放器记录到了字幕地址，但字幕服务器返回 HTTP 401/403，扩展没有权限读取。";
@@ -1010,6 +1117,10 @@
         title = "Google 网页翻译访问被拒绝";
         summary = `Google 网页端点返回 HTTP ${httpStatus}，请求没有被接受；这不是 API Key 问题。`;
         recommendation = "检查网络和扩展站点权限，等待后降低并发/RPS，或切换到需要 API Key 的 Provider。";
+      } else if (String(context.provider || "").toLowerCase() === "azure") {
+        title = "Azure Translator 认证失败";
+        summary = `Azure Translator 返回 HTTP ${httpStatus}，订阅密钥、资源区域或资源权限不匹配。`;
+        recommendation = "检查 Azure 订阅密钥；如果使用多服务或区域型资源，还要在高级设置填写 Azure 门户显示的 Region/Location。";
       } else {
         title = "翻译服务认证失败";
         summary = `上游服务返回 HTTP ${httpStatus}，API Key 无效、过期或没有权限。`;
@@ -1207,6 +1318,14 @@
         ? "翻译进程结束了，但没有生成结果文件。"
         : "翻译进程生成了文件，但文件没有有效的带时间轴字幕。";
       recommendation = "结果不会写入缓存；检查脚本错误输出后重试。";
+    } else if (code === "MANUAL_IMPORT_EMPTY") {
+      title = "没有导入字幕内容";
+      summary = "剪贴板或文件内容为空，无法校验翻译结果。";
+      recommendation = "重新复制完整的 WebVTT，或选择包含字幕内容的 .vtt 文件。";
+    } else if (code === "MANUAL_IMPORT_CUE_TEXT_LINE_COUNT_MISMATCH") {
+      title = "译文包含重复或缺失字幕行";
+      summary = message || "某个 cue 的字幕行数与原文不一致，译文可能被重复追加。";
+      recommendation = "每个 cue 只保留与原文相同数量的字幕行；不要把原文和译文同时粘回单语译文文件。";
     } else if (code === "TRANSLATION_CANCELLED") {
       title = "翻译已取消";
       summary = "翻译进程被取消，未将不完整结果宣布为成功。";
@@ -1408,6 +1527,12 @@
       ].filter(Boolean).join("；");
       if (sourceValue) details.push({ label: "字幕源", value: sourceValue });
       if (source.sourceId) details.push({ label: "字幕源地址", value: source.sourceId });
+      if (stats.textLineCount != null) {
+        details.push({
+          label: "字幕结构",
+          value: `${formatNumber(stats.cueCount)} 个 cue，${formatNumber(stats.textLineCount)} 行字幕文字；多行 cue ${formatNumber(stats.multilineCueCount || 0)} 个`,
+        });
+      }
     }
     if (model.candidateCount != null || model.sourceStrategy) {
       details.push({
@@ -1648,6 +1773,7 @@
     formatDebugLog,
     isTranslatableVttLine,
     countTranslatableLines,
+    isTargetNeutralText,
     hasCjkInEveryTimedCue,
     hasCjkInSuccessfulTimedCues,
     timedCueTextEntries,

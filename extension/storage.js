@@ -9,7 +9,9 @@
     SIZE_MAP,
   } = ns.constants;
   const extensionApi = ns.browserApi;
-  const KEYLESS_PROVIDERS = new Set(["google-web", "argos"]);
+  const KEYLESS_PROVIDERS = new Set(["google-web", "argos", "custom-backend"]);
+  const DEFAULT_ARGOS_BACKEND_URL = "http://127.0.0.1:8765";
+  const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
   // Schema history:
   //   v2 – defaulted to Echo360 native CC injection (useNativeSubtitles=false).
   //   v3 – native CC injection demoted to an opt-in Beta; default is the
@@ -160,17 +162,23 @@
       cfg.reasoningEffort || "",
       cfg.deepseekThinkingMode || "",
       cfg.deeplFormality || "",
+      cfg.provider === "azure" ? (cfg.azureRegion || "") : "",
+      cfg.provider === "custom-backend" ? (cfg.customBackendUrl || cfg.backendUrl || "") : "",
     ]);
   }
 
   async function getConfig() {
-    const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
-    const config = value || {
+    const [configObj, keysObj] = await Promise.all([
+      extensionApi.storage.local.get(STORAGE_KEY),
+      extensionApi.storage.local.get(API_KEYS_STORAGE_KEY),
+    ]);
+    const value = configObj[STORAGE_KEY];
+    const separateKeys = keysObj[API_KEYS_STORAGE_KEY] || {};
+    const defaults = {
       apiKey: "",
       apiKeys: {},
       appearance: "auto",
-      useLocalBackend: false,
-      backendUrl: "http://127.0.0.1:8765",
+      customBackendUrl: DEFAULT_ARGOS_BACKEND_URL,
       provider: "google-web",
       model: "",
       endpoint: "",
@@ -187,9 +195,12 @@
       slowSplitThreshold: 0,
       deepseekThinkingMode: "disabled",
       deeplFormality: "",
+      azureRegion: "",
     };
+    const config = { ...defaults, ...(value || {}) };
     // Resolve the effective API key for the current provider from the per-provider
     // map, falling back to the legacy single apiKey field for migration.
+    config.apiKeys = { ...(config.apiKeys || {}), ...separateKeys };
     const provider = config.provider || "google-web";
     const effectiveApiKey = KEYLESS_PROVIDERS.has(provider)
       ? ""
@@ -228,22 +239,31 @@
       }
     }
     if (!isLocalBackendEnabled() && provider === "argos") {
-      return {
+      const fallback = {
         ...resolved,
         provider: "google-web",
         model: "",
         endpoint: "",
         apiKey: "",
-        useLocalBackend: false,
+        backendUrl: DEFAULT_ARGOS_BACKEND_URL,
       };
+      delete fallback.useLocalBackend;
+      return fallback;
     }
-    if (!isLocalBackendEnabled()) {
-      return { ...resolved, useLocalBackend: false };
-    }
-    if (provider === "argos") {
-      return { ...resolved, useLocalBackend: true };
-    }
-    return resolved;
+    const migratedCustomUrl = String(
+      value?.customBackendUrl ||
+      (provider === "custom-backend" ? value?.backendUrl : "") ||
+      DEFAULT_ARGOS_BACKEND_URL
+    ).trim();
+    const routed = {
+      ...resolved,
+      customBackendUrl: migratedCustomUrl,
+      // Routing is provider-owned. Argos always uses the packaged endpoint;
+      // only the explicit custom-backend provider uses a configurable URL.
+      backendUrl: provider === "custom-backend" ? migratedCustomUrl : DEFAULT_ARGOS_BACKEND_URL,
+    };
+    delete routed.useLocalBackend;
+    return routed;
   }
 
   async function saveConfig(config) {

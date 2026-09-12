@@ -797,8 +797,16 @@
     }
     const cjkCoverage = targetRequiresCjk
       ? (isCacheResult
-        ? hasCjkInEveryTimedCue(vtt, { bilingual: options.bilingual === true })
-        : hasCjkInSuccessfulTimedCues(vtt, failedItems, failed, { bilingual: options.bilingual === true }))
+        ? hasCjkInEveryTimedCue(vtt, {
+          bilingual: options.bilingual === true,
+          sourceVtt: hasSourceVtt ? options.sourceVtt : null,
+          target: targetCode,
+        })
+        : hasCjkInSuccessfulTimedCues(vtt, failedItems, failed, {
+          bilingual: options.bilingual === true,
+          sourceVtt: hasSourceVtt ? options.sourceVtt : null,
+          target: targetCode,
+        }))
       : true;
     if (targetRequiresCjk && (
       cjkCoverage === false ||
@@ -806,10 +814,10 @@
     )) {
       throw makeClientError(
         isCacheResult
-          ? "本地翻译缓存并非每个字幕文字行都包含可识别的中文字符，已忽略缓存"
+          ? "本地翻译缓存并非每个字幕文字行都包含中文或可合法保留的中性文字，已忽略缓存"
           : cjkCoverage === null
             ? "翻译报告了失败字幕，但失败明细没有可用于标记对应字幕文字行的位置"
-            : "翻译统计报告了中文结果，但成功字幕文字行实际不包含可识别的中文字符",
+            : "翻译统计报告了中文结果，但成功字幕文字行实际不包含中文或可合法保留的中性文字",
         isCacheResult
           ? "INVALID_TRANSLATION_CACHE"
           : cjkCoverage === null

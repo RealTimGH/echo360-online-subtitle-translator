@@ -277,6 +277,41 @@ describe("canonicalizeSourceId", () => {
   });
 });
 
+describe("source track selection", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+    document.body.innerHTML = "";
+  });
+
+  it("never selects the extension's generated translated track as the source", () => {
+    const video = document.createElement("video");
+    const translated = document.createElement("track");
+    translated.src = "blob:echo360-generated";
+    translated.label = "翻译字幕 (双语)";
+    translated.setAttribute("data-echo360-translated", "1");
+    const original = document.createElement("track");
+    original.src = "https://media.example/original.vtt";
+    video.append(translated, original);
+    document.body.appendChild(video);
+
+    expect(sourceFinder.findBestTrackElement(video)).toBe(original);
+    expect(sourceFinder.isExtensionTranslatedTrack(translated)).toBe(true);
+    expect(sourceFinder.isExtensionTranslatedTrack(original)).toBe(false);
+  });
+
+  it("removes translated TextTrack objects before exporting cues or evaluating native capability", () => {
+    const translated = { label: "翻译字幕", mode: "showing", cues: [{ startTime: 0, endTime: 1, text: "译文" }] };
+    const original = { label: "English (CC)", mode: "disabled", cues: [{ startTime: 0, endTime: 1, text: "Original" }] };
+    const video = {
+      querySelectorAll: () => [],
+      textTracks: [translated, original],
+    };
+
+    expect(sourceFinder.collectTextTrackObjects(video)).toEqual([original]);
+    expect(sourceFinder.hasNativeCaptionCapability(video)).toBe(true);
+  });
+});
+
 describe("hasNativeCaptionCapability", () => {
   beforeEach(() => {
     sourceFinder = setup();

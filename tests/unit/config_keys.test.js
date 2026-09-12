@@ -12,6 +12,7 @@ describe("config_keys (shared per-provider API key logic)", () => {
     expect(api.isKeylessProvider("google-web")).toBe(true);
     expect(api.isKeylessProvider("argos")).toBe(true);
     expect(api.isKeylessProvider("deepseek")).toBe(false);
+    expect(api.isKeylessProvider("azure")).toBe(false);
     expect(api.isKeylessProvider("")).toBe(false);
   });
 

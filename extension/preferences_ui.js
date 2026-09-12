@@ -6,8 +6,7 @@
 
   const DEFAULT_CONFIG = Object.freeze({
     apiKey: "",
-    useLocalBackend: false,
-    backendUrl: "http://127.0.0.1:8765",
+    customBackendUrl: "http://127.0.0.1:8765",
     provider: "google-web",
     model: "",
     endpoint: "",
@@ -24,6 +23,7 @@
     slowSplitThreshold: 0,
     deepseekThinkingMode: "disabled",
     deeplFormality: "",
+    azureRegion: "",
   });
 
   const PROVIDER_DEFAULTS = Object.freeze({
@@ -32,7 +32,9 @@
     deepseek: Object.freeze({ model: "deepseek-v4-flash", endpoint: "" }),
     gemini: Object.freeze({ model: "gemini-3.1-flash-lite", endpoint: "" }),
     deepl: Object.freeze({ model: "", endpoint: "" }),
+    azure: Object.freeze({ model: "", endpoint: "" }),
     argos: Object.freeze({ model: "", endpoint: "" }),
+    "custom-backend": Object.freeze({ model: "", endpoint: "" }),
   });
 
   const PROVIDER_LABELS = Object.freeze({
@@ -41,12 +43,15 @@
     gemini: "Gemini",
     openai: "OpenAI",
     deepl: "DeepL",
+    azure: "Azure AI Translator F0",
     argos: "Argos Translate（本地）",
+    "custom-backend": "自定义后端",
   });
 
   function createModelPresets({ includeLocalOnly = true } = {}) {
-    const providers = ["google-web", "deepseek", "gemini", "openai", "deepl"];
+    const providers = ["google-web", "deepseek", "gemini", "openai", "deepl", "azure"];
     if (includeLocalOnly) providers.push("argos");
+    providers.push("custom-backend");
     return providers.map((provider) => {
       const defaults = PROVIDER_DEFAULTS[provider];
       return {

@@ -13,11 +13,209 @@ afterEach(() => {
 });
 
 describe("direct translator provider safeguards", () => {
+  it("rejects the extension's bilingual output before any provider request", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const bilingualVtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+First line
+第一行
+
+00:00:01.000 --> 00:00:02.000
+Second line
+第二行
+
+00:00:02.000 --> 00:00:03.000
+Third line
+第三行
+`;
+
+    try {
+      await expect(translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        concurrency: 1,
+        retries: 0,
+        timeout: 5,
+        vtt_text: bilingualVtt,
+      })).rejects.toMatchObject({
+        code: "SOURCE_ALREADY_TRANSLATED",
+        status: 422,
+        phase: "source",
+        details: {
+          sourceStructure: expect.objectContaining({
+            probable: true,
+            cueCount: 3,
+            mixedCueCount: 3,
+            textLineCount: 6,
+          }),
+        },
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("uses the configured bounded Google web cadence", () => {
     const adapter = translator.getProviderAdapter("google-web");
 
     expect(adapter.concurrencyCap).toBe(48);
     expect(adapter.defaultRps).toBe(0);
+  });
+
+  it("batches Azure Translator inputs with the official v3 target and optional region headers", async () => {
+    const adapter = translator.getProviderAdapter("azure");
+    expect(adapter).toMatchObject({
+      protocol: "azure-translator",
+      defaultEndpoint: "https://api.cognitive.microsofttranslator.com/translate",
+      concurrencyCap: 8,
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response(JSON.stringify([
+        { detectedLanguage: { language: "en", score: 1 }, translations: [{ text: "第一條", to: "zh-Hant" }] },
+        { detectedLanguage: { language: "en", score: 1 }, translations: [{ text: "第二條", to: "zh-Hant" }] },
+      ]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ));
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        azure_region: "australiaeast",
+        target: "ZH-HK",
+        concurrency: 96,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 6,
+        max_chars: 1200,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfirst\n\n00:00:01.000 --> 00:00:02.000\nsecond\n",
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [rawUrl, init] = fetchMock.mock.calls[0];
+      const requestUrl = new URL(rawUrl);
+      expect(requestUrl.origin + requestUrl.pathname).toBe("https://api.cognitive.microsofttranslator.com/translate");
+      expect(requestUrl.searchParams.get("api-version")).toBe("3.0");
+      expect(requestUrl.searchParams.getAll("to")).toEqual(["zh-Hant"]);
+      expect(init).toMatchObject({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Ocp-Apim-Subscription-Key": "azure-test-key",
+          "Ocp-Apim-Subscription-Region": "australiaeast",
+          "Content-Type": "application/json; charset=UTF-8",
+        }),
+      });
+      expect(JSON.parse(init.body)).toEqual([{ Text: "first" }, { Text: "second" }]);
+      expect(result.translated_vtt).toContain("第一條");
+      expect(result.translated_vtt).toContain("第二條");
+      expect(result.failed_items).toEqual([]);
+      expect(result.metrics).toMatchObject({
+        provider: "azure",
+        total: 2,
+        batches: 1,
+        effectiveConcurrency: 1,
+        translated: 2,
+        providerResults: 2,
+        targetResults: 2,
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("maps Cantonese to Azure yue and omits the region header for a global resource", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response(JSON.stringify([
+        { translations: [{ text: "呢個係字幕。", to: "yue" }] },
+      ]), { status: 200, headers: { "content-type": "application/json" } })
+    ));
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "YUE",
+        concurrency: 1,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 6,
+        max_chars: 1200,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nThis is a subtitle.\n",
+      });
+
+      const [rawUrl, init] = fetchMock.mock.calls[0];
+      expect(new URL(rawUrl).searchParams.get("to")).toBe("yue");
+      expect(init.headers).not.toHaveProperty("Ocp-Apim-Subscription-Region");
+      expect(result.translated_vtt).toContain("呢個係字幕。");
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("keeps Azure batches within the conservative v3 item limit even with oversized dev settings", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      return new Response(JSON.stringify(body.map((item, index) => ({
+        translations: [{ text: `译文${index + 1}`, to: "zh-Hans" }],
+      }))), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const cues = Array.from({ length: 26 }, (_, index) => (
+      `\n00:00:${String(index).padStart(2, "0")}.000 --> 00:00:${String(index + 1).padStart(2, "0")}.000\nline ${index + 1}\n`
+    )).join("");
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "ZH",
+        concurrency: 96,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 1000,
+        max_chars: 50000,
+        vtt_text: `WEBVTT\n${cues}`,
+      });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body).length).sort((a, b) => a - b))
+        .toEqual([1, 25]);
+      expect(result.metrics).toMatchObject({ total: 26, batches: 2, effectiveConcurrency: 2, translated: 26 });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("rejects a malformed Azure response instead of caching a partial success", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response(JSON.stringify([{ translations: [] }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ));
+
+    try {
+      await expect(translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "ZH",
+        concurrency: 1,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 6,
+        max_chars: 1200,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nmalformed\n",
+      })).rejects.toMatchObject({
+        code: "INVALID_PROVIDER_OUTPUT",
+        provider: "azure",
+        metrics: expect.objectContaining({ translated: 0, providerResults: 0 }),
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 
   it("keeps failed Google cues, reports partial progress, and never recursively storms after 429", async () => {
@@ -353,6 +551,43 @@ describe("direct translator provider safeguards", () => {
           targetResults: 0,
           unchangedResults: 1,
         }),
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("accepts an unchanged grade/code caption as a valid neutral Chinese-target item", async () => {
+    expect(translator.isTargetNeutralText("F.", "F.", "ZH")).toBe(true);
+    expect(translator.isTargetNeutralText("unchanged", "unchanged", "ZH")).toBe(false);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response(JSON.stringify([[ ["F.", "F."] ]]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ));
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        concurrency: 1,
+        rps: 0,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 1,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nF.\n",
+      });
+
+      expect(result.failed_items).toEqual([]);
+      expect(result.metrics).toMatchObject({
+        total: 1,
+        processed: 1,
+        translated: 1,
+        failed: 0,
+        providerResults: 1,
+        targetResults: 1,
+        unchangedResults: 1,
       });
     } finally {
       fetchMock.mockRestore();

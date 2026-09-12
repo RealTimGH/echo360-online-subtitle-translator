@@ -2,19 +2,19 @@
 
 **简体中文** | [English](README.en.md)
 
-用于 Echo360 录播课和 Canvas 内嵌 Instructure Media 视频的 Chrome/Safari 扩展，用来加载并显示翻译字幕；本地 FastAPI 后端保留为开发调试、fallback 和批处理路径。
+用于 Echo360 录播课和 Canvas 内嵌 Instructure Media 视频的 Chrome/Safari 扩展，用来加载并显示翻译字幕。在线服务由扩展直接请求；只有 Argos 与显式选择的“自定义后端”会走后端协议。
 
-当前扩展版本：**1.5.1**
+当前扩展版本：**1.6.0**
 
 ## 功能概览
 
 1. 在当前 Echo360 录播课页面或 Canvas 内嵌视频中寻找 VTT 字幕源（播放器 CC、网络抓取、`transcript-file` API 等）。
-2. 默认通过扩展前端直连翻译服务（`direct_translator.js`）；dev 构建也可以发送到本地后端。
-3. 如果启用本地后端，后端会调用仓库内的 VTT 翻译脚本作为 fallback/批处理工具：
-  `translator/translate_vtt_zh_deepl_native.py`
+2. Google、DeepSeek、Gemini、OpenAI、DeepL、Azure AI Translator 由扩展直接请求（`direct_translator.js`）；Argos 自动使用固定的本机后端；“自定义后端”只在用户明确选择该服务时使用其 URL。
+3. Argos 后端调用仓库内的 VTT 翻译脚本作为离线/fallback 工具：`translator/translate_vtt_zh_deepl_native.py`。设置里不再有容易产生矛盾状态的通用“使用本地后端”开关。
 4. 扩展将翻译后的 VTT 显示在当前 Echo360 视频上；**默认使用浏览器 `<track>` 字幕轨**。设置中可勾选 **使用原生 CC 注入（Beta）** 尝试注入 Echo360 原生 CC（倍速下仍可能漏译；本课程没有原生字幕位时会自动回退）。
 5. **边翻译边显示**（1.3.0）：点击翻译后立即挂载字幕，未完成的 cue 显示 `正在翻译中...`，随批次完成逐步替换为译文。
 6. **按 provider 分别保存 API Key**；popup 与 options 页实时同步，切换 provider 时自动带出对应 Key。
+7. **AI 手动翻译往返**：点击 `AI 手动翻译` 即下载一个包含全课 cue 的精简 `.translate.json` 并复制简短提示词；支持文件的 AI 可一次翻译后返回完整 `.translated.json`。扩展通过会话绑定校验课程 SHA-256 与目标语言，再检查完整 ID 集合、WebVTT 标签、代码、URL、路径、邮箱和数字，最后以原始 VTT 为不可变骨架在本地重建播放字幕。
 
 
 
@@ -31,7 +31,7 @@
 
 ## 翻译与显示流程
 
-**直连翻译路径**（store 构建默认、dev 未开本地后端时）：
+**直连翻译路径**（Google、DeepSeek、Gemini、OpenAI、DeepL、Azure AI Translator）：
 
 1. 点击 `加载翻译字幕` → 若可挂载，立刻显示字幕（未完成 cue 为 `正在翻译中...`）。
 2. 翻译进行中 → 每批 partial VTT 热更新已译 cue；状态栏显示 `翻译中 X/Y（已开始显示）`。
@@ -42,6 +42,18 @@
 - 增量预览目前仅支持扩展内直连翻译（`direct_translator.js` → background job）；本地 FastAPI 后端路径仍等整份 VTT 返回后再显示。
 - 命中本地翻译缓存时直接显示完整字幕，不会走增量流程。
 
+### AI 手动翻译
+
+在页面控制面板中展开 `AI 手动翻译`：
+
+1. 点击 `AI 手动翻译` 后，默认下载一份包含全课 cue 的精简 `.translate.json`，同时复制简短提示词。JSON 只把字幕 ID 映射到待翻译文本，不包含时间码、重复上下文、分片清单或客户端校验元数据。
+2. 把 JSON 和复制的提示词一次交给能处理文件的 AI。提示词只包含任务规则和条数，不重复嵌入字幕正文；它要求 AI 翻译全部字幕并返回一个完整 `.translated.json`，不需要用户手动拆分、合并或复制多批内容。
+3. AI 如果一次无法处理整份文件，点击 `AI 不能一次处理整份文件？改用逐批模式`。此时扩展复制当前小批（最多 80 条 / 4000 个源字符），每次导入后自动保存进度并准备下一批；修复时只会再次发送缺漏或可疑条目。
+4. AI 必须直接理解句子并翻译，禁止用词典、正则替换或删除停用词脚本生成译文；无需翻译的字段、ID、数字、代码、URL、路径、邮箱和已有 WebVTT 标签保持不变。说话人/样式外壳由扩展在本地恢复，返回 `.translated.json` 或 JSON 文本后，从剪贴板或文件导入即可。
+5. 扩展按会话、请求 ID、完整 cue ID 集合、WebVTT 标签结构、代码/URL/路径/邮箱字面值、数字和部分明显语言缺陷校验结果；合格条目会保留，问题条目会生成下一份补译任务。完整文件若只有孤立、可定位的少量失败（单条失败且至少 10 条、或失败不超过 20 条且成功率至少 99%），会先加载合格译文、把失败 cue 标成待修复并保存本机手动进度；失败过多时仍只保存进度，不把部分内容当成完整译文。原时间码、ID、settings 和元数据保持不变。
+6. 最近一节课的手动进度保存在扩展本机 storage，30 天内可恢复；刷新后重新打开手动翻译即可继续。保存失败会提示当前页面仍保有进度。当前 v2 JSON 和完整 VTT 导入路径先按严格规则校验，v2 完整文件遇到少量可定位失败时才进入上面的局部保留流程；质量检查是启发式，不能替代专业译审。此流程不修改直连或后端翻译。
+
+协议字段、校验规则与后续扩展约束见 [手动 AI 字幕翻译协议](docs/manual-ai-translation-protocol.md)。
 
 
 ## 字幕渲染方式
@@ -66,7 +78,7 @@
 
 3. **Canvas / Instructure Media 视频**
   - Canvas 页面里的视频实际运行在 `sydney.instructuremedia.com` 的独立 iframe 中，播放器使用 Vidstack 的自定义 `[data-part="captions"]` 渲染层；扩展会在每个 iframe 内独立识别视频，避免把页面上的多个视频混成一个。
-  - 翻译仍使用同一份时间码 VTT 和同一套翻译缓存；字幕按 `video.currentTime` 直接更新到播放器 captions surface，因此不依赖播放器原生 CC 是否打开，也不会在多个视频之间串字幕。
+  - 翻译仍使用同一份时间码 VTT 和同一套翻译缓存；字幕按 `video.currentTime` 更新到扩展自己的 overlay，因此不依赖播放器原生 CC 是否打开，也不会在多个视频之间串字幕。默认模式会保留 Vidstack 原生 CC；原生 CC 打开时中文层会自动移到其上方且不重复英文。只有勾选“使用原生 CC 注入（Beta）”时才隐藏原生 surface 并占用它原来的字幕位置。
   - 如果字幕 URL 的跨域响应不允许 content script 直接读取，扩展会把请求交给 service worker，但只允许 `*.instructuremedia.com`，不会变成任意网址代理。
 
 ### Canvas 考试安全模式
@@ -93,7 +105,7 @@ tests/        Vitest 单元测试（覆盖 extension 核心逻辑）
 扩展主要模块：
 
 ```text
-build_config.js           构建目标（dev/store）与本地后端开关
+build_config.js           构建目标（dev/store）与 Argos 后端能力标记
 assessment_guard.js       Canvas 考试/作业来源检查与默认拒绝安全门
 canvas_course_bridge.js   仅限 Canvas 课程内容页/external_tools 的无数据页面证明桥
 browser_api.js            Chrome / Safari storage 与 runtime API 抽象
@@ -101,6 +113,7 @@ config_keys.js            popup/options 共用的 per-provider API Key 逻辑
 constants.js              共享默认值和选项列表
 host_support.js           Echo360 / Canvas Instructure Media 播放器识别与宿主适配
 vtt.js                    纯 VTT 解析、格式化、双语与增量预览工具
+manual_translation.js     手动 AI 精简 JSON、字面值/标签校验与本地 VTT 重建
 subtitle_strategy.js      浏览器检测与双语 VTT 构建策略
 storage.js                配置、偏好和本地字幕缓存
 video.js                  Echo360 视频发现、media-id 线索和页面探针桥接
@@ -120,7 +133,8 @@ translation_service.js    payload 构造、缓存键与翻译编排
 controller.js             翻译用例编排（含增量预览挂载）
 content.js                content script 入口
 page_probe.js             MAIN world 的 Echo360/React/XHR 探针
-background.js             service worker（直连翻译 job 与 partial_vtt 存储）
+backend_startup.js        Argos 后端健康检查、去重与分阶段重新拉起
+background.js             service worker（直连翻译 job、后端代理与 partial_vtt 存储）
 popup.js / options.js     扩展弹窗与选项页
 ```
 
@@ -175,9 +189,9 @@ Invoke-WebRequest http://127.0.0.1:8765/health
 - macOS：解压 `echo360-online-subtitle-translator-backend-macos-*.tar.gz`，把 `Echo360 Subtitle Backend.app` 放进“应用程序”并至少打开一次；
 - Windows：解压 `echo360-online-subtitle-translator-backend-windows-x64.zip`，首次运行 `Echo360SubtitleBackend\install-and-launch-echo360-subtitle-backend.cmd`，它只在当前用户下注册启动协议，不需要管理员权限。
 
-程序默认只监听 `127.0.0.1:8765`，扩展继续使用现有 Backend URL。关闭程序即可停止后端。翻译缓存写入当前用户的系统缓存目录，不会写入应用安装目录。
+程序固定监听 `127.0.0.1:8765`；选择 Argos 时扩展自动使用该地址，不再要求用户配置 Backend URL。关闭程序即可停止后端。翻译缓存写入当前用户的系统缓存目录，不会写入应用安装目录。
 
-首次启动会把只读应用包中的 Argos 模型复制到当前用户的应用数据目录，因此会比后续启动慢一些。完成上述一次性安装/注册后，扩展在选择 Argos、开始 Argos 翻译或执行 Google 429 备份时会先检查 `/health`；后端未运行就通过 `echo360-subtitle-backend://start` 请求 Windows/macOS 拉起程序，并等待最多 20 秒。自动启动只支持默认的 `http://127.0.0.1:8765`（`localhost`/`[::1]` 等价）；自定义端口仍需手动启动。当前工作流产出的包用于测试和内部发布，尚未配置 Windows Authenticode 或 Apple Developer ID 公证；面向公众分发时应在工作流中接入对应签名凭据。
+首次启动会把只读应用包中的 Argos 模型复制到当前用户的应用数据目录，因此会比后续启动慢一些。模型安装现在使用跨进程原子锁与完整性复查，避免 server 与 translator 同时启动时互相删除刚安装好的模型。完成上述一次性安装/注册后，扩展在选择 Argos、开始 Argos 翻译、重新翻译或执行 Google 429 备份时都会先检查 `/health`；后端未运行就通过 `echo360-subtitle-backend://start` 请求 Windows/macOS 拉起程序。Edge 的外部协议确认是浏览器安全边界，普通扩展不能静默跳过；需要确认时扩展会把该临时标签页切到前台，后端健康检查成功后自动关闭。启动管理器统一把 `localhost`/`[::1]` 规范为服务实际监听的 `127.0.0.1:8765`，共享并发请求，并在 75 秒窗口内分阶段重发被浏览器/系统吞掉的协议启动。准备阶段会立即报告已知字幕总数，不再长时间显示 `0/0`。失败的尝试会从状态中清除，下一次点击可以真正重试。当前工作流产出的包用于测试和内部发布，尚未配置 Windows Authenticode 或 Apple Developer ID 公证；面向公众分发时应在工作流中接入对应签名凭据。
 
 后端更新后，在目标系统上一条命令即可重建原生包（PyInstaller 不能跨系统构建）：
 
@@ -210,7 +224,7 @@ python scripts\smoke-backend.py --check-argos
 3. 点击 `加载已解压的扩展程序`。
 4. 选择当前仓库下的 `extension/` 目录。
 
-进入 Echo360 classroom 页面后，右下角会出现**收纳球**；点击展开滑出式翻译面板，齿轮按钮打开显示/渲染偏好 popover。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。正常使用点击 `加载翻译字幕`；如果需要清除当前缓存并重新翻译，点击 `重新翻译`。
+进入 Echo360 classroom 页面后，右下角会出现**分体收纳球**：点击大按钮会检查缓存并加载或启动默认翻译，同时复制 AI 提示词并下载完整 `.translate.json`；旁边的箭头打开滑出式面板，导入图标在字幕会话准备好后可读取 AI 返回的 `.translated.json` 或完整 `.vtt`。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。如需清除当前缓存并重新翻译，在面板中点击 `重新翻译`。
 
 ## 发布构建
 
@@ -220,7 +234,7 @@ python scripts\smoke-backend.py --check-argos
 npm install
 ```
 
-源码默认保留本地后端开关，方便开发测试。上传 Chrome Web Store 时请使用 store 构建：
+上传 Chrome Web Store 时请使用 store 构建：
 
 ```bash
 npm run build:store
@@ -231,7 +245,7 @@ npm run build:store
 - `dist/extension-store/`
 - `dist/echo360-online-subtitle-translator-store.zip`
 
-store 构建保留可选的本地后端入口以及 `localhost` / `127.0.0.1` 权限，使 Chrome 发布包与 Safari containing app 都能连接独立 Argos 后端；未启用该选项时，扩展仍默认使用前端直连翻译。
+store 构建保留 Argos 所需的固定 loopback 权限。用户不再切换全局后端开关：选择 Argos 自动连接本机后端，选择在线服务始终直连，选择“自定义后端”才使用用户配置的本机 HTTP 或远程 HTTPS 地址并按 origin 请求可选权限。
 
 本地开发测试可使用：
 
@@ -239,7 +253,7 @@ store 构建保留可选的本地后端入口以及 `localhost` / `127.0.0.1` �
 npm run build:dev
 ```
 
-dev 构建同样保留本地后端入口和 localhost 权限，并使用开发版名称方便并行安装。
+dev 构建同样保留 Argos、本机权限和后端调试参数，并使用开发版名称方便并行安装。
 
 `extension/` 是 Chrome 与 Safari 共用的唯一业务源码。Safari/Xcode 工程引用的是由它生成的 `dist/extension-store/` 发布态资源，而不是另一套需要手工维护的源码；构建过程会生成目标专用的 `build_config.js` 和清单，同时保留独立本地后端能力。
 
@@ -278,14 +292,14 @@ npm run test:python
 - target: `ZH`
 - max_paragraphs: `6`（Google 网页端点会按单条字幕刷新进度）
 - max_chars: `1200`
-- concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `48`，其他 provider 不变
+- concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `48`，Azure AI Translator 为 `8`，其他 provider 不变
 - rps: `0`（首次请求不额外限速；失败时才自动尝试 `3` RPS 恢复）
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: 默认空
 - deepseek_thinking_mode: `disabled`
 
-支持的 provider：`google-web`、`deepseek`、`openai`、`gemini`、`deepl`，以及仅开发版/本地后端可用的 `argos`。`google-web` 与 `argos` 不需要 API Key。
+支持的 provider：`google-web`、`deepseek`、`openai`、`gemini`、`deepl`、`azure`、`argos` 与 `custom-backend`。`google-web`、`argos`、`custom-backend` 不需要 API Key；Azure 需要用户自己的 Translator 订阅密钥。自定义后端必须实现与本项目 `/translate`、`/translate-async`、`/translate-async/{job_id}` 相同的 JSON 契约。
 
 目标语言选项：`ZH`、`ZH-HK`、`YUE`、`EN`、`JA`、`KO`、`FR`、`DE`、`ES`、`IT`、`PT`、`RU`、`AR`、`HI`。
 
@@ -295,6 +309,7 @@ Chrome 商店版的高级翻译参数只显示与当前 provider 相关的设置
 - DeepSeek: `DeepSeek Thinking`（默认关闭，减少延迟）
 - Gemini: 默认模型 `gemini-3.1-flash-lite`
 - DeepL: `DeepL Formality`
+- Azure AI Translator: 可选的 `Azure Region`
 
 dev 构建会额外保留本地后端调试参数，例如 `maxParagraphs`、`maxChars`、`concurrency`、`rps`、`retries`、`timeout`、`fallbackMode`、`repairConcurrency` 和 `slowSplitThreshold`。
 
@@ -303,17 +318,28 @@ dev 构建会额外保留本地后端调试参数，例如 `maxParagraphs`、`ma
 - 当 provider 为 `deepl` 时，不支持 `YUE`（请使用 AI provider，如 `deepseek`/`openai`/`gemini`）
 - `argos` 当前明确使用英语作为源语言，支持 `ZH`（`en→zh`）与 `ZH-HK`（`en→zt`）等已安装语言对；不支持 `YUE`，也不接受 `EN` 作为目标语言
 
+Azure AI Translator provider：
+
+- `azure` 使用官方 Translator v3 REST API；请在 Azure 创建 F0 Translator 资源，并在扩展中填写该资源的订阅密钥
+- 全局 Translator 资源只需密钥；多服务或区域型资源还需在高级设置填写 Azure 门户显示的 Region/Location（例如 `australiaeast`）
+- 留空 Endpoint 时使用 `https://api.cognitive.microsofttranslator.com/translate`；如使用 Azure 自定义域名，请填写完整的 translate endpoint
+- 一次请求直接提交一个字幕批次，保持输入和输出索引对应；当前每批仍受 `max_paragraphs=6`、`max_chars=1200` 约束，并将并发上限固定为 `8`
+- `ZH`、`ZH-HK`、`YUE` 分别映射到 Azure 的 `zh-Hans`、`zh-Hant`、`yue`；其他项目目标语言也直接映射到对应 Azure 代码
+- HTTP 429、超时和 5xx 使用现有重试/退避路径；无效凭据、无效输出和不完整批次不会写入成功缓存
+- API Key 只由 service worker 从扩展本地存储读取并注入，请勿把共享密钥写入仓库或发布包
+- 官方参考：[身份验证](https://learn.microsoft.com/azure/ai-services/translator/text-translation/reference/authentication)、[Translate API](https://learn.microsoft.com/rest/api/translator/translator/translate?view=rest-translator-v3.0)、[语言支持](https://learn.microsoft.com/azure/ai-services/translator/language-support)
+
 Google Translate provider：
 
 - `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用
-- store 构建会由扩展前端直接请求；dev 构建可选择通过本地后端转发
+- 所有构建都由扩展前端直接请求，不受 Argos 或自定义后端配置影响
 - 后端/脚本路径的 Google 并发上限为 `48`（原 `96` 的一半），仍保持 `rps=0, max_chars=1200, max_paragraphs=1`
 - 该接口非官方，稳定性、可用性和翻译质量不保证
-- 如果重视字幕翻译质量，建议改用 AI/API provider（如 `deepseek`/`openai`/`gemini`/`deepl`）并填写自己的 API Key
+- 如果重视字幕翻译质量和接口稳定性，建议改用官方 API provider（如 `azure`/`deepl`）或 AI provider，并填写自己的 API Key
 
 `google-web` 的直接扩展路径最多使用 `48` 个 worker，是原 `96` 上限的一半；默认 `rps=0`（不增加请求间隔），显式设置正数 `rps` 时仍会按该值排队。每条字幕独立处理；零星 `HTTP 429` 仍按 `Retry-After` 或指数退避重试，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试、跳过原来的 Google 低并发恢复，并自动拉起本地后端改用 Argos。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
 
-Argos Translate provider（仅开发版）：
+Argos Translate provider：
 
 `argos` 直接在现有 Python 翻译子进程中加载本机 Argos 模型，不需要再启动 LibreTranslate 服务，也不会把字幕发送到第三方。为了避免 CTranslate2 模型竞争和重复占用内存，运行时固定为单 worker。独立后端发布包已经包含简体/繁体中文模型；只有源码开发模式需要在后端虚拟环境安装可选依赖和所需模型：
 
@@ -328,13 +354,15 @@ python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["
 # 如需繁体中文：argospm install translate-en_zt
 ```
 
-最后一条命令会显式预下载英语 MiniSBD 断句模型。然后构建并加载开发版扩展，在完整设置中选择 `Argos Translate（本地）`。保存时会自动启用本地后端；后端仍按原方式在 `127.0.0.1:8765` 启动。翻译过程中不会静默联网或下载模型：缺少依赖、语言包或断句模型时，界面会分别显示 `ARGOS_DEPENDENCY_MISSING` 或 `ARGOS_MODEL_MISSING` 及安装提示。
+最后一条命令会显式预下载英语 MiniSBD 断句模型。然后在完整设置中选择 `Argos Translate（本地）`；保存或开始翻译时会自动检查并拉起 `127.0.0.1:8765`，无需另设开关。翻译过程中不会静默联网或下载模型：缺少依赖、语言包或断句模型时，界面会分别显示 `ARGOS_DEPENDENCY_MISSING` 或 `ARGOS_MODEL_MISSING` 及安装提示。
+
+本地翻译替代方案的质量、速度、体积、许可证和迁移建议见 [本地机器翻译调研](docs/local-translation-research.md)。
 
 
 
 ## 隐私
 
-详见 [PRIVACY.md](PRIVACY.md)。扩展会将字幕文本发送到用户选择的翻译服务；选择 `argos` 时字幕只在本机处理。API Key 与字幕缓存保存在 Chrome 本地 storage。
+详见 [PRIVACY.md](PRIVACY.md)。扩展会将字幕文本发送到用户明确选择的翻译服务；选择 `argos` 时字幕只在本机处理，选择“自定义后端”时发送到用户配置的地址。手动 AI 模式只在本地生成/读取文件，文件交给哪个 AI 由用户决定。API Key 与字幕缓存保存在 Chrome 本地 storage。
 
 ## 后端翻译脚本调用方式
 

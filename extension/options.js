@@ -4,7 +4,7 @@ const buildConfig = window.Echo360BuildConfig || {};
 const enableLocalBackend = buildConfig.enableLocalBackend !== false;
 const { DEFAULT_CONFIG: defaultConfig, PROVIDER_DEFAULTS: providerDefaults, createErrorPresenter } =
   window.Echo360PreferencesUi;
-const { isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = window.Echo360ConfigKeys;
+const { API_KEYS_STORAGE_KEY, isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = window.Echo360ConfigKeys;
 const errorPresenter = createErrorPresenter({ surface: "options" });
 const typedOptionsError = (errorLike, code = "STORAGE_ERROR") => errorPresenter.typed(errorLike, code);
 
@@ -14,7 +14,9 @@ const providerHints = {
   gemini: "需要你自己的 Gemini API Key。适合追求更好翻译质量；请确认所在地区和账号可用。",
   openai: "需要你自己的 OpenAI API Key。适合追求更好翻译质量；Reasoning Effort 仅对支持模型生效。",
   deepl: "需要你自己的 DeepL API Key。适合常规机器翻译质量需求；不支持 YUE 目标语言。",
-  argos: "完全在本机离线翻译，不需要 API Key；仅开发版可用，源字幕必须是英语，并需先安装 Argos 与目标语言模型。"
+  azure: "需要 Azure Translator F0 资源的订阅密钥。支持批量翻译、简体/繁体中文和粤语；区域型资源还需在高级设置填写 Region。",
+  argos: "完全在本机离线翻译，不需要 API Key；源字幕必须是英语。后端会在翻译时自动启动，无需额外开关。",
+  "custom-backend": "把字幕发送到你指定的兼容后端。只有选择此服务时才会使用该 URL；其他在线服务始终由扩展直连。"
 };
 
 function applyAppearance(mode) {
@@ -81,9 +83,13 @@ function refreshProviderUi() {
   const modelEl = document.getElementById("model");
   const providerHint = document.getElementById("providerHint");
   const apiKeyHint = document.getElementById("apiKeyHint");
+  const endpointEl = document.getElementById("endpoint");
+  const customBackend = provider === "custom-backend";
 
   providerHint.textContent = providerHints[provider] || "";
-  apiKeyHint.textContent = isKeyless
+  apiKeyHint.textContent = customBackend
+    ? "自定义后端的鉴权和上游服务由后端自身管理，扩展不会向它附带已保存的 API Key。"
+    : isKeyless
     ? provider === "argos"
       ? "Argos 不需要 API Key；会强制使用本地后端。请先安装 Argos 依赖和对应的 en→目标语言模型。"
       : "Google Translate 不需要 API Key；保存时会自动清空本地 API Key 字段。若翻译质量不理想，请切换到 AI/API 模型。"
@@ -99,38 +105,45 @@ function refreshProviderUi() {
     apiKeyEl.value = localApiKeys[provider] || "";
     apiKeyEl.dataset.forProvider = provider;
   }
-  modelEl.disabled = isKeyless;
-  if (isKeyless) modelEl.value = "";
-  const useLocalBackendEl = document.getElementById("useLocalBackend");
-  if (useLocalBackendEl && enableLocalBackend) {
-    if (provider === "argos") useLocalBackendEl.checked = true;
-    useLocalBackendEl.disabled = provider === "argos";
+  const modelUnavailable = isKeyless || provider === "azure";
+  modelEl.disabled = modelUnavailable;
+  if (modelUnavailable) modelEl.value = "";
+  const directFields = [
+    ...document.querySelectorAll("[data-direct-provider-field]"),
+    apiKeyEl,
+    apiKeyHint,
+    modelEl,
+    endpointEl,
+  ];
+  for (const field of directFields) field.hidden = customBackend;
+  const customSection = document.getElementById("customBackendSection");
+  if (customSection) customSection.hidden = !customBackend;
+  if (customBackend) {
+    modelEl.value = "";
+    endpointEl.value = "";
   }
   refreshAdvancedUi(provider);
 }
 
 function refreshBuildUi() {
-  const section = document.getElementById("localBackendSection");
-  const checkbox = document.getElementById("useLocalBackend");
-  if (!enableLocalBackend) {
-    if (section) section.hidden = true;
-    if (checkbox) checkbox.checked = false;
-  }
   const argosOption = document.querySelector('option[value="argos"]');
   if (argosOption) argosOption.disabled = !enableLocalBackend;
 }
 
 async function loadConfig() {
   const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
+  const { [API_KEYS_STORAGE_KEY]: separateKeys } = await extensionApi.storage.local.get(API_KEYS_STORAGE_KEY);
   const config = { ...defaultConfig, ...(value || {}) };
-  localApiKeys = buildKeyMap(config);
+  localApiKeys = { ...buildKeyMap(config), ...(separateKeys || {}) };
   const currentProvider = providerDefaults[config.provider] && (config.provider !== "argos" || enableLocalBackend)
     ? config.provider
     : defaultConfig.provider;
-  const useLocalBackendEl = document.getElementById("useLocalBackend");
-  const backendUrlEl = document.getElementById("backendUrl");
-  if (useLocalBackendEl) useLocalBackendEl.checked = enableLocalBackend && !!config.useLocalBackend;
-  if (backendUrlEl) backendUrlEl.value = config.backendUrl;
+  const customBackendUrlEl = document.getElementById("customBackendUrl");
+  if (customBackendUrlEl) {
+    customBackendUrlEl.value = config.customBackendUrl ||
+      (config.provider === "custom-backend" ? config.backendUrl : "") ||
+      defaultConfig.customBackendUrl;
+  }
   const apiKeyEl = document.getElementById("apiKey");
   apiKeyEl.value = isKeylessProvider(currentProvider) ? "" : (localApiKeys[currentProvider] || "");
   apiKeyEl.dataset.forProvider = isKeylessProvider(currentProvider) ? "" : currentProvider;
@@ -156,6 +169,7 @@ async function loadConfig() {
   setInputValue("reasoningEffort", config.reasoningEffort || "");
   setInputValue("deepseekThinkingMode", config.deepseekThinkingMode || defaultConfig.deepseekThinkingMode);
   setInputValue("deeplFormality", config.deeplFormality || "");
+  setInputValue("azureRegion", config.azureRegion || "");
   setInputValue("appearance", config.appearance || "auto");
   applyAppearance(config.appearance || "auto");
   refreshProviderUi();
@@ -188,9 +202,7 @@ function applyProviderDefaults() {
 // providers without clicking "保存设置".
 async function persistApiKeysOnly() {
   try {
-    const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
-    const merged = { ...defaultConfig, ...(value || {}), apiKeys: { ...(value?.apiKeys || {}), ...localApiKeys } };
-    await extensionApi.storage.local.set({ [STORAGE_KEY]: merged });
+    await extensionApi.storage.local.set({ [API_KEYS_STORAGE_KEY]: { ...localApiKeys } });
   } catch (error) {
     // A key switch is best-effort, but it must still be visible if browser
     // storage rejects it; otherwise the next translation fails mysteriously.
@@ -213,46 +225,71 @@ function handleExternalConfigChange(newConfig) {
 }
 
 extensionApi.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes[STORAGE_KEY]) return;
-  handleExternalConfigChange(changes[STORAGE_KEY].newValue);
+  if (area !== "local") return;
+  if (changes[API_KEYS_STORAGE_KEY]?.newValue) {
+    localApiKeys = { ...localApiKeys, ...changes[API_KEYS_STORAGE_KEY].newValue };
+  }
+  if (changes[STORAGE_KEY]) handleExternalConfigChange(changes[STORAGE_KEY].newValue);
+  else if (!isEditingApiKey()) refreshProviderUi();
 });
 
-function isLocalBackendUrl(url) {
+function normalizeCustomBackendUrl(url) {
   try {
-    const { protocol, hostname: rawHostname } = new URL(url);
+    const parsed = new URL(url);
+    const { protocol, hostname: rawHostname } = parsed;
     const hostname = String(rawHostname || "").replace(/^\[|\]$/g, "").toLowerCase();
-    return (protocol === "http:" || protocol === "https:") &&
-      (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1");
+    const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    if ((protocol !== "https:" && !(protocol === "http:" && local)) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return null;
+    }
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString().replace(/\/$/, "");
   } catch {
-    return false;
+    return null;
   }
+}
+
+function backendPermissionPattern(url) {
+  const parsed = new URL(url);
+  return `${parsed.protocol}//${parsed.host}/*`;
 }
 
 async function saveConfig() {
   try {
     const provider = document.getElementById("provider").value;
-    const { [STORAGE_KEY]: existingValue } = await extensionApi.storage.local.get(STORAGE_KEY);
-    const existing = { ...defaultConfig, ...(existingValue || {}) };
-    const useLocalBackendEl = document.getElementById("useLocalBackend");
-    const backendUrlEl = document.getElementById("backendUrl");
-    const useLocalBackend = enableLocalBackend && (provider === "argos" || !!useLocalBackendEl?.checked);
-    const rawBackendUrl = backendUrlEl?.value.trim() || defaultConfig.backendUrl;
-    if (useLocalBackend && !isLocalBackendUrl(rawBackendUrl)) {
-      const error = { code: "BACKEND_URL_INVALID", message: "Backend 地址只允许使用 HTTP/HTTPS 的 localhost、127.0.0.1 或 [::1]" };
-      showError(error, { phase: "preferences" });
+    const customBackendUrl = normalizeCustomBackendUrl(
+      document.getElementById("customBackendUrl")?.value.trim() || defaultConfig.customBackendUrl
+    );
+    if (provider === "custom-backend" && !customBackendUrl) {
+      showError({
+        code: "BACKEND_URL_INVALID",
+        message: "自定义后端必须是本机 HTTP 地址或远程 HTTPS 地址，且不能包含账号、查询参数或片段。",
+      }, { phase: "preferences" });
       return;
     }
+    // Request exactly one origin while the Save click still carries a user
+    // gesture. This avoids a blanket host permission for custom backends.
+    if (provider === "custom-backend") {
+      const origins = [backendPermissionPattern(customBackendUrl)];
+      const granted = await extensionApi.permissions.contains({ origins }) ||
+        await extensionApi.permissions.request({ origins });
+      if (!granted) {
+        showError({ code: "BACKEND_PERMISSION_DENIED", message: "未获得访问该自定义后端地址的权限。" }, { phase: "preferences" });
+        return;
+      }
+    }
+    const { [STORAGE_KEY]: existingValue } = await extensionApi.storage.local.get(STORAGE_KEY);
+    const existing = { ...defaultConfig, ...(existingValue || {}) };
     stashKey(localApiKeys, provider, document.getElementById("apiKey").value);
     // Merge in whatever is currently in storage in case it changed elsewhere
     // (e.g. the popup) more recently than our own onChanged listener caught up.
     const mergedKeys = { ...(existingValue?.apiKeys || {}), ...localApiKeys };
     const config = {
-      useLocalBackend,
-      backendUrl: rawBackendUrl,
+      customBackendUrl: customBackendUrl || existing.customBackendUrl || defaultConfig.customBackendUrl,
       ...resolveForSave(mergedKeys, provider),
       provider,
-      model: isKeylessProvider(provider) ? "" : document.getElementById("model").value.trim(),
-      endpoint: document.getElementById("endpoint").value.trim(),
+      model: isKeylessProvider(provider) || provider === "azure" ? "" : document.getElementById("model").value.trim(),
+      endpoint: provider === "custom-backend" ? "" : document.getElementById("endpoint").value.trim(),
       target: (document.getElementById("target").value || "ZH").toUpperCase(),
       maxParagraphs: getNumberValue("maxParagraphs", existing.maxParagraphs ?? defaultConfig.maxParagraphs, 1),
       maxChars: getNumberValue("maxChars", existing.maxChars ?? defaultConfig.maxChars, 100),
@@ -268,14 +305,18 @@ async function saveConfig() {
         ? getInputValue("deepseekThinkingMode", defaultConfig.deepseekThinkingMode)
         : defaultConfig.deepseekThinkingMode,
       deeplFormality: provider === "deepl" ? getInputValue("deeplFormality", "") : "",
+      azureRegion: getInputValue("azureRegion", existing.azureRegion || defaultConfig.azureRegion).trim(),
       appearance: getInputValue("appearance", "auto") || "auto",
     };
-    await extensionApi.storage.local.set({ [STORAGE_KEY]: config });
+    await extensionApi.storage.local.set({
+      [STORAGE_KEY]: config,
+      [API_KEYS_STORAGE_KEY]: { ...mergedKeys },
+    });
     if (provider === "argos") {
       setStatus("设置已保存，正在启动 Argos 后端…");
       const response = await extensionApi.runtime.sendMessage({
         type: "ensure-argos-backend",
-        backendUrl: config.backendUrl,
+        backendUrl: "http://127.0.0.1:8765",
       });
       if (!response?.ok) {
         throw extensionApi.toError(response, "ARGOS_BACKEND_START_FAILED", "Argos 设置已保存，但后端启动失败");

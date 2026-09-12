@@ -40,7 +40,7 @@
       bubble.setAttribute("role", "status");
       bubble.innerHTML = `
         <button id="echo360-onboarding-bubble-close" aria-label="关闭提示" title="关闭提示">×</button>
-        <div class="echo360-onboarding-text">点这里展开字幕翻译面板</div>
+        <div class="echo360-onboarding-text">点击大按钮可一键加载翻译并导出 AI 材料；旁边箭头打开面板，导入图标可快捷载入 AI 译文。</div>
       `;
       root.appendChild(bubble);
       bubble.querySelector("#echo360-onboarding-bubble-close").addEventListener("click", dismiss);

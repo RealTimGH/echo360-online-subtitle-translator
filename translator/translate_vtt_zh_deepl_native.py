@@ -23,6 +23,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Callable, List
 from urllib.parse import quote
@@ -98,6 +99,11 @@ AI_LINE_SEPARATOR = "\n<<<VTT_TRANSLATOR_LINE_BREAK_8F3B>>>\n"
 YUE_TARGET_CODES = {"YUE", "CANTONESE"}
 TRADITIONAL_CHINESE_TARGET_CODES = {"ZH-HK"}
 CJK_TARGET_CODES = {"ZH", "ZH-HK", "YUE", "CANTONESE"}
+TARGET_NEUTRAL_CODE_STOPWORDS = {
+    "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
+    "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
+    "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
+}
 SUPPORTED_TARGET_CODES = {
     "ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE",
     "ES", "IT", "PT", "RU", "AR", "HI",
@@ -107,6 +113,7 @@ FALLBACK_MODES = {"immediate", "deferred", "deferred-fastpath"}
 CLI_ERROR_CODES = {
     "INVALID_REQUEST",
     "INVALID_SOURCE_VTT",
+    "SOURCE_ALREADY_TRANSLATED",
     "EMPTY_TRANSLATABLE_VTT",
     "UNSUPPORTED_PROVIDER",
     "UNSUPPORTED_TARGET_LANGUAGE",
@@ -138,6 +145,51 @@ TIMECODE_RE = re.compile(
 WEBVTT_RE = re.compile(r"^\s*WEBVTT", re.IGNORECASE)
 INDEX_RE = re.compile(r"^\s*\d+\s*$")
 VOICE_TAG_RE = re.compile(r"^(?P<prefix>\s*<v\b[^>]*>)(?P<body>.*?)(?P<suffix>\s*</v>\s*)?$")
+
+
+def _caption_plain_text(value: object) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", str(value or ""))).strip()
+
+
+def _comparable_caption(value: object) -> str:
+    return unicodedata.normalize("NFKC", _caption_plain_text(value)).casefold()
+
+
+def has_cjk_text(value: object) -> bool:
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", str(value or "")))
+
+
+def is_target_neutral_text(source_value: object, translated_value: object, target: str = "ZH") -> bool:
+    """Accept only unchanged Chinese-target captions with no translation need.
+
+    Ordinary English that a provider failed to translate remains a failure.
+    Neutral content is limited to symbols/numbers, URLs/emails, and clearly
+    code-like or label-like tokens such as ``ITLS6111`` and ``F.``.
+    """
+    target_code = str(target or "ZH").strip().upper()
+    if target_code not in CJK_TARGET_CODES:
+        return False
+    source = _caption_plain_text(source_value)
+    translated = _caption_plain_text(translated_value)
+    if not source or not translated or _comparable_caption(source) != _comparable_caption(translated):
+        return False
+    if has_cjk_text(source):
+        return True
+    if not re.search(r"[^\W\d_]", source, re.UNICODE):
+        return True
+    if (
+        re.fullmatch(r"(?:(?:https?|ftp)://|www\.)\S+", source, re.IGNORECASE)
+        or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
+    ):
+        return True
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9._:/+#&()'’\-]*", source):
+        upper = source.upper()
+        has_digit = bool(re.search(r"\d", source))
+        all_upper = source == upper
+        code_word = re.sub(r"[.)]+$", "", upper)
+        if (has_digit or (all_upper and len(source) <= 32)) and code_word not in TARGET_NEUTRAL_CODE_STOPWORDS:
+            return True
+    return False
 
 
 def _error_code_from_text(message: str) -> str:
@@ -392,6 +444,46 @@ def timed_text_line_indices(lines: List[str]) -> list[int]:
             continue
         indexes.append(index)
     return indexes
+
+
+def inspect_probable_bilingual_source(lines: List[str], minimum_cues: int = 3, minimum_ratio: float = 0.6) -> dict:
+    """Detect a rendered bilingual track before any provider is called.
+
+    The extension's output has one CJK line followed by a source-language
+    line in the same cue. This high-confidence shape is a source contamination
+    signal, not a general language detector; ordinary multiline captions are
+    left alone unless most cues have the mixed-language pattern.
+    """
+    cue_blocks: list[list[str]] = []
+    in_cue = False
+    for line in lines:
+        if is_timecode(line):
+            cue_blocks.append([])
+            in_cue = True
+            continue
+        if not line.strip():
+            in_cue = False
+            continue
+        if in_cue and should_translate(line):
+            cue_blocks[-1].append(line)
+
+    mixed_cues = sum(
+        1
+        for block in cue_blocks
+        if len(block) >= 2 and
+        any(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", line) for line in block) and
+        any(not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", line) for line in block)
+    )
+    cue_count = len(cue_blocks)
+    ratio = mixed_cues / cue_count if cue_count else 0.0
+    return {
+        "probable": cue_count >= minimum_cues and mixed_cues >= minimum_cues and ratio >= minimum_ratio,
+        "cueCount": cue_count,
+        "mixedCueCount": mixed_cues,
+        "multilineCueCount": sum(1 for block in cue_blocks if len(block) > 1),
+        "textLineCount": sum(len(block) for block in cue_blocks),
+        "ratio": ratio,
+    }
 
 
 def read_text(path: Path) -> List[str]:
@@ -1288,6 +1380,13 @@ def translate_lines_native(
     total = len(translatable_idx)
     if total == 0:
         raise ValueError("EMPTY_TRANSLATABLE_VTT: VTT 中没有可翻译文本")
+    source_structure = inspect_probable_bilingual_source(lines)
+    if target_code in CJK_TARGET_CODES and source_structure["probable"]:
+        raise ValueError(
+            "SOURCE_ALREADY_TRANSLATED: detected a probable bilingual translated track in the source VTT; "
+            f"{source_structure['mixedCueCount']}/{source_structure['cueCount']} cues contain mixed-language lines; "
+            "remove the generated translation track and resolve the original source"
+        )
     out_lines = list(lines)
     failed_items: list[dict] = []
     provider_results = 0
@@ -1564,9 +1663,12 @@ def translate_lines_native(
                     staged_failures.append((idx_in_batch, empty_message))
                 staged_lines.append((line_idx, lines[line_idx]))
                 continue
-            if idx_in_batch not in failed_indexes and target_requires_cjk and not re.search(
-                r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", translated_text
-            ):
+            target_compatible = (
+                not target_requires_cjk
+                or has_cjk_text(translated_text)
+                or is_target_neutral_text(source_texts[line_idx], translated_text, target_lang)
+            )
+            if idx_in_batch not in failed_indexes and target_requires_cjk and not target_compatible:
                 target_message = "NO_TARGET_TRANSLATION: Provider returned a non-empty result without recognizable target-language text"
                 failed_indexes.add(idx_in_batch)
                 if translated_text.strip().casefold() == str(source_texts[line_idx]).strip().casefold():
@@ -1587,7 +1689,7 @@ def translate_lines_native(
                 else:
                     staged_lines.append((line_idx, translated_text))
             staged_provider_results += 1
-            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", translated_text):
+            if target_requires_cjk and target_compatible:
                 staged_target_results += 1
             if translated_text.strip().casefold() == str(source_texts[line_idx]).strip().casefold():
                 staged_unchanged_results += 1
@@ -1687,10 +1789,12 @@ def translate_lines_native(
             )
             return False
         target_requires_cjk = str(target_lang or "ZH").strip().upper() in CJK_TARGET_CODES
-        if target_requires_cjk and not re.search(
-            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]",
-            normalized,
-        ):
+        target_compatible = (
+            not target_requires_cjk
+            or has_cjk_text(normalized)
+            or is_target_neutral_text(source_texts[line_idx], normalized, target_lang)
+        )
+        if target_requires_cjk and not target_compatible:
             _record_argos_fallback_failure(
                 line_idx,
                 "NO_TARGET_TRANSLATION: Argos returned a result without recognizable target-language text",
@@ -1707,7 +1811,7 @@ def translate_lines_native(
         _remove_failure_for_line(line_idx)
         provider_results += 1
         fallback_provider_results += 1
-        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", normalized):
+        if target_requires_cjk and target_compatible:
             target_results += 1
         if normalized.casefold() == str(source_texts[line_idx]).strip().casefold():
             unchanged_results += 1

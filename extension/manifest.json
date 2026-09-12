@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Echo360 Online Subtitle Translator",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Translate Echo360 and Canvas Instructure Media lecture subtitles and display them on recorded videos.",
   "options_page": "options.html",
   "icons": {
@@ -24,7 +24,15 @@
     "service_worker": "background.js"
   },
   "permissions": [
-    "storage"
+    "storage",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "optional_host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "http://[::1]/*",
+    "https://*/*"
   ],
   "host_permissions": [
     "http://127.0.0.1:8765/*",
@@ -36,6 +44,8 @@
     "https://translate.googleapis.com/*",
     "https://api-free.deepl.com/*",
     "https://api.deepl.com/*",
+    "https://api.cognitive.microsofttranslator.com/*",
+    "https://*.cognitiveservices.azure.com/*",
     "*://*.instructuremedia.com/*",
     "*://echo360.org/*",
     "*://*.echo360.org/*",
@@ -97,6 +107,7 @@
         "browser_api.js",
         "constants.js",
         "error_utils.js",
+        "manual_translation.js",
         "host_support.js",
         "vtt.js",
         "transcript_model.js",

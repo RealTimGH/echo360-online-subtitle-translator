@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import re
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -100,6 +101,7 @@ _jobs: dict[str, dict] = {}
 ERROR_TITLES = {
     "INVALID_REQUEST": "翻译请求参数无效",
     "INVALID_SOURCE_VTT": "原始字幕格式无效",
+    "SOURCE_ALREADY_TRANSLATED": "检测到译文被当作原文",
     "EMPTY_TRANSLATABLE_VTT": "字幕中没有可翻译文本",
     "UNSUPPORTED_PROVIDER": "翻译服务不受支持",
     "UNSUPPORTED_TARGET_LANGUAGE": "目标语言不受支持",
@@ -783,6 +785,42 @@ def timed_cue_text_entries(text: str) -> list[dict]:
     return entries
 
 
+def inspect_probable_bilingual_source(text: str, minimum_cues: int = 3, minimum_ratio: float = 0.6) -> dict:
+    """Detect a rendered bilingual track accidentally fed back as the source.
+
+    This is a defensive source-boundary check, not a language detector. It only
+    fires when most cues contain at least two physical text lines and one line
+    contains CJK while another does not—the shape produced by the extension's
+    own bilingual renderer. Ordinary single-language cues and isolated
+    multilingual phrases remain valid.
+    """
+    entries = timed_cue_text_entries(text)
+    by_cue: dict[int, list[str]] = {}
+    for entry in entries:
+        by_cue.setdefault(entry["cue"], []).append(str(entry.get("text") or ""))
+    mixed_cues = 0
+    for lines in by_cue.values():
+        non_empty = [line.strip() for line in lines if line.strip()]
+        has_cjk_line = any(has_cjk_text(line) for line in non_empty)
+        has_non_cjk_line = any(not has_cjk_text(line) for line in non_empty)
+        if len(non_empty) >= 2 and has_cjk_line and has_non_cjk_line:
+            mixed_cues += 1
+    cue_count = timed_cue_count(text)
+    multiline_cues = sum(
+        1 for lines in by_cue.values()
+        if len([line for line in lines if line.strip()]) > 1
+    )
+    ratio = mixed_cues / cue_count if cue_count else 0.0
+    return {
+        "probable": cue_count >= minimum_cues and mixed_cues >= minimum_cues and ratio >= minimum_ratio,
+        "cueCount": cue_count,
+        "mixedCueCount": mixed_cues,
+        "multilineCueCount": multiline_cues,
+        "textLineCount": len(entries),
+        "ratio": ratio,
+    }
+
+
 def has_timed_cue_text(text: str) -> bool:
     """Return whether every timed cue contains actual caption text."""
     lines = str(text or "").replace("\r", "").split("\n")
@@ -811,8 +849,86 @@ def has_cjk_text(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", str(text or "")))
 
 
-def has_cjk_in_every_timed_cue(text: str, bilingual: bool = False) -> bool:
-    """Require target-language text in every cue for a complete success.
+TARGET_NEUTRAL_CODE_STOPWORDS = {
+    "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
+    "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
+    "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
+}
+
+
+def _caption_plain_text(value: object) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", str(value or ""))).strip()
+
+
+def _comparable_caption(value: object) -> str:
+    return unicodedata.normalize("NFKC", _caption_plain_text(value)).casefold()
+
+
+def is_target_neutral_text(source_value: object, translated_value: object, target: str = "ZH") -> bool:
+    """Return whether unchanged text is a valid Chinese-target neutral item.
+
+    Target-language coverage must remain strict for ordinary English. The
+    exception is limited to content that has no translatable language (for
+    example ``2026``), a URL/email, or a clearly code-like/label-like token
+    such as ``ITLS6111`` or ``F.``. The source and output must be equivalent;
+    this helper never accepts an arbitrary non-Chinese translation.
+    """
+    target_code = str(target or "ZH").strip().upper()
+    if target_code not in CJK_TARGET_CODES:
+        return False
+    source = _caption_plain_text(source_value)
+    translated = _caption_plain_text(translated_value)
+    if not source or not translated or _comparable_caption(source) != _comparable_caption(translated):
+        return False
+    if has_cjk_text(source):
+        return True
+    # Numbers, punctuation and symbols do not have a linguistic target.
+    if not re.search(r"[^\W\d_]", source, re.UNICODE):
+        return True
+    if (
+        re.fullmatch(r"(?:(?:https?|ftp)://|www\.)\S+", source, re.IGNORECASE)
+        or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
+    ):
+        return True
+    # Uppercase abbreviations, course codes, file names and software tokens
+    # are commonly preserved by subtitle translation. Exclude common English
+    # words so an unchanged "NO" or "OK" is not silently accepted.
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9._:/+#&()'’\-]*", source):
+        upper = source.upper()
+        has_digit = bool(re.search(r"\d", source))
+        all_upper = source == upper
+        code_word = re.sub(r"[.)]+$", "", upper)
+        if (has_digit or (all_upper and len(source) <= 32)) and code_word not in TARGET_NEUTRAL_CODE_STOPWORDS:
+            return True
+    return False
+
+
+def _target_compatible_text(output_text: object, source_text: object | None, target: str) -> bool:
+    return has_cjk_text(output_text) or (
+        source_text is not None and is_target_neutral_text(source_text, output_text, target)
+    )
+
+
+def _target_compatible_bilingual_block(output_block: object, source_block: object | None, target: str) -> bool:
+    if has_cjk_text(output_block):
+        return True
+    if source_block is None:
+        return False
+    source_lines = [line.strip() for line in str(source_block or "").split("\n") if line.strip()]
+    output_lines = [line.strip() for line in str(output_block or "").split("\n") if line.strip()]
+    return bool(source_lines and output_lines) and all(
+        any(is_target_neutral_text(source_line, output_line, target) for source_line in source_lines)
+        for output_line in output_lines
+    )
+
+
+def has_cjk_in_every_timed_cue(
+    text: str,
+    bilingual: bool = False,
+    source_text: str | None = None,
+    target: str = "ZH",
+) -> bool:
+    """Require target-language or explicitly neutral text in every cue.
 
     A whole-document CJK check is insufficient: one translated cue can make
     an otherwise English/original document look successful. Partial results
@@ -825,12 +941,20 @@ def has_cjk_in_every_timed_cue(text: str, bilingual: bool = False) -> bool:
     entries = timed_cue_text_entries(text)
     if not entries:
         return False
+    source_entries = timed_cue_text_entries(source_text) if source_text is not None else []
     if not bilingual:
-        return all(has_cjk_text(entry["text"]) for entry in entries)
+        return all(
+            _target_compatible_text(entry["text"], source_entries[index].get("text") if index < len(source_entries) else None, target)
+            for index, entry in enumerate(entries)
+        )
     cue_blocks: dict[int, list[str]] = {}
     for entry in entries:
         cue_blocks.setdefault(entry["cue"], []).append(entry["text"])
-    return bool(cue_blocks) and all(has_cjk_text("\n".join(lines)) for lines in cue_blocks.values())
+    source_blocks = timed_cue_text_blocks(source_text) if source_text is not None else []
+    return bool(cue_blocks) and all(
+        _target_compatible_bilingual_block("\n".join(lines), source_blocks[index] if index < len(source_blocks) else None, target)
+        for index, lines in enumerate(cue_blocks.values())
+    )
 
 
 def has_cjk_in_successful_timed_cues(
@@ -838,6 +962,8 @@ def has_cjk_in_successful_timed_cues(
     failed_items: list[dict] | None = None,
     expected_failed_count: int | None = None,
     bilingual: bool = False,
+    source_text: str | None = None,
+    target: str = "ZH",
 ) -> bool | None:
     """Check target text on text lines known to have succeeded.
 
@@ -854,7 +980,12 @@ def has_cjk_in_successful_timed_cues(
     if expected is not None and expected > len(failures):
         return None
     if not failures:
-        return has_cjk_in_every_timed_cue(text, bilingual=bilingual)
+        return has_cjk_in_every_timed_cue(
+            text,
+            bilingual=bilingual,
+            source_text=source_text,
+            target=target,
+        )
 
     if bilingual:
         failed_cues: set[int] = set()
@@ -866,9 +997,14 @@ def has_cjk_in_successful_timed_cues(
         cue_blocks: dict[int, list[str]] = {}
         for entry in entries:
             cue_blocks.setdefault(entry["cue"], []).append(entry["text"])
+        source_blocks = timed_cue_text_blocks(source_text) if source_text is not None else []
         return all(
-            cue in failed_cues or has_cjk_text("\n".join(lines))
-            for cue, lines in cue_blocks.items()
+            cue in failed_cues or _target_compatible_bilingual_block(
+                "\n".join(lines),
+                source_blocks[index] if index < len(source_blocks) else None,
+                target,
+            )
+            for index, (cue, lines) in enumerate(cue_blocks.items())
         )
 
     entries_by_line = {entry["line"]: entry for entry in entries}
@@ -892,9 +1028,14 @@ def has_cjk_in_successful_timed_cues(
         if len(cue_entries) != 1:
             return None
         failed_lines.add(cue_entries[0]["line"])
+    source_entries = timed_cue_text_entries(source_text) if source_text is not None else []
     return all(
-        entry["line"] in failed_lines or has_cjk_text(entry["text"])
-        for entry in entries
+        entry["line"] in failed_lines or _target_compatible_text(
+            entry["text"],
+            source_entries[index].get("text") if index < len(source_entries) else None,
+            target,
+        )
+        for index, entry in enumerate(entries)
     )
 
 
@@ -1152,8 +1293,10 @@ def translator_error_status(code: str | None) -> int:
     normalized = normalize_translator_process_code(code) or "TRANSLATOR_PROCESS_FAILED"
     if re.fullmatch(r"HTTP_\d{3}", normalized):
         return int(normalized[-3:])
-    if normalized in {"INVALID_REQUEST", "UNSUPPORTED_PROVIDER", "UNSUPPORTED_TARGET_LANGUAGE", "PROVIDER_API_KEY_MISSING", "INVALID_REASONING_EFFORT"}:
+    if normalized in {"INVALID_REQUEST", "INVALID_SOURCE_VTT", "UNSUPPORTED_PROVIDER", "UNSUPPORTED_TARGET_LANGUAGE", "PROVIDER_API_KEY_MISSING", "INVALID_REASONING_EFFORT"}:
         return 400
+    if normalized == "SOURCE_ALREADY_TRANSLATED":
+        return 422
     if normalized in {"REQUEST_TIMEOUT", "TRANSLATION_TIMEOUT"}:
         return 504
     if normalized in {"NETWORK_ERROR", "PROVIDER_REQUEST_FAILED", "INVALID_PROVIDER_RESPONSE", "INVALID_PROVIDER_OUTPUT"}:
@@ -1226,6 +1369,24 @@ def run_translation(
             "原始 WebVTT 没有可翻译的字幕文字；翻译尚未开始",
             phase="source",
         )
+    source_structure = inspect_probable_bilingual_source(vtt_text)
+    if target_code in CJK_TARGET_CODES and source_structure["probable"]:
+        raise_problem(
+            422,
+            "SOURCE_ALREADY_TRANSLATED",
+            (
+                "检测到原始 VTT 多数 cue 同时包含 CJK 和非 CJK 字幕行；"
+                f"这通常表示已生成的双语译文被再次当作原文（{source_structure['mixedCueCount']}/"
+                f"{source_structure['cueCount']} 个 cue）。翻译尚未开始"
+            ),
+            phase="source",
+            provider=provider_name,
+            target=target_code,
+            details={
+                "sourceStructure": source_structure,
+                "action": "remove-translated-track-and-resolve-original-source",
+            },
+        )
     limit_key = web_provider_limit_key(provider_name)
     if provider_name not in KEYLESS_PROVIDERS and not (req.api_key or "").strip():
         raise_problem(400, "PROVIDER_API_KEY_MISSING", f"Provider '{req.provider}' 需要 API Key", phase="config")
@@ -1275,7 +1436,12 @@ def run_translation(
                 (req.bilingual or cached_line_count == source_line_count) and
                 (
                     target_code not in CJK_TARGET_CODES or
-                    has_cjk_in_every_timed_cue(cached_text, bilingual=req.bilingual)
+                    has_cjk_in_every_timed_cue(
+                        cached_text,
+                        bilingual=req.bilingual,
+                        source_text=vtt_text,
+                        target=target_code,
+                    )
                 )
             ):
                 total_lines = source_line_count
@@ -1707,6 +1873,8 @@ def run_translation(
                 failed_items,
                 failed,
                 bilingual=bool(req.bilingual),
+                source_text=vtt_text,
+                target=target_code,
             )
             if cjk_coverage is False or (failed > 0 and failed <= 50 and cjk_coverage is None):
                 if cjk_coverage is None:
@@ -1723,7 +1891,7 @@ def run_translation(
                 raise_problem(
                     500,
                     "INCONSISTENT_TRANSLATION_RESULT",
-                    "翻译统计报告了中文译文，但成功字幕文字行实际不包含可识别的中文字符；结果没有写入缓存",
+                    "翻译统计报告了中文译文，但成功字幕文字行实际不包含可识别的中文或合法中性文字；结果没有写入缓存",
                     phase="translation",
                     metrics=metrics,
                     failure_codes=failure_codes,
@@ -1810,6 +1978,11 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
         req.rps,
         req.retries,
     )
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            job["status"] = "running"
+            job["updated_at"] = int(time.time())
 
     def on_progress(current: int, total: int, line: str, partial_vtt: str = "") -> None:
         with _jobs_lock:
@@ -1887,12 +2060,22 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
 @app.post("/translate-async")
 def translate_async(req: TranslateAsyncRequest) -> dict:
     job_id = uuid.uuid4().hex
+    # Publish the known work size before the worker imports/loads the
+    # translator (Argos model startup can take noticeably longer on Windows).
+    # Clients can therefore show 0/N + a preparing stage instead of appearing
+    # stuck at the meaningless 0/0 state.
+    initial_total = translatable_line_count(req.vtt_text)
     with _jobs_lock:
         cleanup_jobs_locked()
         _jobs[job_id] = {
             "id": job_id,
             "status": "queued",
-            "progress": {"current": 0, "total": 0, "line": ""},
+            "progress": {
+                "current": 0,
+                "total": initial_total,
+                "line": "正在准备本地翻译…" if initial_total > 0 else "",
+                "stage": "preparing",
+            },
             "partial_vtt": "",
             "result": None,
             "error": "",
