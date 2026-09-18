@@ -1,6 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -459,6 +460,7 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertEqual(proc.wait.call_count, 2)
         self.assertEqual(backend.translator_error_status("TRANSLATOR_PROCESS_TIMEOUT"), 504)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX-only process-group behavior")
     def test_posix_translator_process_group_is_terminated_and_reaped(self):
         proc = mock.Mock(pid=1234)
         proc.poll.return_value = None
@@ -470,6 +472,22 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertEqual(
             killpg.call_args_list,
             [mock.call(1234, backend.signal.SIGTERM), mock.call(1234, backend.signal.SIGKILL)],
+        )
+        self.assertEqual(proc.wait.call_count, 2)
+
+    def test_windows_translator_process_tree_is_terminated_and_reaped(self):
+        proc = mock.Mock(pid=1234)
+        proc.poll.return_value = None
+        proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="translator", timeout=5), 0]
+        proc._echo360_process_group = "windows"
+        with mock.patch.object(backend.subprocess, "run") as run:
+            backend.terminate_translator_process(proc)
+        proc.terminate.assert_called_once_with()
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            check=False,
+            capture_output=True,
+            timeout=backend.TRANSLATOR_TERMINATE_GRACE_SECONDS,
         )
         self.assertEqual(proc.wait.call_count, 2)
 
