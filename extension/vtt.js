@@ -34,10 +34,13 @@
       .trim();
     if (!raw || !raw.includes("-->")) return "";
 
-    const lines = raw.split("\n").map((line) => line.replace(
-      /(\d{1,2}:\d{2}:\d{2}),(\d{3})/g,
-      "$1.$2"
-    ));
+    // Only rewrite timing lines: timestamp examples inside caption text must
+    // remain byte-for-byte intact. Accept long recordings as well as MM:SS.
+    const lines = raw.split("\n").map((line) => {
+      if (!/^\s*(?:\d{2,}:)?\d{2}:\d{2}[,.]\d{3}\s+-->\s+(?:\d{2,}:)?\d{2}:\d{2}[,.]\d{3}(?:\s+.*)?$/.test(line)) return line;
+      return line.replace(/((?:\d{2,}:)?\d{2}:\d{2}),(\d{3})/g, "$1.$2");
+    });
+    if (!lines.some((line) => parseVttTimingLine(line))) return "";
     if (/^WEBVTT(?:\s|$)/i.test(lines[0].trim())) return lines.join("\n");
     return ["WEBVTT", "", ...lines].join("\n");
   }

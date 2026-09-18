@@ -16,7 +16,18 @@
          interactive children re-enable pointer-events individually. */
       #echo360-ui-root {
         pointer-events: none;
+        --echo360-ball-bottom: 120px;
+        --echo360-surface-bottom: 80px;
         ${toCssVars(DARK)}
+      }
+      /* Canvas embeds usually give the media frame a much taller page-sized
+         viewport than the older Echo360 player. Keep the compact control
+         clear of the bottom edge and the page's own controls on that surface.
+         The values are inherited by the ball, panel, popover and onboarding
+         bubble so opening a secondary surface does not jump to another level. */
+      #echo360-ui-root[data-echo360-host="instructure-media"] {
+        --echo360-ball-bottom: 200px;
+        --echo360-surface-bottom: 160px;
       }
       .echo360-sr-only {
         position: absolute !important;
@@ -58,7 +69,7 @@
       #echo360-translator-ball-group {
         position: fixed;
         right: 6px;
-        bottom: 120px;
+        bottom: var(--echo360-ball-bottom);
         width: 84px;
         height: 52px;
         display: flex;
@@ -156,20 +167,41 @@
         animation: echo360-ball-busy-spin 1.1s linear infinite;
       }
       #echo360-translator-ball-group[data-kind="success"] #echo360-translator-ball {
+        --echo360-result-ring: #25b36a;
         box-shadow: 0 0 0 2px #25b36a, -3px 2px 14px var(--echo360-ball-shadow);
+      }
+      #echo360-translator-ball-group[data-kind="cache"] #echo360-translator-ball {
+        --echo360-result-ring: #258bd6;
+        box-shadow: 0 0 0 2px #258bd6, -3px 2px 14px var(--echo360-ball-shadow);
       }
       #echo360-translator-ball-group[data-kind="warning"] #echo360-translator-ball,
       #echo360-translator-ball-group[data-kind="error"] #echo360-translator-ball {
         box-shadow: 0 0 0 2px #e5a225, -3px 2px 14px var(--echo360-ball-shadow);
       }
       @keyframes echo360-ball-busy-spin { to { transform: rotate(360deg); } }
+      @keyframes echo360-ball-result-ring {
+        0% { transform: scale(1); opacity: 0.85; }
+        70% { transform: scale(1.28); opacity: 0; }
+        100% { transform: scale(1.28); opacity: 0; }
+      }
+      #echo360-translator-ball-group.echo360-ball-result-ring[data-kind="success"] #echo360-translator-ball::after,
+      #echo360-translator-ball-group.echo360-ball-result-ring[data-kind="cache"] #echo360-translator-ball::after {
+        content: "";
+        position: absolute;
+        inset: -3px;
+        border: 2px solid var(--echo360-result-ring);
+        border-radius: 50%;
+        animation: echo360-ball-result-ring 1.35s ease-out 1;
+        pointer-events: none;
+      }
       @media (hover: none) {
         #echo360-translator-ball-group { transform: translateX(0); }
       }
       @media (prefers-reduced-motion: reduce) {
         #echo360-translator-ball-group,
         #echo360-translator-ball,
-        #echo360-translator-ball-group.echo360-ball-pulse #echo360-translator-ball::before {
+        #echo360-translator-ball-group.echo360-ball-pulse #echo360-translator-ball::before,
+        #echo360-translator-ball-group.echo360-ball-result-ring #echo360-translator-ball::after {
           transition: none;
           animation: none;
         }
@@ -198,7 +230,7 @@
       #echo360-onboarding-bubble {
         position: fixed;
         right: 70px;
-        bottom: 122px;
+        bottom: calc(var(--echo360-ball-bottom) + 2px);
         z-index: 2147483647;
         pointer-events: auto;
         max-width: 240px;
@@ -260,7 +292,7 @@
       #echo360-translator-panel {
         position: fixed;
         right: 12px;
-        bottom: 80px;
+        bottom: var(--echo360-surface-bottom);
         width: ${PANEL_W}px;
         box-sizing: border-box;
         z-index: 2147483647;
@@ -413,7 +445,7 @@
       #echo360-translator-popover {
         position: fixed;
         right: ${PANEL_W + 28}px;
-        bottom: 80px;
+        bottom: var(--echo360-surface-bottom);
         z-index: 2147483647;
         pointer-events: auto;
         width: 280px;
@@ -557,6 +589,10 @@
       }
       .echo360-status-text.echo360-status-success {
         color: #9ce6b0;
+      }
+      .echo360-status-text.echo360-status-cache {
+        color: var(--echo360-diagnostic-accent);
+        font-weight: 700;
       }
       .echo360-popover-link-btn {
         display: inline-flex;

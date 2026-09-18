@@ -6,6 +6,7 @@
   const ns = root.Echo360Translator = root.Echo360Translator || {};
 
   const PROVIDER_LABELS = {
+    mixed: "混合翻译（并行）",
     "google-web": "Google Translate 网页端点",
     deepseek: "DeepSeek",
     gemini: "Gemini",
@@ -13,6 +14,7 @@
     deepl: "DeepL",
     azure: "Azure AI Translator F0",
     argos: "Argos Translate（本地）",
+    "custom-backend": "自定义后端",
   };
 
   const TARGET_LABELS = {
@@ -45,6 +47,53 @@
     "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
   ]);
 
+  function normalizeTargetCode(target = "ZH") {
+    const code = String(target || "ZH").trim().toUpperCase();
+    return code === "CANTONESE" ? "YUE" : code;
+  }
+
+  function responseTooLargeError(options = {}) {
+    return Object.assign(new Error(options.message || "响应内容超过允许的大小限制"), {
+      code: options.code || "RESOURCE_TOO_LARGE",
+      status: Number(options.status) || 413,
+      phase: options.phase || undefined,
+    });
+  }
+
+  async function readBoundedResponseText(response, maxBytes, errorOptions = {}) {
+    const limit = Number(maxBytes);
+    if (!Number.isFinite(limit) || limit <= 0) throw new TypeError("maxBytes must be positive");
+    const declaredLength = Number(response?.headers?.get?.("content-length") || 0);
+    if (Number.isFinite(declaredLength) && declaredLength > limit) throw responseTooLargeError(errorOptions);
+
+    const reader = response?.body?.getReader?.();
+    if (!reader) {
+      const text = await response.text();
+      if (new TextEncoder().encode(text).byteLength > limit) throw responseTooLargeError(errorOptions);
+      return text;
+    }
+
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let receivedBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        receivedBytes += value?.byteLength || 0;
+        if (receivedBytes > limit) {
+          try { await reader.cancel(); } catch (_) { /* best-effort cancellation */ }
+          throw responseTooLargeError(errorOptions);
+        }
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      chunks.push(decoder.decode());
+      return chunks.join("");
+    } finally {
+      reader.releaseLock?.();
+    }
+  }
+
   // Some captions are valid target-language output even when they contain no
   // CJK character: a number, URL, file/code token, a grade/label, or text
   // already written in the target script.  This is intentionally a narrow
@@ -76,7 +125,7 @@
   }
 
   function isTargetNeutralText(sourceValue, translatedValue, target = "ZH") {
-    const targetCode = String(target || "ZH").trim().toUpperCase();
+    const targetCode = normalizeTargetCode(target);
     if (!CJK_TARGET_CODES.has(targetCode)) return false;
     const source = captionPlainText(sourceValue);
     const translated = captionPlainText(translatedValue);
@@ -231,14 +280,19 @@
     return { ok: true };
   }
 
-  function isTranslatableVttLine(value) {
+  function isTranslatableVttLine(value, options = {}) {
     const line = String(value ?? "").trim();
+    const insideCue = options === true || options?.insideCue === true;
     // Numeric caption text is valid (for example, a lecturer saying “123”)
     // and is now kept because callers only invoke this helper inside a timed
     // cue. Cue identifiers are excluded by timedCueTextEntries(), where the
     // parser knows whether it is currently inside a cue body.
-    if (!line || /^WEBVTT\b/i.test(line) || VTT_TIMING_LINE_RE.test(line)) return false;
-    if (/^(?:NOTE|STYLE|REGION)\b/i.test(line)) return false;
+    if (!line || VTT_TIMING_LINE_RE.test(line)) return false;
+    // NOTE/STYLE/REGION and the WEBVTT header are metadata only at a VTT
+    // block boundary. A cue may legitimately begin with any of these words
+    // (for example, “Note we've got ...”), so do not apply the metadata
+    // prefix filter while the parser is inside a timed cue.
+    if (!insideCue && /^(?:WEBVTT|NOTE|STYLE|REGION)\b/i.test(line)) return false;
     return true;
   }
 
@@ -278,7 +332,7 @@
       cue += 1;
       for (let next = index + 1; next < lines.length && lines[next].trim() !== ""; next += 1) {
         if (VTT_TIMING_LINE_RE.test(lines[next])) break;
-        if (!isTranslatableVttLine(lines[next])) continue;
+        if (!isTranslatableVttLine(lines[next], { insideCue: true })) continue;
         entries.push({ cue, line: next + 1, text: lines[next] });
       }
     }
@@ -933,6 +987,11 @@
     "UNSUPPORTED_PROVIDER_PROTOCOL",
     "INVALID_REASONING_EFFORT",
     "PROVIDER_CONFIG_ERROR",
+    "PROVIDER_RESPONSE_TOO_LARGE",
+    "BACKEND_RESPONSE_TOO_LARGE",
+    "TRANSLATOR_OUTPUT_TOO_LARGE",
+    "RESOURCE_TOO_LARGE",
+    "REQUEST_TOO_LARGE",
     "PROVIDER_API_KEY_MISSING",
     "SOURCE_ALREADY_TRANSLATED",
     "MANUAL_SESSION_SOURCE_INVALID",
@@ -941,6 +1000,8 @@
     "ARGOS_DEPENDENCY_MISSING",
     "ARGOS_MODEL_MISSING",
     "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+    "MIXED_PROVIDERS_REQUIRED",
+    "MIXED_ALL_PROVIDERS_FAILED",
     "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
     "ARGOS_BACKEND_START_TIMEOUT",
     "ARGOS_BACKEND_START_UNAVAILABLE",
@@ -959,7 +1020,11 @@
     "HTTP_429",
     "NETWORK_ERROR",
     "REQUEST_TIMEOUT",
+    "BACKEND_REQUEST_TIMEOUT",
     "TRANSLATION_TIMEOUT",
+    "SOURCE_RESOLUTION_TIMEOUT",
+    "TRANSLATOR_PROCESS_TIMEOUT",
+    "TOO_MANY_ACTIVE_JOBS",
     "RESOURCE_NETWORK_ERROR",
     "RESOURCE_FETCH_FAILED",
     "SUBTITLE_NETWORK_ERROR",
@@ -1013,7 +1078,11 @@
     let summary = message || "发生了未分类错误";
     let recommendation = "请展开“诊断详情”，按建议处理后重试。";
 
-    if (code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN") {
+    if (code === "TOO_MANY_ACTIVE_JOBS") {
+      title = "后台翻译任务已满";
+      summary = message || "当前正在排队或运行的翻译任务已达到安全上限。";
+      recommendation = "等待已有任务完成后再重试；如果任务长期不结束，请重启本地后端或扩展。";
+    } else if (code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN") {
       title = "Google 限流熔断已触发";
       summary = "短时间内收到了大量 HTTP 429，扩展已停止继续请求 Google；自动 Argos 备份未能完成。";
       recommendation = "确认 Echo360 Subtitle Backend 已正确安装且可由系统启动，然后重新翻译；无需继续重试 Google。";
@@ -1163,10 +1232,18 @@
       title = "无法连接翻译服务";
       summary = "网络请求失败：浏览器没有完成翻译请求（Safari 常见显示为 Load failed）。";
       recommendation = "检查网络、站点权限和 Endpoint；不要立即连续重试，必要时切换 Provider。";
-    } else if (code === "REQUEST_TIMEOUT" || code === "TRANSLATION_TIMEOUT") {
-      title = "翻译请求超时";
-      summary = "翻译服务在规定时间内没有返回结果。";
-      recommendation = "降低并发或增加单请求超时时间，然后重试。";
+    } else if (code === "REQUEST_TIMEOUT" || code === "BACKEND_REQUEST_TIMEOUT" || code === "TRANSLATION_TIMEOUT" || code === "TRANSLATOR_PROCESS_TIMEOUT" || code === "SOURCE_RESOLUTION_TIMEOUT") {
+      title = code === "SOURCE_RESOLUTION_TIMEOUT" ? "字幕源解析超时" : "翻译请求超时";
+      summary = code === "TRANSLATOR_PROCESS_TIMEOUT"
+        ? "本地翻译进程超过整任务期限，后端已将其终止以释放任务槽位。"
+        : code === "SOURCE_RESOLUTION_TIMEOUT"
+          ? "扩展在共享时间预算内没有找到可用的字幕轨。"
+          : "翻译服务在规定时间内没有返回结果。";
+      recommendation = code === "TRANSLATOR_PROCESS_TIMEOUT"
+        ? "检查本地后端日志和网络状况；可降低字幕规模或并发后重试。"
+        : code === "SOURCE_RESOLUTION_TIMEOUT"
+          ? "确认播放器和字幕已加载，刷新页面后重试。"
+          : "降低并发或增加单请求超时时间，然后重试。";
     } else if (code === "ARGOS_DEPENDENCY_MISSING") {
       title = "缺少 Argos Translate 运行依赖";
       summary = "本地后端可以运行，但当前 Python 环境没有安装可选的 Argos Translate 依赖。";
@@ -1185,6 +1262,18 @@
         ? "翻译任务创建成功响应不完整，没有返回任务 ID。"
         : "扩展轮询的任务已过期、被清理，或后台 Service Worker 重启了。";
       recommendation = "重新开始翻译；如果频繁发生，请检查扩展是否被系统挂起。";
+    } else if (code === "MIXED_PROVIDERS_REQUIRED") {
+      title = "混合翻译服务不足";
+      summary = message || "混合翻译至少需要两个支持当前目标语言的服务。";
+      recommendation = "打开完整设置，勾选至少两个兼容服务并填写它们需要的 API Key。";
+    } else if (code === "MIXED_PRIORITY_CONFIG_INVALID") {
+      title = "混合翻译优先级配置无效";
+      summary = message || "请检查翻译分组与字幕数量阈值。";
+      recommendation = "打开完整设置，为每级选择至少一个兼容服务，并按级别填写递增的正整数阈值；或关闭多级优先级以使用原有调度。";
+    } else if (code === "MIXED_ALL_PROVIDERS_FAILED") {
+      title = "混合翻译的所有候选服务均失败";
+      summary = message || "当前分片已尝试所有健康服务，但仍未得到完整译文。";
+      recommendation = "检查各服务 API Key、配额、网络和本地后端状态，然后重试或调整服务比例。";
     } else if (code === "UNSUPPORTED_PROVIDER" || code === "PROVIDER_CONFIG_ERROR") {
       title = "翻译服务配置无效";
       summary = code === "UNSUPPORTED_PROVIDER"
@@ -1211,6 +1300,18 @@
       title = "字幕中没有可翻译文本";
       summary = "VTT 有时间轴，但没有可翻译的字幕文字。";
       recommendation = "确认字幕文件不是空文件，也不是只有时间轴/样式块。";
+    } else if (code === "RESOURCE_TOO_LARGE" || code === "REQUEST_TOO_LARGE") {
+      title = "字幕内容超过大小限制";
+      summary = message || "当前字幕文件或翻译请求超过了安全上限。";
+      recommendation = "请拆分字幕文件或减少本次翻译内容后重试。";
+    } else if (code === "PROVIDER_RESPONSE_TOO_LARGE") {
+      title = "翻译服务响应过大";
+      summary = message || "Provider 返回的数据超过安全上限，扩展已停止读取。";
+      recommendation = "检查 Endpoint 是否指向正确的 JSON API；若使用代理，请排查它是否返回了错误页或超大调试数据。";
+    } else if (code === "BACKEND_RESPONSE_TOO_LARGE" || code === "TRANSLATOR_OUTPUT_TOO_LARGE") {
+      title = "后端响应过大";
+      summary = message || "本地或自定义后端返回的数据超过安全上限。";
+      recommendation = "确认 Backend URL 指向兼容的翻译后端，并检查代理或调试中间层是否放大了响应。";
     } else if (code === "RESOURCE_HOST_NOT_ALLOWED") {
       title = "字幕地址不在允许的站点范围内";
       summary = "扩展拒绝读取这个字幕地址，避免把页面数据发送到未知站点。";
@@ -1243,13 +1344,13 @@
         ? "把 Backend URL 改回 http://127.0.0.1:8765 后重试。"
         : "Windows 请先运行发布包内的“安装并启动”入口；macOS 请把应用移到 Applications 并至少打开一次。";
     } else if (code === "BACKEND_DISABLED" || code === "BACKEND_URL_MISSING" || code === "BACKEND_REQUEST_ERROR" || code === "BACKEND_NETWORK_ERROR") {
-      title = "本地后端请求失败";
-      summary = message || "扩展没有得到本地后端的有效响应。";
-      recommendation = "检查本地后端是否运行、Backend URL 是否正确；不需要本地后端时请关闭该选项。";
+      title = "后端请求失败";
+      summary = message || "扩展没有得到 Argos 或自定义后端的有效响应。";
+      recommendation = "Argos 请确认本机后端已安装并能启动；自定义后端请检查 URL、站点权限、网络与协议版本。";
     } else if (code === "BACKEND_URL_INVALID") {
       title = "Backend 地址无效";
-      summary = "本地后端地址只允许使用 HTTP/HTTPS 的 localhost、127.0.0.1 或 [::1]。";
-      recommendation = "把 Backend URL 改为例如 http://127.0.0.1:8765，然后再次保存。";
+      summary = "Backend URL 必须是远程 HTTPS，或仅在 localhost、127.0.0.1、[::1] 上使用 HTTP；不能包含账号、密码、查询参数或片段。";
+      recommendation = "使用例如 http://127.0.0.1:8765 的本机地址，或改用可信的 https:// 自定义后端后重新保存。";
     } else if (code === "PROVIDER_API_KEY_MISSING") {
       title = "缺少翻译服务 API Key";
       summary = `Provider ${PROVIDER_LABELS[context.provider] || context.provider || "当前服务"} 没有可用 API Key。`;
@@ -1640,7 +1741,18 @@
     };
     const descriptor = describe(code, status, message, metrics, failureCodes, sourceContext);
     const upstreamTitle = clean(errorLike?.title || problem.title || "", 240);
-    const rawDetails = errorLike?.details || problem.details || null;
+    // `normalizeError` is called at more than one UI boundary.  A model that
+    // has already been normalized carries its rendered detail rows in
+    // `details`, while the original structured payload is kept in
+    // `extraDetails`.  Prefer that preserved payload and, when it is absent,
+    // treat an own `extraDetails` property as authoritative even when its
+    // value is null.  Falling back to `errorLike.details` in that case wraps
+    // the generated rows in a new "结构化附加信息" row on every re-entry.
+    const hasPreservedDetails = errorLike && typeof errorLike === "object" &&
+      Object.prototype.hasOwnProperty.call(errorLike, "extraDetails");
+    const rawDetails = hasPreservedDetails
+      ? errorLike.extraDetails
+      : errorLike?.details ?? problem.details ?? null;
     const extraDetails = rawDetails && typeof rawDetails === "object" ? sanitizeDetails(rawDetails) : rawDetails;
     const boundaryCode = normalizeCodeValue(
       context.boundaryCode || errorObject.boundary_code || errorObject.boundaryCode || problem.boundary_code ||
@@ -1766,6 +1878,8 @@
     serializeError,
     redactUrl,
     normalizeCode: normalizeCodeValue,
+    normalizeTargetCode,
+    readBoundedResponseText,
     isGenericCode,
     isWrapperCode,
     normalizeHttpStatus,

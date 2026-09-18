@@ -1,6 +1,7 @@
-importScripts("build_config.js", "browser_api.js", "error_utils.js", "backend_startup.js", "direct_translator.js");
+importScripts("build_config.js", "browser_api.js", "error_utils.js", "background_contracts.js", "backend_startup.js", "direct_translator.js");
 
 const extensionApi = globalThis.Echo360ExtensionApi;
+const backgroundContracts = globalThis.Echo360BackgroundContracts;
 const buildConfig = globalThis.Echo360BuildConfig || {};
 const STORAGE_KEY = "echo360TranslatorConfig";
 const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
@@ -9,8 +10,14 @@ const DIRECT_CACHE_KEY = "echo360DirectTranslateCache";
 const DIRECT_CACHE_SCHEMA = 3;
 const DIRECT_CACHE_MAX_ENTRIES = 10;
 const DIRECT_CACHE_MAX_CHARS = 5_000_000;
+const MAX_TEXT_RESOURCE_BYTES = 5_000_000;
+const TEXT_RESOURCE_TIMEOUT_MS = 20_000;
+const MAX_BACKEND_RESPONSE_BYTES = 64 * 1024 * 1024;
+const BACKEND_REQUEST_TIMEOUT_MS = 30_000;
+const BACKEND_SYNC_TRANSLATE_TIMEOUT_MS = 9 * 60 * 1000;
 const DIRECT_JOB_TTL_MS = 60 * 60 * 1000;
 const DIRECT_JOB_MAX_COUNT = 100;
+const DIRECT_JOB_MAX_ACTIVE_COUNT = 4;
 const directJobs = new Map();
 const INSTRUCTURE_MEDIA_HOST_RE = /(^|\.)instructuremedia\.com$/i;
 const SUPPORTED_PROVIDER_CODES_BG = new Set(["google-web", "deepl", "azure", "openai", "deepseek", "gemini", "argos", "custom-backend"]);
@@ -18,6 +25,7 @@ const SUPPORTED_TARGET_CODES_BG = globalThis.Echo360Translator?.errorUtils?.SUPP
   "ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE",
   "ES", "IT", "PT", "RU", "AR", "HI",
 ]);
+const normalizeTargetCodeBG = backgroundContracts.normalizeTargetCode;
 
 const DIRECT_LOG_TAG = "[echo360-translator][background]";
 const ARGOS_BACKEND_LAUNCH_URL = "echo360-subtitle-backend://start";
@@ -481,8 +489,7 @@ function validateDirectTranslationResult(result, payload) {
 function isAllowedTextResourceUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
-    return (url.protocol === "http:" || url.protocol === "https:") &&
-      INSTRUCTURE_MEDIA_HOST_RE.test(url.hostname);
+    return url.protocol === "https:" && INSTRUCTURE_MEDIA_HOST_RE.test(url.hostname);
   } catch (_) {
     return false;
   }
@@ -538,7 +545,7 @@ function ensureArgosBackend(rawBackendUrl) {
   return argosBackendStartup.ensure(rawBackendUrl);
 }
 
-async function fetchAllowedTextResource(rawUrl) {
+async function fetchAllowedTextResource(rawUrl, requestedTimeoutMs = TEXT_RESOURCE_TIMEOUT_MS) {
   if (!isAllowedTextResourceUrl(rawUrl)) {
     return backgroundErrorResponse(
       Object.assign(new Error("字幕资源地址不在允许的 Instructure Media 站点范围内"), { code: "RESOURCE_HOST_NOT_ALLOWED" }),
@@ -546,9 +553,15 @@ async function fetchAllowedTextResource(rawUrl) {
       "RESOURCE_HOST_NOT_ALLOWED"
     );
   }
+  const timeoutMs = Math.max(1, Math.min(TEXT_RESOURCE_TIMEOUT_MS, Number(requestedTimeoutMs) || TEXT_RESOURCE_TIMEOUT_MS));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(rawUrl, { credentials: "include" });
-    const text = await resp.text();
+    const resp = await fetch(rawUrl, {
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
     if (!resp.ok) {
       return backgroundErrorResponse(
         Object.assign(new Error(`字幕资源请求返回 HTTP ${resp.status}`), {
@@ -559,6 +572,10 @@ async function fetchAllowedTextResource(rawUrl) {
         `HTTP_${resp.status}`
       );
     }
+    const text = await globalThis.Echo360Translator.errorUtils.readBoundedResponseText(
+      resp,
+      MAX_TEXT_RESOURCE_BYTES,
+    );
     if (!text.trim()) {
       return backgroundErrorResponse(
         Object.assign(new Error("字幕资源返回空内容"), { code: "EMPTY_VTT", status: resp.status }),
@@ -569,6 +586,8 @@ async function fetchAllowedTextResource(rawUrl) {
     return { ok: true, data: { text, status: resp.status } };
   } catch (err) {
     return backgroundErrorResponse(err, { phase: "source" }, "RESOURCE_NETWORK_ERROR");
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -656,7 +675,7 @@ function normalizeDirectRequestPayload(rawPayload) {
     }
     return rawPayload[field].trim();
   };
-  const readNumber = (field, fallback, { integer = false, min = 0, allowNull = false } = {}) => {
+  const readNumber = (field, fallback, { integer = false, min = 0, max = Number.POSITIVE_INFINITY, allowNull = false } = {}) => {
     const hasField = Object.prototype.hasOwnProperty.call(rawPayload, field);
     const raw = hasField ? rawPayload[field] : undefined;
     if (!hasField || raw == null || (allowNull && raw === "")) return fallback;
@@ -669,12 +688,12 @@ function normalizeDirectRequestPayload(rawPayload) {
       });
     }
     const value = Number(raw);
-    if (!Number.isFinite(value) || (integer && !Number.isInteger(value)) || value < min) {
-      throw Object.assign(new Error(`${field} 必须是大于等于 ${min} 的${integer ? "整数" : "有限数字"}`), {
+    if (!Number.isFinite(value) || (integer && !Number.isInteger(value)) || value < min || value > max) {
+      throw Object.assign(new Error(`${field} 必须是 ${min} 到 ${max} 范围内的${integer ? "整数" : "有限数字"}`), {
         code: "INVALID_REQUEST",
         status: 400,
         phase: "config",
-        details: { field, reason: "out_of_range", value: raw, integer, min },
+        details: { field, reason: "out_of_range", value: raw, integer, min, max },
       });
     }
     return value;
@@ -702,7 +721,7 @@ function normalizeDirectRequestPayload(rawPayload) {
       details: { field: "provider", value: provider, allowed: Array.from(SUPPORTED_PROVIDER_CODES_BG).sort() },
     });
   }
-  const target = readString("target", "ZH").toUpperCase();
+  const target = normalizeTargetCodeBG(readString("target", "ZH"));
   if (!SUPPORTED_TARGET_CODES_BG.has(target)) {
     throw Object.assign(new Error(`不支持的目标语言代码：${target}`), {
       code: "UNSUPPORTED_TARGET_LANGUAGE",
@@ -755,14 +774,14 @@ function normalizeDirectRequestPayload(rawPayload) {
     deepl_formality: readOptionalString("deepl_formality"),
     azure_region: readOptionalString("azure_region"),
     fallback_mode: fallbackMode,
-    max_paragraphs: readNumber("max_paragraphs", 6, { integer: true, min: 0 }),
-    max_chars: readNumber("max_chars", 1200, { integer: true, min: 0 }),
-    concurrency: readNumber("concurrency", 96, { integer: true, min: 1 }),
-    rps: readNumber("rps", 0, { min: 0 }),
-    retries: readNumber("retries", 1, { integer: true, min: 0 }),
-    timeout: readNumber("timeout", null, { min: 1, allowNull: true }),
-    repair_concurrency: readNumber("repair_concurrency", 1, { integer: true, min: 1 }),
-    slow_split_threshold: readNumber("slow_split_threshold", 0, { min: 0 }),
+    max_paragraphs: readNumber("max_paragraphs", 6, { integer: true, min: 0, max: 10_000 }),
+    max_chars: readNumber("max_chars", 1200, { integer: true, min: 0, max: 100_000 }),
+    concurrency: readNumber("concurrency", 96, { integer: true, min: 1, max: 256 }),
+    rps: readNumber("rps", 0, { min: 0, max: 1_000 }),
+    retries: readNumber("retries", 1, { integer: true, min: 0, max: 10 }),
+    timeout: readNumber("timeout", null, { min: 1, max: 600, allowNull: true }),
+    repair_concurrency: readNumber("repair_concurrency", 1, { integer: true, min: 1, max: 64 }),
+    slow_split_threshold: readNumber("slow_split_threshold", 0, { min: 0, max: 3_600 }),
     bilingual: readBoolean("bilingual", false),
     force_refresh: readBoolean("force_refresh", false),
   };
@@ -772,6 +791,14 @@ function normalizeDirectRequestPayload(rawPayload) {
       status: 422,
       phase: "source",
       details: { field: "vtt_text", reason: "required_non_empty_string" },
+    });
+  }
+  if (normalized.vtt_text.length > DIRECT_CACHE_MAX_CHARS) {
+    throw Object.assign(new Error("vtt_text 超过允许的大小限制"), {
+      code: "REQUEST_TOO_LARGE",
+      status: 413,
+      phase: "source",
+      details: { field: "vtt_text", maxChars: DIRECT_CACHE_MAX_CHARS },
     });
   }
   return normalized;
@@ -945,6 +972,17 @@ async function resolveApiKey(provider) {
 }
 
 function createDirectJob(payload) {
+  const activeJobs = Array.from(directJobs.values())
+    .filter((job) => job.status === "queued" || job.status === "running").length;
+  if (activeJobs >= DIRECT_JOB_MAX_ACTIVE_COUNT) {
+    throw Object.assign(new Error(`扩展后台翻译任务已达到并发上限（${DIRECT_JOB_MAX_ACTIVE_COUNT}）`), {
+      code: "TOO_MANY_ACTIVE_JOBS",
+      status: 429,
+      retryable: true,
+      phase: "backend",
+      details: { activeJobs, limit: DIRECT_JOB_MAX_ACTIVE_COUNT },
+    });
+  }
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const initialTotal = countTranslatableLines(payload.vtt_text || "");
   const job = {
@@ -1227,15 +1265,47 @@ async function proxyBackendRequest(message) {
     const base = parsedBase.toString().replace(/\/+$/, "");
     const path = message.type === "proxy-translate" ? "/translate" : (message.path || "/health");
     const method = message.type === "proxy-translate" ? "POST" : (message.method || "GET");
-    const headers = { "Content-Type": "application/json", ...(message.headers || {}) };
-    const init = { method, headers };
+    const allowedRoute = backgroundContracts.isAllowedProxyRoute(path, method);
+    if (!allowedRoute) {
+      return backgroundErrorResponse(
+        Object.assign(new Error("后端代理只允许固定的健康检查与翻译协议路径"), {
+          code: "BACKEND_ROUTE_NOT_ALLOWED",
+          status: 400,
+          details: { path, method },
+        }),
+        { phase: "backend" },
+        "BACKEND_ROUTE_NOT_ALLOWED"
+      );
+    }
+    const headers = { "Content-Type": "application/json" };
+    const controller = new AbortController();
+    const requestTimeoutMs = path === "/translate"
+      ? BACKEND_SYNC_TRANSLATE_TIMEOUT_MS
+      : BACKEND_REQUEST_TIMEOUT_MS;
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+    const init = { method, headers, cache: "no-store", signal: controller.signal };
     if (message.payload != null) {
       const payload = normalizeDirectRequestPayload(message.payload);
       const api_key = await resolveApiKey(payload.provider);
       init.body = JSON.stringify({ ...payload, api_key });
     }
-    const resp = await fetch(`${base}${path}`, init);
-    const text = await resp.text();
+    let resp;
+    let text;
+    try {
+      resp = await fetch(`${base}${path}`, init);
+      text = await globalThis.Echo360Translator.errorUtils.readBoundedResponseText(
+        resp,
+        MAX_BACKEND_RESPONSE_BYTES,
+        {
+          code: "BACKEND_RESPONSE_TOO_LARGE",
+          status: 502,
+          phase: "backend",
+          message: `Backend response exceeded ${MAX_BACKEND_RESPONSE_BYTES} bytes`,
+        },
+      );
+    } finally {
+      clearTimeout(timer);
+    }
     if (!resp.ok) {
       let problem = null;
       try { problem = JSON.parse(text); } catch (_) {}
@@ -1294,6 +1364,12 @@ async function proxyBackendRequest(message) {
     }
     return { ok: true, data };
   } catch (err) {
+    if (err?.name === "AbortError") {
+      err.code = "BACKEND_REQUEST_TIMEOUT";
+      err.status = 504;
+      err.phase = "backend";
+      err.message = "Backend request timed out";
+    }
     const serialized = serializeBackgroundError(err, { phase: "backend" });
     const boundaryCode = serialized.code === "NETWORK_ERROR"
       ? "BACKEND_NETWORK_ERROR"
@@ -1330,7 +1406,15 @@ async function proxyBackendRequest(message) {
   }
 }
 
-extensionApi.runtime.addOnMessageListener(async (message) => {
+extensionApi.runtime.addOnMessageListener(async (message, sender) => {
+  const expectedSenderId = extensionApi.raw?.runtime?.id;
+  if (!backgroundContracts.isTrustedRuntimeSender(expectedSenderId, sender)) {
+    return backgroundErrorResponse(
+      Object.assign(new Error("拒绝来自其他扩展或未知上下文的消息"), { code: "UNTRUSTED_MESSAGE_SENDER", status: 403 }),
+      { phase: "backend" },
+      "UNTRUSTED_MESSAGE_SENDER"
+    );
+  }
   if (!message || typeof message !== "object") {
     return backgroundErrorResponse(
       Object.assign(new Error("扩展收到空消息或无效消息对象"), { code: "INVALID_REQUEST", status: 400 }),
@@ -1340,7 +1424,7 @@ extensionApi.runtime.addOnMessageListener(async (message) => {
   }
 
   if (message.type === "fetch-text-resource") {
-    return fetchAllowedTextResource(message.url);
+    return fetchAllowedTextResource(message.url, message.timeoutMs);
   }
 
   if (message.type === "direct-translate-async") {

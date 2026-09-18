@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import deque
+import copy
 from functools import lru_cache
 import os
+import signal
 import sys
 import subprocess
 import tempfile
@@ -30,6 +33,31 @@ DEFAULT_TRANSLATOR_SCRIPT = Path(__file__).resolve().parent.parent / "translator
 TRANSLATOR_SCRIPT = Path(os.getenv("TRANSLATOR_SCRIPT", str(DEFAULT_TRANSLATOR_SCRIPT)))
 JOB_TTL_SECONDS = 60 * 60
 JOB_MAX_COUNT = 100
+JOB_MAX_ACTIVE_COUNT = 4
+MAX_VTT_CHARS = 5_000_000
+MAX_TRANSLATOR_OUTPUT_BYTES = 64 * 1024 * 1024
+TRANSLATOR_HELP_TIMEOUT_SECONDS = 10
+
+
+def bounded_timeout_from_env(name: str, default: float) -> float:
+    """Read a positive process deadline without allowing an unbounded value."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not (value > 0):
+        return default
+    # The extension polls backend jobs for nine minutes. Keep the process
+    # deadline at or below eight minutes so termination and the typed error
+    # always fit inside the client contract.
+    return min(max(value, 30.0), 8 * 60.0)
+
+
+TRANSLATOR_TASK_TIMEOUT_SECONDS = bounded_timeout_from_env(
+    "TRANSLATOR_TASK_TIMEOUT_SECONDS",
+    8 * 60,
+)
+TRANSLATOR_TERMINATE_GRACE_SECONDS = 5
 KEYLESS_PROVIDERS = {"google-web", "argos"}
 CJK_TARGET_CODES = {"ZH", "ZH-HK", "YUE", "CANTONESE"}
 SUPPORTED_TARGET_CODES = {
@@ -39,6 +67,7 @@ SUPPORTED_TARGET_CODES = {
 FALLBACK_MODES = {"immediate", "deferred", "deferred-fastpath"}
 DEEPL_UNSUPPORTED_TARGET_CODES = {"YUE", "CANTONESE"}
 ARGOS_UNSUPPORTED_TARGET_CODES = {"YUE", "CANTONESE", "EN"}
+TARGET_CODE_ALIASES = {"CANTONESE": "YUE"}
 CORS_ORIGIN_PATTERN = (
     r"^(?:"
     r"(?:chrome-extension|moz-extension|safari-web-extension)://[A-Za-z0-9._-]+|"
@@ -49,9 +78,9 @@ CORS_ORIGIN_PATTERN = (
     r")$"
 )
 WEB_PROVIDER_LIMITS = {
-    # Cap Google Web at half of the former 96-worker profile. rps=0 means no
-    # default pacing; max_paragraphs=1 remains an incremental-display choice.
-    "google-web": {"concurrency": 48, "rps": 0.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
+    # The undocumented Google Web endpoint gets one shared conservative
+    # profile; max_paragraphs=1 remains an incremental-display choice.
+    "google-web": {"concurrency": 3, "rps": 3.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
     # Argos runs in the translator subprocess and uses English as the source.
     # A single worker avoids loading/contending on the same CTranslate2 model
     # from multiple Python threads.
@@ -59,33 +88,139 @@ WEB_PROVIDER_LIMITS = {
 }
 
 
+def normalize_target_code(target: object = "ZH") -> str:
+    code = str(target or "ZH").strip().upper()
+    return TARGET_CODE_ALIASES.get(code, code)
+
+
+SRT_TIMING_LINE_RE = re.compile(
+    r"^\s*((?:(?:\d{2,}):)?\d{2}:\d{2},\d{3})\s*-->\s*"
+    r"((?:(?:\d{2,}):)?\d{2}:\d{2},\d{3})(?:\s+.*)?$"
+)
+
+
+def _srt_timing_line(line: object) -> bool:
+    return SRT_TIMING_LINE_RE.fullmatch(str(line or "")) is not None
+
+
+def _srt_to_vtt_timing_line(line: str) -> str:
+    # Rewrite only timestamp tokens. A caption can contain a timestamp example
+    # with a comma, and that text must remain exactly as authored.
+    return re.sub(
+        r"((?:(?:\d{2,}):)?\d{2}:\d{2}),(\d{3})",
+        r"\1.\2",
+        line,
+    )
+
+
+def _is_genuine_srt(value: str) -> bool:
+    """Return whether *value* has the structure of a numbered SRT track.
+
+    A loose ``-->`` search would turn transcript prose or arbitrary text that
+    happens to contain an arrow into WebVTT. Require every nonblank block to
+    contain one valid SRT timing line in the expected first/second position;
+    malformed blocks therefore remain available to the normal source guards.
+    Empty cue bodies are structurally SRT and are deliberately accepted here
+    so ``has_timed_cue_text`` can keep rejecting them with its existing error.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in value.split("\n"):
+        if not line.strip():
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+    if not blocks:
+        return False
+
+    for block in blocks:
+        if _srt_timing_line(block[0]):
+            timing_index = 0
+        elif len(block) >= 2 and block[0].strip().isdigit() and _srt_timing_line(block[1]):
+            timing_index = 1
+        else:
+            return False
+
+        converted_timing = _srt_to_vtt_timing_line(block[timing_index])
+        # This lookup is intentionally deferred until invocation: the VTT
+        # parser is defined below the request model in this module.
+        if parse_vtt_timing_line(converted_timing) is None:
+            return False
+        # A second SRT timing line without a separating blank would otherwise
+        # be swallowed as caption text and make malformed input look valid.
+        if any(_srt_timing_line(line) for line in block[timing_index + 1:]):
+            return False
+    return True
+
+
+def normalize_timed_text(text: str) -> str:
+    """Normalize a genuine SRT source to the WebVTT consumed by translation.
+
+    Existing WebVTT and invalid/transcript input are left untouched so the
+    established validation path can issue the same typed source error. Only
+    comma-based SRT timing lines are rewritten; caption text, cue identifiers,
+    timing values, and cue order are preserved.
+    """
+    if not isinstance(text, str):
+        return text
+    value = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").strip()
+    if not value or re.match(r"^WEBVTT(?:\s|$)", value, re.IGNORECASE):
+        return text
+    if not _is_genuine_srt(value):
+        return text
+    lines = [
+        _srt_to_vtt_timing_line(line) if _srt_timing_line(line) else line
+        for line in value.split("\n")
+    ]
+    return "\n".join(["WEBVTT", "", *lines])
+
+
+def normalize_request_timed_text(req: "TranslateRequest") -> None:
+    """Apply source normalization to a request before any work is counted."""
+    normalized = normalize_timed_text(req.vtt_text)
+    if normalized != req.vtt_text:
+        req.vtt_text = normalized
+
+
 class TranslateRequest(BaseModel):
-    vtt_text: str = Field(..., min_length=1)
-    api_key: str = ""
+    vtt_text: str = Field(..., min_length=1, max_length=MAX_VTT_CHARS)
+    api_key: str = Field("", max_length=16_384)
     # Keep the backend's omitted-field behavior aligned with the extension's
     # first-install configuration.  The browser normally sends this field,
     # but direct/API callers and older clients may omit it.
-    provider: str = "google-web"
-    model: str = ""
-    endpoint: str = ""
-    target: str = "ZH"
-    max_paragraphs: int = Field(6, ge=0)
-    max_chars: int = Field(1200, ge=0)
-    concurrency: int = Field(96, ge=1)
-    rps: float = Field(0.0, ge=0)
-    retries: int = Field(1, ge=0)
+    provider: str = Field("google-web", max_length=64)
+    model: str = Field("", max_length=512)
+    endpoint: str = Field("", max_length=4_096)
+    target: str = Field("ZH", max_length=32)
+    max_paragraphs: int = Field(6, ge=0, le=10_000)
+    max_chars: int = Field(1200, ge=0, le=100_000)
+    concurrency: int = Field(96, ge=1, le=256)
+    rps: float = Field(0.0, ge=0, le=1_000)
+    retries: int = Field(1, ge=0, le=10)
     bilingual: bool = False
-    # Pydantic evaluates model-field annotations at class creation time.
-    # Optional keeps this entrypoint importable on macOS's Python 3.9; the
-    # newer ``T | None`` spelling is safe for ordinary deferred annotations
-    # below, but Pydantic cannot backport it without an extra dependency.
-    timeout: Optional[int] = Field(None, ge=1)
-    reasoning_effort: Optional[str] = None
-    deepseek_thinking_mode: str = "disabled"
-    deepl_formality: str = ""
-    fallback_mode: str = "immediate"
-    repair_concurrency: int = Field(1, ge=1)
-    slow_split_threshold: float = Field(0.0, ge=0)
+    # Keep Optional spelling compatible with the full supported Python 3.10+
+    # matrix and with both Pydantic validation paths used by packaged builds.
+    timeout: Optional[int] = Field(None, ge=1, le=600)
+    reasoning_effort: Optional[str] = Field(None, max_length=64)
+    deepseek_thinking_mode: str = Field("disabled", max_length=64)
+    deepl_formality: str = Field("", max_length=64)
+    fallback_mode: str = Field("immediate", max_length=64)
+    repair_concurrency: int = Field(1, ge=1, le=64)
+    slow_split_threshold: float = Field(0.0, ge=0, le=3_600)
+
+    def __init__(self, **data):
+        # Normalize at model construction so sync and async routes, including
+        # the async worker's initial progress count, share one input format.
+        # Keep non-string values for Pydantic to validate instead of coercing
+        # malformed requests in this compatibility shim.
+        if isinstance(data.get("vtt_text"), str):
+            data = dict(data)
+            data["vtt_text"] = normalize_timed_text(data["vtt_text"])
+        super().__init__(**data)
 
 
 class TranslateAsyncRequest(TranslateRequest):
@@ -97,6 +232,7 @@ logger = logging.getLogger("echo360-translator")
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]\s+Translating")
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+_translation_slots = threading.BoundedSemaphore(JOB_MAX_ACTIVE_COUNT)
 
 ERROR_TITLES = {
     "INVALID_REQUEST": "翻译请求参数无效",
@@ -105,18 +241,23 @@ ERROR_TITLES = {
     "EMPTY_TRANSLATABLE_VTT": "字幕中没有可翻译文本",
     "UNSUPPORTED_PROVIDER": "翻译服务不受支持",
     "UNSUPPORTED_TARGET_LANGUAGE": "目标语言不受支持",
+    "PROVIDER_CONFIG_ERROR": "翻译服务配置无效",
     "PROVIDER_API_KEY_MISSING": "缺少翻译服务 API Key",
     "ARGOS_DEPENDENCY_MISSING": "缺少 Argos Translate 运行依赖",
     "ARGOS_MODEL_MISSING": "缺少 Argos 翻译模型",
     "INVALID_REASONING_EFFORT": "Reasoning Effort 配置无效",
     "JOB_NOT_FOUND": "后台翻译任务不存在",
+    "JOB_START_FAILED": "后台翻译任务无法启动",
+    "TOO_MANY_ACTIVE_JOBS": "后台翻译任务过多",
     "TRANSLATOR_PROCESS_FAILED": "本地翻译进程失败",
+    "TRANSLATOR_PROCESS_TIMEOUT": "本地翻译进程超时",
     "TRANSLATOR_INPUT_WRITE_FAILED": "翻译输入文件写入失败",
     "TRANSLATOR_INPUT_MISSING": "翻译输入文件不存在",
     "TRANSLATOR_INPUT_READ_FAILED": "翻译输入文件读取失败",
     "TRANSLATOR_OUTPUT_WRITE_FAILED": "翻译结果文件写入失败",
     "TRANSLATOR_PROGRESS_WRITE_FAILED": "翻译进度文件写入失败",
     "TRANSLATOR_OUTPUT_READ_FAILED": "翻译结果文件读取失败",
+    "TRANSLATOR_OUTPUT_TOO_LARGE": "翻译结果超过大小限制",
     "TRANSLATOR_SUMMARY_MISSING": "翻译进程没有提供结果摘要",
     "TRANSLATOR_SUMMARY_INVALID": "翻译进程结果摘要损坏",
     "INCONSISTENT_TRANSLATION_RESULT": "翻译结果与统计不一致",
@@ -502,6 +643,7 @@ def get_supported_args() -> set[str]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=TRANSLATOR_HELP_TIMEOUT_SECONDS,
         )
     except Exception:
         return set()
@@ -603,7 +745,7 @@ def build_translator_args(
         "--model",
         req.model,
         "--target",
-        req.target,
+        normalize_target_code(req.target),
         "--max-paragraphs",
         str(max_paragraphs),
         "--max-chars",
@@ -657,7 +799,7 @@ def build_translator_args(
 
 def build_cache_key(vtt_text: str, req: TranslateRequest) -> str:
     provider = str(req.provider or "").strip().lower()
-    target = str(req.target or "ZH").strip().upper()
+    target = normalize_target_code(req.target)
     model = str(req.model or "").strip()
     endpoint = str(req.endpoint or "").strip()
     reasoning_effort = str(req.reasoning_effort or "").strip().lower() or None
@@ -752,12 +894,13 @@ def translatable_line_count(text: str) -> int:
 
 def is_translatable_vtt_line(raw_line: str) -> bool:
     line = str(raw_line or "").strip()
-    if not line or re.match(r"^WEBVTT\b", line, re.IGNORECASE):
+    if not line:
         return False
     if parse_vtt_timing_line(line) is not None:
         return False
-    if re.match(r"^(NOTE|STYLE|REGION)\b", line, re.IGNORECASE):
-        return False
+    # This helper is called only while walking the body of a timed cue.
+    # WEBVTT/NOTE/STYLE/REGION are metadata markers only at a block boundary;
+    # inside a cue they are ordinary caption text (for example, "Note ...").
     return True
 
 
@@ -836,9 +979,8 @@ def has_timed_cue_text(text: str) -> bool:
                 break
             if parse_vtt_timing_line(cue_line):
                 break
-            if not re.match(r"^(NOTE|STYLE|REGION)\b", cue_line.strip(), re.IGNORECASE):
-                has_text = True
-                break
+            has_text = True
+            break
         if has_text:
             cue_with_text += 1
     return cue_count > 0 and cue_with_text == cue_count
@@ -1293,17 +1435,80 @@ def translator_error_status(code: str | None) -> int:
     normalized = normalize_translator_process_code(code) or "TRANSLATOR_PROCESS_FAILED"
     if re.fullmatch(r"HTTP_\d{3}", normalized):
         return int(normalized[-3:])
-    if normalized in {"INVALID_REQUEST", "INVALID_SOURCE_VTT", "UNSUPPORTED_PROVIDER", "UNSUPPORTED_TARGET_LANGUAGE", "PROVIDER_API_KEY_MISSING", "INVALID_REASONING_EFFORT"}:
+    if normalized in {"INVALID_REQUEST", "INVALID_SOURCE_VTT", "UNSUPPORTED_PROVIDER", "UNSUPPORTED_TARGET_LANGUAGE", "PROVIDER_CONFIG_ERROR", "PROVIDER_API_KEY_MISSING", "INVALID_REASONING_EFFORT"}:
         return 400
     if normalized == "SOURCE_ALREADY_TRANSLATED":
         return 422
-    if normalized in {"REQUEST_TIMEOUT", "TRANSLATION_TIMEOUT"}:
+    if normalized in {"REQUEST_TIMEOUT", "TRANSLATION_TIMEOUT", "TRANSLATOR_PROCESS_TIMEOUT"}:
         return 504
     if normalized in {"NETWORK_ERROR", "PROVIDER_REQUEST_FAILED", "INVALID_PROVIDER_RESPONSE", "INVALID_PROVIDER_OUTPUT"}:
         return 502
     if normalized in {"ARGOS_DEPENDENCY_MISSING", "ARGOS_MODEL_MISSING"}:
         return 503
     return 500
+
+
+def terminate_translator_process(proc: subprocess.Popen) -> None:
+    """Stop a translator process tree, escalating to a forced reap."""
+    if proc.poll() is not None:
+        return
+    process_group = getattr(proc, "_echo360_process_group", None)
+    try:
+        if process_group == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=TRANSLATOR_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            if process_group == "posix":
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            elif process_group == "windows":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    timeout=TRANSLATOR_TERMINATE_GRACE_SECONDS,
+                )
+            else:
+                proc.kill()
+        except (OSError, subprocess.SubprocessError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=TRANSLATOR_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("translator process did not exit after forced termination pid=%s", getattr(proc, "pid", None))
+
+
+def read_translator_output(path: Path) -> str:
+    """Read a UTF-8 translator artifact without trusting its on-disk size."""
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(MAX_TRANSLATOR_OUTPUT_BYTES + 1)
+    except OSError:
+        logger.exception("could not read translator output file")
+        raise_problem(500, "TRANSLATOR_OUTPUT_READ_FAILED", "无法读取翻译结果文件；请查看本地后端日志", phase="translation")
+    if len(payload) > MAX_TRANSLATOR_OUTPUT_BYTES:
+        raise_problem(
+            502,
+            "TRANSLATOR_OUTPUT_TOO_LARGE",
+            f"翻译进程输出超过 {MAX_TRANSLATOR_OUTPUT_BYTES} 字节安全上限",
+            phase="translation",
+            retryable=False,
+        )
+    try:
+        return payload.decode("utf-8")
+    except UnicodeError:
+        raise_problem(502, "TRANSLATOR_OUTPUT_READ_FAILED", "翻译结果不是有效 UTF-8 文本", phase="translation")
 
 
 def run_translation(
@@ -1313,10 +1518,14 @@ def run_translation(
     progress_callback=None,
 ) -> tuple[str, list[str], bool, dict]:
     warnings: list[str] = []
+    # Keep direct callers and older integrations on the same safe source path
+    # as the HTTP request models. The request model normally already contains
+    # this normalized value, but the local guard is cheap and defensive.
+    vtt_text = normalize_timed_text(vtt_text)
     provider_name = (req.provider or "").strip().lower()
     if provider_name not in {"deepl", "openai", "deepseek", "gemini", "google-web", "argos"}:
         raise_problem(400, "UNSUPPORTED_PROVIDER", f"不支持的 Provider：{req.provider}", phase="config")
-    target_code = str(req.target or "ZH").strip().upper()
+    target_code = normalize_target_code(req.target)
     if target_code not in SUPPORTED_TARGET_CODES:
         raise_problem(
             400,
@@ -1498,32 +1707,70 @@ def run_translation(
                 bufsize=1,
                 env=proc_env,
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                start_new_session=(os.name != "nt"),
             )
-            output_lines: list[str] = []
+            proc._echo360_process_group = "windows" if os.name == "nt" else "posix"
+            # Keep only a bounded diagnostic tail. A noisy child must not grow
+            # the backend process indefinitely while a long job is running.
+            output_lines: deque[str] = deque(maxlen=2_000)
+            timed_out = threading.Event()
+
+            def enforce_process_deadline() -> None:
+                if proc.poll() is not None:
+                    return
+                timed_out.set()
+                logger.error(
+                    "translator exceeded task deadline seconds=%s",
+                    TRANSLATOR_TASK_TIMEOUT_SECONDS,
+                )
+                terminate_translator_process(proc)
+
+            deadline_timer = threading.Timer(
+                TRANSLATOR_TASK_TIMEOUT_SECONDS,
+                enforce_process_deadline,
+            )
+            deadline_timer.daemon = True
+            deadline_timer.start()
             assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip("\n")
-                output_lines.append(line)
-                logger.info("[translator] %s", redact_sensitive_detail(line, 2000))
-                match = PROGRESS_RE.search(line)
-                if match and progress_callback:
-                    partial_vtt = ""
-                    if progress_vtt and progress_vtt.exists():
-                        try:
-                            partial_vtt = progress_vtt.read_text(encoding="utf-8")
-                        except OSError as exc:
-                            logger.warning("could not read partial VTT: %s", exc)
-                    progress_callback(
-                        int(match.group(1)),
-                        int(match.group(2)),
-                        line,
-                        partial_vtt,
-                    )
-            return_code = proc.wait()
+            try:
+                for line in proc.stdout:
+                    line = line.rstrip("\n")
+                    output_lines.append(line)
+                    logger.info("[translator] %s", redact_sensitive_detail(line, 2000))
+                    match = PROGRESS_RE.search(line)
+                    if match and progress_callback:
+                        partial_vtt = ""
+                        if progress_vtt and progress_vtt.exists():
+                            try:
+                                partial_vtt = read_translator_output(progress_vtt)
+                            except HTTPException as exc:
+                                if exc.detail.get("error_code") == "TRANSLATOR_OUTPUT_TOO_LARGE":
+                                    raise
+                                logger.warning("could not read partial VTT: %s", exc)
+                        progress_callback(
+                            int(match.group(1)),
+                            int(match.group(2)),
+                            line,
+                            partial_vtt,
+                        )
+                return_code = proc.wait()
+            finally:
+                deadline_timer.cancel()
+                if proc.poll() is None:
+                    terminate_translator_process(proc)
+            if timed_out.is_set():
+                raise_problem(
+                    504,
+                    "TRANSLATOR_PROCESS_TIMEOUT",
+                    f"本地翻译进程超过 {TRANSLATOR_TASK_TIMEOUT_SECONDS:g} 秒任务期限，已终止",
+                    phase="translation",
+                    retryable=True,
+                )
             if return_code != 0:
                 logger.error("translator failed, returncode=%s", return_code)
-                code = extract_translator_error_code(output_lines) or "TRANSLATOR_PROCESS_FAILED"
-                detail = extract_translator_error_detail(output_lines)
+                captured_output = list(output_lines)
+                code = extract_translator_error_code(captured_output) or "TRANSLATOR_PROCESS_FAILED"
+                detail = extract_translator_error_detail(captured_output)
                 raise_problem(
                     translator_error_status(code),
                     code,
@@ -1544,11 +1791,7 @@ def run_translation(
             raise_problem(500, "TRANSLATOR_OUTPUT_READ_FAILED", "无法检查翻译结果文件；请查看本地后端日志", phase="translation")
         if not output_exists:
             raise_problem(500, "TRANSLATOR_OUTPUT_MISSING", "翻译进程结束了，但没有生成 translated VTT 文件", phase="translation")
-        try:
-            translated_vtt = out_vtt.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            logger.exception("could not read translator output file")
-            raise_problem(500, "TRANSLATOR_OUTPUT_READ_FAILED", "无法读取翻译结果文件；请查看本地后端日志", phase="translation")
+        translated_vtt = read_translator_output(out_vtt)
         source_cues = timed_cue_count(vtt_text)
         translated_cues = timed_cue_count(translated_vtt)
         if not is_valid_timed_vtt(translated_vtt) or not has_timed_cue_text(translated_vtt):
@@ -1907,7 +2150,7 @@ def run_translation(
             metrics["failureCodes"] = failure_codes
             result_error_code = no_result_failure_code(
                 provider_name,
-                str(req.target or "ZH").upper(),
+                normalize_target_code(req.target),
                 failure_codes,
                 failed,
                 provider_results,
@@ -1928,7 +2171,20 @@ def run_translation(
             warnings.append(f"PARTIAL_TRANSLATION: {failed}/{total} 条字幕保留原文，结果不会写入缓存")
         if failed == 0:
             try:
-                cache_file.write_text(translated_vtt, encoding="utf-8")
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary_cache = cache_file.with_name(f".{cache_file.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    temporary_cache.write_text(translated_vtt, encoding="utf-8")
+                    try:
+                        temporary_cache.chmod(0o600)
+                    except OSError:
+                        pass
+                    os.replace(temporary_cache, cache_file)
+                finally:
+                    try:
+                        temporary_cache.unlink()
+                    except OSError:
+                        pass
             except OSError as exc:
                 warnings.append("CACHE_WRITE_FAILED: 翻译结果有效，但本地缓存保存失败")
                 logger.warning("translation succeeded but cache write failed file=%s: %s", cache_file, exc)
@@ -1964,11 +2220,25 @@ def health() -> dict:
 
 @app.post("/translate")
 def translate(req: TranslateRequest) -> dict:
-    translated_vtt, warnings, cache_hit, metrics = run_translation(req.vtt_text, req)
-    return {"translated_vtt": translated_vtt, "warnings": warnings, "metrics": metrics, "cache_hit": cache_hit}
+    normalize_request_timed_text(req)
+    if not _translation_slots.acquire(blocking=False):
+        raise_problem(
+            429,
+            "TOO_MANY_ACTIVE_JOBS",
+            f"翻译进程已达到全局并发上限（{JOB_MAX_ACTIVE_COUNT}）",
+            phase="backend",
+            retryable=True,
+            details={"limit": JOB_MAX_ACTIVE_COUNT},
+        )
+    try:
+        translated_vtt, warnings, cache_hit, metrics = run_translation(req.vtt_text, req)
+        return {"translated_vtt": translated_vtt, "warnings": warnings, "metrics": metrics, "cache_hit": cache_hit}
+    finally:
+        _translation_slots.release()
 
 
 def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
+    normalize_request_timed_text(req)
     logger.info(
         "[job %s] started provider=%s target=%s requested_concurrency=%s requested_rps=%s retries=%s",
         job_id,
@@ -1978,12 +2248,6 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
         req.rps,
         req.retries,
     )
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if job:
-            job["status"] = "running"
-            job["updated_at"] = int(time.time())
-
     def on_progress(current: int, total: int, line: str, partial_vtt: str = "") -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
@@ -1996,7 +2260,16 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             job["updated_at"] = int(time.time())
         logger.info("[job %s] progress current=%s total=%s", job_id, current, total)
 
+    slot_acquired = False
     try:
+        _translation_slots.acquire()
+        slot_acquired = True
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if not job:
+                return
+            job["status"] = "running"
+            job["updated_at"] = int(time.time())
         translated_vtt, warnings, cache_hit, metrics = run_translation(
             req.vtt_text,
             req,
@@ -2055,10 +2328,14 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             status_code,
             str(error_text).replace("\n", " ")[:320],
         )
+    finally:
+        if slot_acquired:
+            _translation_slots.release()
 
 
 @app.post("/translate-async")
 def translate_async(req: TranslateAsyncRequest) -> dict:
+    normalize_request_timed_text(req)
     job_id = uuid.uuid4().hex
     # Publish the known work size before the worker imports/loads the
     # translator (Argos model startup can take noticeably longer on Windows).
@@ -2067,6 +2344,19 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
     initial_total = translatable_line_count(req.vtt_text)
     with _jobs_lock:
         cleanup_jobs_locked()
+        active_jobs = sum(
+            1 for job in _jobs.values()
+            if job.get("status") in {"queued", "running"}
+        )
+        if active_jobs >= JOB_MAX_ACTIVE_COUNT:
+            raise_problem(
+                429,
+                "TOO_MANY_ACTIVE_JOBS",
+                f"后台翻译任务已达到并发上限（{JOB_MAX_ACTIVE_COUNT}）",
+                phase="backend",
+                retryable=True,
+                details={"activeJobs": active_jobs, "limit": JOB_MAX_ACTIVE_COUNT},
+            )
         _jobs[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -2090,7 +2380,34 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
             "updated_at": int(time.time()),
         }
     worker = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except Exception as exc:
+        problem = problem_payload(
+            503,
+            "JOB_START_FAILED",
+            "后台翻译工作线程无法启动",
+            phase="backend",
+            instance=f"/translate-async/{job_id}",
+            retryable=True,
+            details={"cause": type(exc).__name__},
+        )
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["status"] = "failed"
+                job["error"] = "后台翻译工作线程无法启动"
+                job["error_code"] = "JOB_START_FAILED"
+                job["status_code"] = 503
+                job["error_detail"] = problem
+                job["updated_at"] = int(time.time())
+        raise_problem(
+            503,
+            "JOB_START_FAILED",
+            "后台翻译工作线程无法启动",
+            phase="backend",
+            retryable=True,
+        )
     return {"job_id": job_id}
 
 
@@ -2101,4 +2418,7 @@ def translate_async_status(job_id: str) -> dict:
         job = _jobs.get(job_id)
         if not job:
             raise_problem(404, "JOB_NOT_FOUND", "后台翻译任务不存在或已被清理", phase="backend", retryable=False)
-        return job
+        # FastAPI serializes after this function returns. Return an isolated
+        # snapshot so the worker cannot mutate nested progress/result objects
+        # while the response encoder is iterating over them.
+        return copy.deepcopy(job)

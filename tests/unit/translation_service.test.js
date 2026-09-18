@@ -80,7 +80,8 @@ describe("resolveSourceVtt", () => {
     const result = await svc.resolveSourceVtt({});
 
     expect(sourceFinderMock.fetchTextResource).toHaveBeenCalledWith(
-      "https://apse2.nv.instructuremedia.com/captions/source.vtt"
+      "https://apse2.nv.instructuremedia.com/captions/source.vtt",
+      expect.objectContaining({ deadlineAt: expect.any(Number) })
     );
     expect(result.vttText).toContain("Hi");
   });
@@ -98,6 +99,16 @@ describe("resolveSourceVtt", () => {
     expect(result.vttText).toContain("Hi");
     expect(result.sourceMeta.mapSource).toBe("transcript-file");
     expect(sourceFinderMock.fetchBestVttFromCandidates).not.toHaveBeenCalled();
+  });
+
+  it("normalizes raw SRT returned by a source adapter before shared validation", async () => {
+    sourceFinderMock.fetchTranscriptFileVtt.mockResolvedValue({
+      text: "1\n00:00:02,720 --> 00:00:06,590\nCaption\n",
+      sourceId: "https://example.com/caption_files/source",
+    });
+    const result = await svc.resolveSourceVtt({});
+    expect(result.vttText).toBe("WEBVTT\n\n1\n00:00:02.720 --> 00:00:06.590\nCaption");
+    expect(backendClientMock.validateSourceVtt).toHaveBeenCalledWith(result.vttText, "source");
   });
 
   it("falls back to the generic candidate scan when the transcript-file API finds nothing (e.g. institution doesn't expose it)", async () => {
@@ -196,6 +207,11 @@ describe("resolveSourceVtt", () => {
 });
 
 describe("buildTranslatePayload", () => {
+  it("normalizes raw SRT before sending it to any translation provider", () => {
+    const payload = svc.buildTranslatePayload({ provider: "argos", target: "ZH" },
+      "1\n00:00:02,720 --> 00:00:06,590\nOriginal caption\n", false);
+    expect(payload.vtt_text).toBe("WEBVTT\n\n1\n00:00:02.720 --> 00:00:06.590\nOriginal caption");
+  });
   it("rejects a missing source instead of emitting vtt_text: undefined", () => {
     expect(() => svc.buildTranslatePayload({ provider: "argos", target: "ZH" }, undefined, false))
       .toThrowError(expect.objectContaining({
@@ -455,6 +471,427 @@ describe("translateWithConfig (store build)", () => {
     } finally {
       window.Echo360Translator.buildConfig.enableLocalBackend = false;
     }
+  });
+
+  it("allocates cue work deterministically according to mixed-provider weights", () => {
+    const units = Array.from({ length: 10 }, (_, index) => ({ index }));
+    const groups = svc.allocateMixedUnits(units, [
+      { provider: "google-web", weight: 70 },
+      { provider: "deepl", weight: 30 },
+    ]);
+    expect(Object.fromEntries(groups.map((group) => [group.provider, group.units.length])))
+      .toEqual({ "google-web": 7, deepl: 3 });
+    expect(groups.flatMap((group) => group.units).map((unit) => unit.index).sort((a, b) => a - b))
+      .toEqual(Array.from({ length: 10 }, (_, index) => index));
+  });
+
+  it("runs mixed providers in parallel and reassigns a failed shard to a healthy provider", async () => {
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `mixed-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId) => {
+      const childPayload = jobs.get(jobId);
+      if (childPayload.provider === "google-web") {
+        throw Object.assign(new Error("temporary upstream failure"), { code: "HTTP_503", status: 503 });
+      }
+      const translated = childPayload.vtt_text.replace(/Hello (\d+)/g, "中文$1");
+      return { translated_vtt: translated, warnings: [], failed_items: [], metrics: {} };
+    });
+
+    const source = [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "Hello 1", "",
+      "00:00:01.000 --> 00:00:02.000", "Hello 2", "",
+      "00:00:02.000 --> 00:00:03.000", "Hello 3", "",
+      "00:00:03.000 --> 00:00:04.000", "Hello 4", "",
+    ].join("\n");
+    const onPartialVtt = vi.fn();
+    const result = await svc.translateWithConfig(
+      {
+        provider: "mixed",
+        mixedProviders: [
+          { provider: "google-web", weight: 50, enabled: true },
+          { provider: "deepl", weight: 50, enabled: true },
+        ],
+      },
+      "http://127.0.0.1:8765",
+      {
+        provider: "mixed",
+        target: "ZH",
+        vtt_text: source,
+        mixed_providers: [
+          { provider: "google-web", weight: 50, enabled: true },
+          { provider: "deepl", weight: 50, enabled: true },
+        ],
+      },
+      { onPartialVtt }
+    );
+
+    expect(backendClientMock.createDirectTranslateJob).toHaveBeenCalledTimes(3);
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+      .toEqual(expect.arrayContaining(["google-web", "deepl", "deepl"]));
+    expect(result.translated_vtt).toContain("中文1");
+    expect(result.translated_vtt).toContain("中文4");
+    expect(result.warnings.join(" ")).toContain("接管并完成");
+    expect(result.metrics).toMatchObject({
+      provider: "mixed",
+      total: 4,
+      processed: 4,
+      translated: 4,
+      failed: 0,
+      providerResults: 4,
+    });
+    expect(onPartialVtt).toHaveBeenCalled();
+  });
+
+  it("keeps successful cues from a partial provider result and reassigns only failed cues", async () => {
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `partial-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId) => {
+      const childPayload = jobs.get(jobId);
+      if (childPayload.provider === "google-web") {
+        return {
+          translated_vtt: childPayload.vtt_text.replace("Hello 2", "中文2"),
+          warnings: ["one cue failed"],
+          failed_items: [{ cue: 2, line: 7, code: "HTTP_429", status: 429, message: "rate limited" }],
+          failure_codes: { HTTP_429: 1 },
+          metrics: { total: 2, processed: 2, translated: 1, failed: 1, providerResults: 1, targetResults: 1 },
+        };
+      }
+      return {
+        translated_vtt: childPayload.vtt_text.replace(/Hello (\d+)/g, "中文$1"),
+        warnings: [],
+        failed_items: [],
+        metrics: {},
+      };
+    });
+
+    const source = [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "Hello 1", "",
+      "00:00:01.000 --> 00:00:02.000", "Hello 2", "",
+      "00:00:02.000 --> 00:00:03.000", "Hello 3", "",
+      "00:00:03.000 --> 00:00:04.000", "Hello 4", "",
+    ].join("\n");
+    const providers = [
+      { provider: "google-web", weight: 50, enabled: true },
+      { provider: "deepl", weight: 50, enabled: true },
+    ];
+    const result = await svc.translateWithConfig(
+      { provider: "mixed", mixedProviders: providers },
+      "http://127.0.0.1:8765",
+      { provider: "mixed", target: "ZH", vtt_text: source, mixed_providers: providers }
+    );
+
+    const deeplPayloads = backendClientMock.createDirectTranslateJob.mock.calls
+      .map(([payload]) => payload)
+      .filter((payload) => payload.provider === "deepl");
+    expect(deeplPayloads).toHaveLength(2);
+    expect(deeplPayloads.some((payload) => payload.vtt_text.includes("Hello 4") && !payload.vtt_text.includes("Hello 2"))).toBe(true);
+    expect(result.translated_vtt).toContain("中文2");
+    expect(result.translated_vtt).toContain("中文4");
+    expect(result.warnings.join(" ")).toContain("已保留 1 个成功 cue 并改派");
+  });
+
+  it("reassigns a multi-line cue when more than one failed line maps to that cue", async () => {
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `multiline-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId) => {
+      const childPayload = jobs.get(jobId);
+      if (childPayload.provider === "google-web") {
+        return {
+          translated_vtt: childPayload.vtt_text,
+          failed_items: [
+            { cue: 1, line: 4, code: "HTTP_429", status: 429 },
+            { cue: 1, line: 5, code: "HTTP_429", status: 429 },
+          ],
+          failed_cues: [1],
+          failure_codes: { HTTP_429: 2 },
+          metrics: { total: 2, processed: 2, translated: 0, failed: 2 },
+        };
+      }
+      return {
+        translated_vtt: childPayload.vtt_text.replace("First line", "第一行").replace("Second line", "第二行"),
+        failed_items: [],
+        failed_cues: [],
+        metrics: {},
+      };
+    });
+
+    const providers = [
+      { provider: "google-web", weight: 50, enabled: true },
+      { provider: "deepl", weight: 50, enabled: true },
+    ];
+    const source = [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "First line", "Second line", "",
+      "00:00:01.000 --> 00:00:02.000", "Third line", "",
+    ].join("\n");
+    const result = await svc.translateWithConfig(
+      { provider: "mixed", mixedProviders: providers },
+      "http://127.0.0.1:8765",
+      { provider: "mixed", target: "ZH", vtt_text: source, mixed_providers: providers }
+    );
+
+    expect(result.translated_vtt).toContain("第一行\n第二行");
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([payload]) => payload.provider))
+      .toEqual(expect.arrayContaining(["google-web", "deepl"]));
+  });
+
+  function priorityCueVtt(count, multilineFirst = false) {
+    const lines = ["WEBVTT", ""];
+    for (let index = 0; index < count; index += 1) {
+      lines.push(
+        `00:00:${String(index).padStart(2, "0")}.000 --> 00:00:${String(index + 1).padStart(2, "0")}.000`,
+        `Priority cue ${index + 1}`
+      );
+      if (multilineFirst && index === 0) lines.push("Second line");
+      lines.push("");
+    }
+    return lines.join("\n");
+  }
+
+  function installSuccessfulMixedBackend() {
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `priority-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId) => {
+      const childPayload = jobs.get(jobId);
+      return {
+        translated_vtt: childPayload.vtt_text.replace(/Priority cue/g, "译文 cue").replace("Second line", "第二行"),
+        failed_items: [],
+        metrics: {},
+      };
+    });
+    return jobs;
+  }
+
+  function priorityConfig(providers, groups) {
+    return {
+      provider: "mixed",
+      mixedPriorityEnabled: true,
+      mixedPriorityGroups: groups,
+      mixedProviders: providers,
+    };
+  }
+
+  function priorityPayload(providers, groups, source, target = "ZH") {
+    return {
+      provider: "mixed",
+      target,
+      vtt_text: source,
+      mixed_providers: providers,
+      mixed_priority_enabled: true,
+      mixed_priority_groups: groups,
+    };
+  }
+
+  it("uses the strict N versus N+1 threshold and counts a multi-line cue once", async () => {
+    installSuccessfulMixedBackend();
+    const groups = [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 2 }];
+    const providers = [
+      { provider: "google-web", weight: 50, enabled: true, priorityGroup: "first" },
+      { provider: "deepl", weight: 50, enabled: true, priorityGroup: "second" },
+    ];
+    const config = priorityConfig(providers, groups);
+
+    const exactlyAtThreshold = priorityCueVtt(2, true);
+    await svc.translateWithConfig(config, "http://127.0.0.1:8765", priorityPayload(providers, groups, exactlyAtThreshold));
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+      .toEqual(["google-web"]);
+    expect(backendClientMock.createDirectTranslateJob.mock.calls[0][0].mixed_priority_enabled).toBeUndefined();
+    expect(backendClientMock.createDirectTranslateJob.mock.calls[0][0].mixed_priority_groups).toBeUndefined();
+
+    backendClientMock.createDirectTranslateJob.mockClear();
+    await svc.translateWithConfig(config, "http://127.0.0.1:8765", priorityPayload(providers, groups, priorityCueVtt(3)));
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+      .toEqual(expect.arrayContaining(["google-web", "deepl"]));
+  });
+
+  it("activates three priority levels cumulatively and preserves each cue once", async () => {
+    installSuccessfulMixedBackend();
+    const groups = [
+      { id: "first", afterCues: 0 },
+      { id: "second", afterCues: 2 },
+      { id: "third", afterCues: 4 },
+    ];
+    const providers = [
+      { provider: "google-web", weight: 1, enabled: true, priorityGroup: "first" },
+      { provider: "deepl", weight: 1, enabled: true, priorityGroup: "second" },
+      { provider: "gemini", weight: 1, enabled: true, priorityGroup: "third" },
+    ];
+    const source = priorityCueVtt(5);
+    const result = await svc.translateWithConfig(
+      priorityConfig(providers, groups),
+      "http://127.0.0.1:8765",
+      priorityPayload(providers, groups, source)
+    );
+    const calls = backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item);
+    expect(calls.map((item) => item.provider)).toEqual(expect.arrayContaining(["google-web", "deepl", "gemini"]));
+    expect(result.metrics.mixedPriority).toMatchObject({
+      enabled: true,
+      count: 3,
+      activeGroupCount: 3,
+      activeGroupIds: ["first", "second", "third"],
+    });
+    expect(Object.values(result.metrics.providerBreakdown).every((item) => Number.isInteger(item.priorityIndex))).toBe(true);
+    expect((result.translated_vtt.match(/译文 cue/g) || []).length).toBe(5);
+    expect(result.translated_vtt.match(/Priority cue/g)).toBeNull();
+  });
+
+  it("allows a single provider only when priority routing is enabled", () => {
+    const providers = [{ provider: "google-web", weight: 100, enabled: true, priorityGroup: "only" }];
+    const groups = [{ id: "only", afterCues: 0 }];
+    expect(svc.normalizeMixedProviders(
+      priorityConfig(providers, groups),
+      priorityPayload(providers, groups, priorityCueVtt(1))
+    )).toEqual([{ provider: "google-web", weight: 100, priorityGroup: "only", priorityIndex: 0 }]);
+    expect(() => svc.normalizeMixedProviders(
+      { mixedProviders: [{ provider: "google-web", weight: 100, enabled: true }] },
+      { target: "ZH" }
+    )).toThrowError(expect.objectContaining({ code: "MIXED_PROVIDERS_REQUIRED", phase: "config" }));
+  });
+
+  it("does not start a threshold-excluded Argos provider", async () => {
+    installSuccessfulMixedBackend();
+    window.Echo360Translator.buildConfig.enableLocalBackend = true;
+    const groups = [{ id: "first", afterCues: 0 }, { id: "later", afterCues: 2 }];
+    const providers = [
+      { provider: "google-web", weight: 100, enabled: true, priorityGroup: "first" },
+      { provider: "argos", weight: 100, enabled: true, priorityGroup: "later" },
+    ];
+    try {
+      await svc.translateWithConfig(
+        priorityConfig(providers, groups),
+        "http://127.0.0.1:8765",
+        priorityPayload(providers, groups, priorityCueVtt(2))
+      );
+      expect(backendClientMock.ensureArgosBackend).not.toHaveBeenCalled();
+      expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+        .toEqual(["google-web"]);
+    } finally {
+      window.Echo360Translator.buildConfig.enableLocalBackend = false;
+    }
+  });
+
+  it("rejects malformed priority groups and an incompatible first group without promoting a later group", () => {
+    const validProviders = [
+      { provider: "google-web", weight: 50, enabled: true, priorityGroup: "first" },
+      { provider: "gemini", weight: 50, enabled: true, priorityGroup: "second" },
+    ];
+    const cases = [
+      {
+        groups: [{ id: "first", afterCues: 0 }, { id: "first", afterCues: 2 }],
+        providers: validProviders,
+      },
+      {
+        groups: [{ id: "first", afterCues: 1 }, { id: "second", afterCues: 2 }],
+        providers: validProviders,
+      },
+      {
+        groups: [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 0 }],
+        providers: validProviders,
+      },
+      {
+        groups: [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 2 }],
+        providers: [{ provider: "google-web", enabled: true, priorityGroup: "missing" }],
+      },
+      {
+        groups: [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 2 }],
+        providers: [{ provider: "google-web", enabled: true, priorityGroup: "first" }],
+      },
+    ];
+    for (const item of cases) {
+      expect(() => svc.normalizeMixedProviders(
+        priorityConfig(item.providers, item.groups),
+        priorityPayload(item.providers, item.groups, priorityCueVtt(3))
+      )).toThrowError(expect.objectContaining({ code: "MIXED_PRIORITY_CONFIG_INVALID", phase: "config" }));
+    }
+
+    const incompatibleFirst = [
+      { provider: "deepl", weight: 50, enabled: true, priorityGroup: "first" },
+      { provider: "google-web", weight: 50, enabled: true, priorityGroup: "second" },
+    ];
+    expect(() => svc.normalizeMixedProviders(
+      priorityConfig(incompatibleFirst, [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 2 }]),
+      priorityPayload(incompatibleFirst, [{ id: "first", afterCues: 0 }, { id: "second", afterCues: 2 }], priorityCueVtt(3), "YUE")
+    )).toThrowError(expect.objectContaining({ code: "MIXED_PRIORITY_CONFIG_INVALID", phase: "config" }));
+  });
+
+  it("does not use threshold-excluded providers for fallback and prefers lower group indexes", async () => {
+    const groups = [
+      { id: "first", afterCues: 0 },
+      { id: "second", afterCues: 1 },
+      { id: "third", afterCues: 2 },
+    ];
+    const providers = [
+      { provider: "google-web", weight: 100, enabled: true, priorityGroup: "first" },
+      { provider: "deepl", weight: 1, enabled: true, priorityGroup: "second" },
+      { provider: "gemini", weight: 1, enabled: true, priorityGroup: "third" },
+    ];
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `fallback-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId) => {
+      const provider = jobs.get(jobId).provider;
+      if (provider === "google-web" || provider === "deepl") {
+        throw Object.assign(new Error(`${provider} failed`), { code: "HTTP_503", status: 503 });
+      }
+      return {
+        translated_vtt: jobs.get(jobId).vtt_text.replace(/Priority cue/g, "译文 cue"),
+        failed_items: [],
+        metrics: {},
+      };
+    });
+
+    const twoCues = priorityCueVtt(2);
+    await expect(svc.translateWithConfig(
+      priorityConfig(providers, groups),
+      "http://127.0.0.1:8765",
+      priorityPayload(providers, groups, twoCues)
+    )).rejects.toThrowError(expect.objectContaining({ code: "MIXED_ALL_PROVIDERS_FAILED" }));
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+      .toEqual(["google-web", "deepl"]);
+
+    backendClientMock.createDirectTranslateJob.mockClear();
+    jobs.clear();
+    sequence = 0;
+    await svc.translateWithConfig(
+      priorityConfig(providers, groups),
+      "http://127.0.0.1:8765",
+      priorityPayload(providers, groups, priorityCueVtt(3))
+    );
+    expect(backendClientMock.createDirectTranslateJob.mock.calls.map(([item]) => item.provider))
+      .toEqual(["google-web", "deepl", "gemini"]);
+  });
+
+  it("rejects a mixed configuration with fewer than two compatible providers", () => {
+    expect(() => svc.normalizeMixedProviders(
+      { mixedProviders: [{ provider: "deepl", weight: 100 }] },
+      { target: "YUE" }
+    )).toThrowError(expect.objectContaining({ code: "MIXED_PROVIDERS_REQUIRED" }));
   });
 });
 

@@ -88,17 +88,20 @@
       statusText.classList.remove(
         "echo360-status-error",
         "echo360-status-warning",
-        "echo360-status-success"
+        "echo360-status-success",
+        "echo360-status-cache"
       );
       if (kind === "error") statusText.classList.add("echo360-status-error");
       if (kind === "warning") statusText.classList.add("echo360-status-warning");
       if (kind === "success") statusText.classList.add("echo360-status-success");
+      if (kind === "cache") statusText.classList.add("echo360-status-cache");
     }
 
     function statusKind() {
       if (statusText.classList.contains("echo360-status-error")) return "error";
       if (statusText.classList.contains("echo360-status-warning")) return "warning";
       if (statusText.classList.contains("echo360-status-success")) return "success";
+      if (statusText.classList.contains("echo360-status-cache")) return "cache";
       return "info";
     }
 
@@ -153,7 +156,7 @@
     exportRow.className = "echo360-manual-row";
     const downloadVttBtn = document.createElement("button");
     downloadVttBtn.type = "button";
-    downloadVttBtn.textContent = "手动下载完整 JSON";
+    downloadVttBtn.textContent = "手动下载 JSON 翻译包";
     downloadVttBtn.disabled = true;
     let currentManualMode = null;
     let manualComplete = false;
@@ -255,7 +258,11 @@
       manualBtn.setAttribute("aria-expanded", String(!manual.hidden));
     });
 
-    const actionButtons = [translateBtn, forceBtn, manualBtn, settingsBtn];
+    // Only starting another direct translation conflicts with an active run.
+    // Keep the surrounding controls usable while progress is reported so the
+    // user can adjust display preferences, open the manual workflow, inspect
+    // diagnostics, or collapse the panel without interrupting the request.
+    const actionButtons = [translateBtn, forceBtn];
 
     return {
       el: panel,
@@ -288,11 +295,11 @@
         currentManualMode = mode;
         manualComplete = !!progress?.complete;
         downloadVttBtn.disabled = false;
-        downloadVttBtn.textContent = progress?.complete ? "下载完整译文 VTT" : (mode === "file" ? "手动下载完整 JSON" : "手动下载本批 JSON");
+        downloadVttBtn.textContent = progress?.complete ? "下载完整译文 VTT" : (mode === "file" ? "导出待译材料" : "手动下载本批 JSON");
         copyPromptBtn.textContent = mode === "file" ? "复制任务说明" : "复制本批材料";
         modeBtn.hidden = !progress || !!progress.complete;
         modeBtn.disabled = false;
-        modeBtn.textContent = mode === "file" ? "AI 不能一次处理整份文件？改用逐批模式" : "切回整份 JSON 模式（推荐）";
+        modeBtn.textContent = mode === "file" ? "AI 不能处理文件？改用逐批模式" : "切回整份 JSON 模式（推荐）";
         copyPromptBtn.disabled = !!progress?.complete;
         downloadPromptBtn.disabled = !!progress?.complete;
         importBtn.disabled = !!progress?.complete;

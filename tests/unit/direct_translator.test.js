@@ -4,6 +4,7 @@ import { evalModule } from "../helpers/load-module.js";
 let translator;
 
 beforeAll(() => {
+  evalModule("error_utils.js");
   evalModule("direct_translator.js");
   translator = window.Echo360DirectTranslator;
 });
@@ -13,6 +14,31 @@ afterEach(() => {
 });
 
 describe("direct translator provider safeguards", () => {
+  it("translates format keywords inside captions but leaves metadata outside cues intact", async () => {
+    const captions = ["Note we've got the same changing demand. But", "NOTE this point", "STYLE matters", "REGION names", "WEBVTT is a format"];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      return new Response(JSON.stringify(body.map(() => ({ translations: [{ text: "字幕译文", to: "zh-Hans" }] }))),
+        { status: 200, headers: { "content-type": "application/json" } });
+    });
+    try {
+      const result = await translator.translateVtt({
+        provider: "azure", api_key: "test-key", target: "ZH", concurrency: 1, retries: 0,
+        max_paragraphs: 6, max_chars: 1200,
+        vtt_text: `WEBVTT\n\nNOTE metadata stays\nComment\n\n00:00:00.000 --> 00:00:01.000\n${captions.join("\n")}\n`,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).map((item) => item.Text)).toEqual(captions);
+      expect(result.metrics).toMatchObject({ total: 5, translated: 5 });
+      expect(result.translated_vtt).toContain("NOTE metadata stays\nComment");
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+  it("canonicalizes the legacy Cantonese target alias", () => {
+    expect(translator.normalizeTargetLanguage("cantonese", "openai")).toBe("YUE");
+  });
+
   it("rejects the extension's bilingual output before any provider request", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const bilingualVtt = `WEBVTT
@@ -60,8 +86,26 @@ Third line
   it("uses the configured bounded Google web cadence", () => {
     const adapter = translator.getProviderAdapter("google-web");
 
-    expect(adapter.concurrencyCap).toBe(48);
-    expect(adapter.defaultRps).toBe(0);
+    expect(adapter.concurrencyCap).toBe(3);
+    expect(adapter.defaultRps).toBe(3);
+  });
+
+  it("stops before the provider request when the whole-task deadline has expired", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    try {
+      await expect(translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        retries: 0,
+        timeout: 5,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+      }, {
+        deadlineAt: Date.now() - 1,
+      })).rejects.toMatchObject({ code: "TRANSLATION_TIMEOUT" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 
   it("batches Azure Translator inputs with the official v3 target and optional region headers", async () => {
@@ -259,12 +303,12 @@ Third line
         effectiveConcurrency: 2,
         requestedRps: 96,
         batches: 2,
-        effectiveRps: 96,
+        effectiveRps: 3,
         failed: 1,
         translated: 1,
         rateLimitCount: 1,
       });
-      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 96 }));
+      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 3 }));
       expect(progress).toHaveBeenLastCalledWith(2, 2, "[2/2] Translating...", expect.objectContaining({ failed: 1 }));
       expect(partial).toHaveBeenLastCalledWith(
         expect.stringContaining("第二条"),
@@ -345,7 +389,7 @@ Third line
         timeout: 5,
         max_paragraphs: 1,
         max_chars: 1200,
-        // The normal path performs one adaptive 3/3 recovery attempt. This
+        // The normal path performs one bounded serial recovery probe. This
         // flag isolates the final error classification for this unit test.
         __googleWebRecoveryAttempt: true,
         vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfirst\n\n00:00:01.000 --> 00:00:02.000\nsecond\n",
@@ -353,7 +397,7 @@ Third line
         code: "GOOGLE_WEB_ALL_REQUESTS_FAILED",
         metrics: expect.objectContaining({
           effectiveConcurrency: 2,
-          effectiveRps: 0,
+          effectiveRps: 3,
           failed: 2,
         }),
         failure_codes: { HTTP_429: 2 },
@@ -431,7 +475,7 @@ Third line
     }
   });
 
-  it("automatically retries an all-failed 96/0 run with the adaptive 3/3 profile", async () => {
+  it("automatically retries an all-failed Google run with one serial probe", async () => {
     let calls = 0;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
       calls += 1;
@@ -462,17 +506,17 @@ Third line
       expect(result.failed_items).toEqual([]);
       expect(result.metrics).toMatchObject({
         recoveryAttempted: true,
-        effectiveConcurrency: 2,
-        effectiveRps: 3,
+        effectiveConcurrency: 1,
+        effectiveRps: 1,
         initialProfile: {
           effectiveConcurrency: 2,
-          effectiveRps: 0,
+          effectiveRps: 3,
           failed: 2,
           failureCodes: { HTTP_429: 2 },
         },
-        recoveryProfile: { concurrency: 2, rps: 3, retries: 1 },
+        recoveryProfile: { concurrency: 1, rps: 1, retries: 1 },
       });
-      expect(result.warnings[0]).toContain("已自动切换到 concurrency=2, rps=3");
+      expect(result.warnings[0]).toContain("已自动切换到 concurrency=1, rps=1");
     } finally {
       fetchMock.mockRestore();
     }

@@ -1,6 +1,7 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -15,6 +16,15 @@ from translator import translate_vtt_zh_deepl_native as translator
 
 
 SAMPLE_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n"
+SAMPLE_SRT = (
+    "\ufeff1\r\n"
+    "00:00:02,720 --> 00:00:06,590\r\n"
+    "Note we're here. Example 00:00:01,234\r\n"
+    "Second line\r\n\r\n"
+    "2\r\n"
+    "00:00:06,590 --> 00:00:10,730\r\n"
+    "STYLE guide\r\n"
+)
 BILINGUAL_SAMPLE_VTT = "WEBVTT\n\n" + "\n\n".join(
     [
         f"00:00:0{index}.000 --> 00:00:0{index + 1}.000\n中文第 {index}\nEnglish line {index}"
@@ -116,6 +126,14 @@ class BackendRuntimeTests(unittest.TestCase):
         uvicorn_run.assert_called_once()
         self.assertEqual(uvicorn_run.call_args.kwargs["port"], 9876)
 
+    def test_server_rejects_non_loopback_listener_without_explicit_override(self):
+        self.assertTrue(launcher.is_loopback_host("127.0.0.1"))
+        self.assertTrue(launcher.is_loopback_host("::1"))
+        self.assertFalse(launcher.is_loopback_host("0.0.0.0"))
+        with mock.patch.object(launcher, "configure_runtime_environment"):
+            with self.assertRaises(SystemExit):
+                launcher.main(["--host", "0.0.0.0"])
+
     def test_register_url_scheme_flag_exits_without_starting_server(self):
         with mock.patch.object(launcher, "configure_runtime_environment") as configure, \
                 mock.patch.object(launcher, "register_windows_url_scheme", return_value=True), \
@@ -135,20 +153,198 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertIsNone(request.timeout)
         self.assertIsNone(request.reasoning_effort)
 
+    def test_request_model_rejects_unbounded_work_parameters(self):
+        with self.assertRaises(ValueError):
+            backend.TranslateRequest(vtt_text=SAMPLE_VTT, concurrency=257)
+        with self.assertRaises(ValueError):
+            backend.TranslateRequest(vtt_text=SAMPLE_VTT, retries=11)
+        with self.assertRaises(ValueError):
+            backend.TranslateRequest(vtt_text="x" * (backend.MAX_VTT_CHARS + 1))
+
     def test_vtt_validation_helpers_agree_on_a_minimal_document(self):
         self.assertEqual(backend.timed_cue_count(SAMPLE_VTT), 1)
         self.assertEqual(backend.translatable_line_count(SAMPLE_VTT), 1)
         self.assertEqual(backend.timed_cue_ranges(SAMPLE_VTT), [(0, 1000)])
 
+    def test_backend_normalizes_numbered_srt_without_rewriting_caption_text(self):
+        normalized = backend.normalize_timed_text(SAMPLE_SRT)
+        self.assertEqual(
+            normalized,
+            "WEBVTT\n\n"
+            "1\n"
+            "00:00:02.720 --> 00:00:06.590\n"
+            "Note we're here. Example 00:00:01,234\n"
+            "Second line\n\n"
+            "2\n"
+            "00:00:06.590 --> 00:00:10.730\n"
+            "STYLE guide",
+        )
+        self.assertTrue(backend.is_valid_timed_vtt(normalized))
+        self.assertEqual(backend.timed_cue_count(normalized), 2)
+        self.assertEqual(backend.timed_cue_ranges(normalized), [(2720, 6590), (6590, 10730)])
+        self.assertEqual(
+            [entry["text"] for entry in backend.timed_cue_text_entries(normalized)],
+            [
+                "Note we're here. Example 00:00:01,234",
+                "Second line",
+                "STYLE guide",
+            ],
+        )
+        # Model construction is the shared boundary used by both HTTP routes,
+        # so the async admission/progress count cannot observe raw SRT.
+        self.assertEqual(backend.TranslateRequest(vtt_text=SAMPLE_SRT).vtt_text, normalized)
+
+    def test_backend_leaves_transcript_and_malformed_srt_for_existing_source_guards(self):
+        transcript = "Transcript --> explanation without timestamps"
+        self.assertEqual(backend.normalize_timed_text(transcript), transcript)
+        request = backend.TranslateRequest(vtt_text=transcript, provider="argos")
+        with self.assertRaises(HTTPException) as caught:
+            backend.run_translation(transcript, request, force_refresh=True)
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "INVALID_SOURCE_VTT")
+
+        malformed_srt = (
+            "1\n00:00:00,000 --> 00:00:01,000\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nCaption\n"
+        )
+        normalized = backend.normalize_timed_text(malformed_srt)
+        self.assertTrue(backend.is_valid_timed_vtt(normalized))
+        self.assertFalse(backend.has_timed_cue_text(normalized))
+        request = backend.TranslateRequest(vtt_text=malformed_srt, provider="argos")
+        with self.assertRaises(HTTPException) as caught:
+            backend.run_translation(malformed_srt, request, force_refresh=True)
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail["error_code"], "INVALID_SOURCE_VTT")
+
+    def test_metadata_keywords_inside_cues_remain_caption_text(self):
+        vtt = "\n".join([
+            "WEBVTT",
+            "",
+            "NOTE document metadata",
+            "metadata body",
+            "",
+            "STYLE",
+            "::cue { color: white; }",
+            "",
+            "REGION",
+            "id:main",
+            "",
+            "00:00:00.000 --> 00:00:01.000",
+            "Note this is spoken text",
+            "STYLE is also spoken text",
+            "REGION appears in this caption",
+            "WEBVTT is spoken text too",
+            "",
+        ])
+        self.assertTrue(backend.has_timed_cue_text(vtt))
+        self.assertEqual(backend.translatable_line_count(vtt), 4)
+        self.assertEqual(
+            translator.timed_text_line_indices(vtt.splitlines()),
+            [12, 13, 14, 15],
+        )
+
+    def test_sync_and_async_entrypoints_pass_normalized_srt_to_translation(self):
+        request = backend.TranslateRequest(vtt_text=SAMPLE_SRT, provider="argos")
+        # Exercise the explicit route boundary as well as model construction;
+        # older integrations can mutate/reuse a request object after parsing.
+        request.vtt_text = SAMPLE_SRT
+        fake_result = (SAMPLE_VTT, [], False, {"total": 1})
+        with mock.patch.object(backend, "run_translation", return_value=fake_result) as run:
+            backend.translate(request)
+        self.assertEqual(run.call_args.args[0], request.vtt_text)
+        self.assertTrue(run.call_args.args[0].startswith("WEBVTT\n\n1\n"))
+
+        async_request = backend.TranslateAsyncRequest(vtt_text=SAMPLE_SRT, provider="argos")
+        async_request.vtt_text = SAMPLE_SRT
+        with mock.patch.object(backend.threading.Thread, "start"):
+            created = backend.translate_async(async_request)
+        try:
+            job = backend.translate_async_status(created["job_id"])
+            self.assertEqual(job["progress"]["total"], 3)
+            self.assertTrue(async_request.vtt_text.startswith("WEBVTT\n\n1\n"))
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.pop(created["job_id"], None)
+
     def test_async_job_exposes_known_total_while_worker_is_preparing(self):
         request = backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="argos")
         with mock.patch.object(backend.threading.Thread, "start"):
             created = backend.translate_async(request)
-        job = backend.translate_async_status(created["job_id"])
-        self.assertEqual(job["status"], "queued")
-        self.assertEqual(job["progress"]["current"], 0)
-        self.assertEqual(job["progress"]["total"], 1)
-        self.assertEqual(job["progress"]["stage"], "preparing")
+        try:
+            job = backend.translate_async_status(created["job_id"])
+            self.assertEqual(job["status"], "queued")
+            self.assertEqual(job["progress"]["current"], 0)
+            self.assertEqual(job["progress"]["total"], 1)
+            self.assertEqual(job["progress"]["stage"], "preparing")
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.pop(created["job_id"], None)
+
+    def test_async_job_admission_rejects_unbounded_active_work(self):
+        request = backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="argos")
+        with backend._jobs_lock:
+            original_jobs = dict(backend._jobs)
+            backend._jobs.clear()
+            backend._jobs.update({
+                f"active-{index}": {
+                    "status": "running",
+                    "created_at": int(backend.time.time()),
+                    "updated_at": int(backend.time.time()),
+                }
+                for index in range(backend.JOB_MAX_ACTIVE_COUNT)
+            })
+        try:
+            with self.assertRaises(HTTPException) as caught:
+                backend.translate_async(request)
+            self.assertEqual(caught.exception.status_code, 429)
+            self.assertEqual(caught.exception.detail["error_code"], "TOO_MANY_ACTIVE_JOBS")
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.clear()
+                backend._jobs.update(original_jobs)
+
+    def test_sync_translation_respects_the_global_process_limit(self):
+        request = backend.TranslateRequest(vtt_text=SAMPLE_VTT, provider="argos")
+        with mock.patch.object(backend._translation_slots, "acquire", return_value=False):
+            with self.assertRaises(HTTPException) as caught:
+                backend.translate(request)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.detail["error_code"], "TOO_MANY_ACTIVE_JOBS")
+
+    def test_async_worker_start_failure_becomes_a_terminal_job(self):
+        request = backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="argos")
+        fake_uuid = mock.Mock(hex="start-failure")
+        try:
+            with mock.patch.object(backend.uuid, "uuid4", return_value=fake_uuid), \
+                    mock.patch.object(backend.threading.Thread, "start", side_effect=RuntimeError("no threads")):
+                with self.assertRaises(HTTPException) as caught:
+                    backend.translate_async(request)
+            self.assertEqual(caught.exception.status_code, 503)
+            snapshot = backend.translate_async_status("start-failure")
+            self.assertEqual(snapshot["status"], "failed")
+            self.assertEqual(snapshot["error_code"], "JOB_START_FAILED")
+            self.assertEqual(snapshot["error_detail"]["error_code"], "JOB_START_FAILED")
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.pop("start-failure", None)
+
+    def test_async_status_returns_an_isolated_snapshot(self):
+        job_id = "snapshot-test"
+        with backend._jobs_lock:
+            backend._jobs[job_id] = {
+                "status": "running",
+                "progress": {"current": 1, "total": 2},
+                "created_at": int(backend.time.time()),
+                "updated_at": int(backend.time.time()),
+            }
+        try:
+            snapshot = backend.translate_async_status(job_id)
+            snapshot["progress"]["current"] = 99
+            with backend._jobs_lock:
+                self.assertEqual(backend._jobs[job_id]["progress"]["current"], 1)
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.pop(job_id, None)
 
     def test_target_coverage_accepts_neutral_unchanged_caption_but_not_ordinary_english(self):
         self.assertTrue(backend.is_target_neutral_text("F.", "F.", "ZH"))
@@ -235,6 +431,68 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertEqual(command[0], backend.get_translator_python())
         self.assertEqual(command[1], str(backend.TRANSLATOR_SCRIPT))
 
+    def test_translator_help_probe_has_a_hard_timeout(self):
+        backend.get_supported_args.cache_clear()
+        completed = mock.Mock(stdout="--progress-file", stderr="")
+        try:
+            with mock.patch.object(backend, "translator_runtime_available", return_value=True):
+                with mock.patch.object(backend, "get_translator_command", return_value=["translator"]):
+                    with mock.patch.object(backend.subprocess, "run", return_value=completed) as run:
+                        self.assertEqual(backend.get_supported_args(), {"--progress-file"})
+            run.assert_called_once_with(
+                ["translator", "--help"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=backend.TRANSLATOR_HELP_TIMEOUT_SECONDS,
+            )
+        finally:
+            backend.get_supported_args.cache_clear()
+
+    def test_stubborn_translator_process_is_killed_after_grace_period(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="translator", timeout=5), 0]
+        backend.terminate_translator_process(proc)
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+        self.assertEqual(proc.wait.call_count, 2)
+        self.assertEqual(backend.translator_error_status("TRANSLATOR_PROCESS_TIMEOUT"), 504)
+
+    def test_posix_translator_process_group_is_terminated_and_reaped(self):
+        proc = mock.Mock(pid=1234)
+        proc.poll.return_value = None
+        proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="translator", timeout=5), 0]
+        proc._echo360_process_group = "posix"
+        with mock.patch.object(backend.os, "getpgid", return_value=1234), \
+                mock.patch.object(backend.os, "killpg") as killpg:
+            backend.terminate_translator_process(proc)
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(1234, backend.signal.SIGTERM), mock.call(1234, backend.signal.SIGKILL)],
+        )
+        self.assertEqual(proc.wait.call_count, 2)
+
+    def test_translator_task_deadline_configuration_is_bounded(self):
+        with mock.patch.dict(backend.os.environ, {"TEST_TASK_TIMEOUT": "480"}):
+            self.assertEqual(backend.bounded_timeout_from_env("TEST_TASK_TIMEOUT", 120), 480)
+        with mock.patch.dict(backend.os.environ, {"TEST_TASK_TIMEOUT": "5"}):
+            self.assertEqual(backend.bounded_timeout_from_env("TEST_TASK_TIMEOUT", 120), 30)
+        with mock.patch.dict(backend.os.environ, {"TEST_TASK_TIMEOUT": "90000"}):
+            self.assertEqual(backend.bounded_timeout_from_env("TEST_TASK_TIMEOUT", 120), 480)
+        with mock.patch.dict(backend.os.environ, {"TEST_TASK_TIMEOUT": "invalid"}):
+            self.assertEqual(backend.bounded_timeout_from_env("TEST_TASK_TIMEOUT", 120), 120)
+
+    def test_translator_output_reader_enforces_a_byte_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "translated.vtt"
+            output.write_bytes(b"x" * 11)
+            with mock.patch.object(backend, "MAX_TRANSLATOR_OUTPUT_BYTES", 10):
+                with self.assertRaises(HTTPException) as caught:
+                    backend.read_translator_output(output)
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertEqual(caught.exception.detail["error_code"], "TRANSLATOR_OUTPUT_TOO_LARGE")
+
     def test_frozen_backend_dispatches_translation_through_its_own_executable(self):
         with mock.patch.object(sys, "frozen", True, create=True):
             self.assertEqual(backend.get_translator_command(), [sys.executable, "--translator"])
@@ -267,17 +525,63 @@ class BackendRuntimeTests(unittest.TestCase):
 
 
 class TranslatorRuntimeTests(unittest.TestCase):
+    def test_batch_builder_rejects_a_single_line_that_exceeds_max_chars(self):
+        with self.assertRaisesRegex(ValueError, "exceeds max_chars"):
+            translator.build_text_batches(
+                ["x" * 1201],
+                [0],
+                chunk_size=1,
+                max_chars=1200,
+            )
+
     def test_omitted_translator_provider_uses_google_web_defaults(self):
         defaults = translator.provider_defaults("")
         self.assertEqual(defaults["endpoint"], "")
         self.assertEqual(defaults["model"], "")
-        self.assertEqual(defaults["concurrency"], 48)
+        self.assertEqual(defaults["concurrency"], 3)
+        self.assertEqual(defaults["rps"], 3.0)
+
+    def test_deepl_provider_applies_its_default_endpoint(self):
+        self.assertEqual(
+            translator.resolve_provider_endpoint("deepl"),
+            "https://api-free.deepl.com/v2/translate",
+        )
+
+    def test_provider_endpoint_rejects_remote_plaintext_http(self):
+        with self.assertRaisesRegex(ValueError, "must use HTTPS"):
+            translator.resolve_provider_endpoint("openai", "http://translator.example/v1")
+        self.assertEqual(
+            translator.resolve_provider_endpoint("openai", "http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1",
+        )
+
+    def test_cli_reports_an_invalid_endpoint_as_a_typed_configuration_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "source.vtt"
+            output = Path(tmpdir) / "translated.vtt"
+            source.write_text(SAMPLE_VTT, encoding="utf-8")
+            with mock.patch.object(sys, "argv", [
+                "translator",
+                str(source),
+                "--out", str(output),
+                "--provider", "openai",
+                "--key", "dummy",
+                "--endpoint", "http://translator.example/v1",
+            ]), mock.patch("builtins.print") as print_mock:
+                self.assertEqual(translator.main(), 1)
+        output_lines = [" ".join(str(value) for value in call.args) for call in print_mock.call_args_list]
+        self.assertTrue(any("ERROR_CODE: PROVIDER_CONFIG_ERROR" in line for line in output_lines))
+        self.assertEqual(backend.translator_error_status("PROVIDER_CONFIG_ERROR"), 400)
+
+    def test_cantonese_compatibility_alias_is_canonicalized(self):
+        self.assertEqual(backend.normalize_target_code("cantonese"), "YUE")
+        self.assertEqual(translator.normalize_target_code("cantonese"), "YUE")
 
     def test_translator_imports_and_exposes_expected_google_defaults(self):
         defaults = translator.provider_defaults("google-web")
-        self.assertEqual(defaults["concurrency"], 48)
-        self.assertEqual(backend.WEB_PROVIDER_LIMITS["google-web"]["concurrency"], 48)
-        self.assertEqual(defaults["rps"], 0.0)
+        self.assertEqual(defaults["concurrency"], 3)
+        self.assertEqual(backend.WEB_PROVIDER_LIMITS["google-web"]["concurrency"], 3)
+        self.assertEqual(defaults["rps"], 3.0)
         self.assertEqual(defaults["max_paragraphs"], 1)
 
     def test_cli_error_code_normalization_keeps_specific_diagnostics(self):

@@ -1,6 +1,11 @@
 (() => {
   const ns = window.Echo360Translator;
   const extensionApi = ns.browserApi;
+  const DIRECT_JOB_POLL_TIMEOUT_MS = 8 * 60 * 1000;
+  // The local translator has an eight-minute hard deadline. Keep polling for
+  // one additional minute so terminate/kill cleanup can surface its typed
+  // terminal error instead of being masked by a client-side timeout.
+  const BACKEND_JOB_POLL_TIMEOUT_MS = 9 * 60 * 1000;
 
   function isGenericCode(value) {
     return ns.errorUtils?.isGenericCode?.(value) ||
@@ -508,7 +513,9 @@
       // validation failure (or, worse, a cache hit).
       validateSourceVtt(options.sourceVtt, "source");
     }
-    const targetCode = String(options.target || result?.target || "ZH").trim().toUpperCase();
+    const targetCode = ns.errorUtils?.normalizeTargetCode
+      ? ns.errorUtils.normalizeTargetCode(options.target || result?.target || "ZH")
+      : String(options.target || result?.target || "ZH").trim().toUpperCase().replace(/^CANTONESE$/, "YUE");
     if (!SUPPORTED_TARGET_CODES.has(targetCode)) {
       throw makeClientError(`不支持的目标语言代码：${targetCode || "(empty)"}`, "UNSUPPORTED_TARGET_LANGUAGE", {
         phase: "config",
@@ -944,7 +951,7 @@
   }
 
   async function waitDirectJob(jobId, options = {}) {
-    const maxMs = 8 * 60 * 1000;
+    const maxMs = DIRECT_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
     while (Date.now() - start < maxMs) {
@@ -991,7 +998,7 @@
   }
 
   async function waitJob(backendUrl, jobId, options = {}) {
-    const maxMs = 8 * 60 * 1000;
+    const maxMs = BACKEND_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
     while (Date.now() - start < maxMs) {
@@ -1044,7 +1051,7 @@
       }
       await new Promise((r) => setTimeout(r, 700));
     }
-    throw makeClientError("翻译任务超时（超过 8 分钟）", "TRANSLATION_TIMEOUT");
+    throw makeClientError("本地后端任务超时（超过 9 分钟）", "TRANSLATION_TIMEOUT");
   }
 
   ns.backendClient = {

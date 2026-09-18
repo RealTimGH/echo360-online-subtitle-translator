@@ -13,6 +13,7 @@
     PREFS_KEY_PREFIX: "echo360TranslatorPrefs::",
     ONBOARDING_KEY: "echo360TranslatorOnboardingSeen",
     PROVIDER_LABELS: {
+      mixed: "混合翻译（并行）",
       "google-web": "Google Translate",
       deepseek: "DeepSeek",
       gemini: "Gemini",

@@ -21,20 +21,20 @@ globalThis.Echo360DirectTranslator = (() => {
     LETTER_RE = /[A-Za-z]/;
   }
   const SUPPORTED_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU", "AR", "HI"]);
-  // Run Google Web at half of the former 96-worker cap, with no default
-  // request pacing (rps=0). `maxParagraphs=1` is still applied
-  // below so each cue can produce an independent partial update; it is a
-  // batching/display choice, not a request-rate limit.
-  const GOOGLE_WEB_CONCURRENCY_CAP = 48;
-  const GOOGLE_WEB_DEFAULT_RPS = 0;
-  // 0 means unlimited, matching 1.4.2. Explicit positive rps values are
-  // still honored when a caller deliberately supplies one.
-  const GOOGLE_WEB_MAX_RPS = 0;
+  // The `gtx` web endpoint is undocumented and publishes no stable quota.
+  // Keep a modest amount of in-flight work for latency hiding, while pacing
+  // starts at three requests/second instead of the previous 48-request burst.
+  // Explicit tuning remains possible, but is capped to avoid recreating the
+  // burst pattern that commonly triggered HTTP 429 responses.
+  const GOOGLE_WEB_CONCURRENCY_CAP = 3;
+  const GOOGLE_WEB_DEFAULT_RPS = 3;
+  const GOOGLE_WEB_MAX_RPS = 3;
   const GOOGLE_WEB_MAX_RETRIES = 2;
   const GOOGLE_WEB_RETRY_BASE_MS = 2000;
   const GOOGLE_WEB_RETRY_MAX_MS = 30000;
-  const GOOGLE_WEB_RECOVERY_CONCURRENCY = 3;
-  const GOOGLE_WEB_RECOVERY_RPS = 3;
+  const GOOGLE_WEB_RECOVERY_CONCURRENCY = 1;
+  const PROVIDER_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
+  const GOOGLE_WEB_RECOVERY_RPS = 1;
   const GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5;
   const GOOGLE_WEB_429_CIRCUIT_WINDOW_MS = 10000;
   // The current Azure service limits are higher, but the v3 REST reference
@@ -115,8 +115,8 @@ globalThis.Echo360DirectTranslator = (() => {
       defaultEndpoint: "https://translate.googleapis.com/translate_a/single",
       keyless: true,
       supportsRecursiveFallback: true,
-      // Keep the 1.4.2 provider profile for users whose stored config still
-      // contains the old generic defaults.
+      // Apply the provider-specific safety profile even when a stored config
+      // still contains the old generic 96-worker / unpaced defaults.
       concurrencyCap: GOOGLE_WEB_CONCURRENCY_CAP,
       defaultRps: GOOGLE_WEB_DEFAULT_RPS,
       authHeaders() {
@@ -143,8 +143,9 @@ globalThis.Echo360DirectTranslator = (() => {
     // This predicate is used only after the VTT state machine has entered a
     // timed cue. Numeric cue identifiers are outside the cue and are filtered
     // by that state machine; numeric caption text is valid subtitle content.
-    if (/^WEBVTT/i.test(trimmed) || isTimecode(trimmed)) return false;
-    if (/^(NOTE|STYLE|REGION)\b/.test(trimmed)) return false;
+    // NOTE/STYLE/REGION and WEBVTT are ordinary words inside cue text.
+    // Metadata outside a cue is already excluded by the caller's state.
+    if (isTimecode(trimmed)) return false;
     return true;
   }
 
@@ -248,7 +249,8 @@ globalThis.Echo360DirectTranslator = (() => {
   }
 
   function normalizeTargetLanguage(target, provider) {
-    const code = String(target || "ZH").trim().toUpperCase();
+    const rawCode = String(target || "ZH").trim().toUpperCase();
+    const code = rawCode === "CANTONESE" ? "YUE" : rawCode;
     if (!SUPPORTED_TARGET_CODES.has(code)) {
       throw makeTranslationError(
         "UNSUPPORTED_TARGET_LANGUAGE",
@@ -624,7 +626,7 @@ globalThis.Echo360DirectTranslator = (() => {
       if (!circuitError && rateLimitTimestamps.length >= GOOGLE_WEB_429_CIRCUIT_THRESHOLD) {
         circuitError = makeTranslationError(
           "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
-          `Google Web 在 ${GOOGLE_WEB_429_CIRCUIT_WINDOW_MS / 1000} 秒内返回了至少 ${GOOGLE_WEB_429_CIRCUIT_THRESHOLD} 次 HTTP 429，已停止继续请求并准备切换到 Argos`,
+          `Google Web 在 ${GOOGLE_WEB_429_CIRCUIT_WINDOW_MS / 1000} 秒内返回了至少 ${GOOGLE_WEB_429_CIRCUIT_THRESHOLD} 次 HTTP 429，已停止继续请求并触发故障转移`,
           {
             status: 429,
             retryable: false,
@@ -732,17 +734,45 @@ globalThis.Echo360DirectTranslator = (() => {
     return waitForRequest;
   }
 
-  async function fetchJson(url, init, timeoutSeconds, waitForRequest = async () => {}, observer = null) {
+  async function fetchJson(url, init, timeoutSeconds, waitForRequest = async () => {}, observer = null, deadlineAt = null) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch (_) {
+      throw makeTranslationError("PROVIDER_CONFIG_ERROR", "Provider endpoint is not a valid URL", { field: "endpoint" });
+    }
+    const endpointHost = String(parsedUrl.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+    const loopback = ["localhost", "127.0.0.1", "::1"].includes(endpointHost);
+    if (parsedUrl.username || parsedUrl.password || (parsedUrl.protocol !== "https:" && !(parsedUrl.protocol === "http:" && loopback))) {
+      throw makeTranslationError(
+        "PROVIDER_CONFIG_ERROR",
+        "Provider endpoint must use HTTPS (HTTP is allowed only for loopback development)",
+        { field: "endpoint", protocol: parsedUrl.protocol, host: endpointHost }
+      );
+    }
     const queuedAt = performance.now();
     const queueInfo = await waitForRequest();
     const queueWaitMs = Math.round(Number(queueInfo?.queueWaitMs) || (performance.now() - queuedAt));
     observer?.({ phase: "request-start", queueWaitMs });
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutSeconds) || 30) * 1000);
+    const perRequestTimeoutMs = Math.max(1, Number(timeoutSeconds) || 30) * 1000;
+    const remainingTaskMs = Number.isFinite(Number(deadlineAt))
+      ? Math.max(0, Number(deadlineAt) - Date.now())
+      : perRequestTimeoutMs;
+    if (remainingTaskMs <= 0) {
+      throw makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
+    }
+    const effectiveTimeoutMs = Math.max(1, Math.min(perRequestTimeoutMs, remainingTaskMs));
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     const requestStartedAt = performance.now();
     try {
       const resp = await fetch(url, { ...init, signal: controller.signal });
-      const text = await resp.text();
+      const text = await ns.errorUtils.readBoundedResponseText(resp, PROVIDER_RESPONSE_MAX_BYTES, {
+        code: "PROVIDER_RESPONSE_TOO_LARGE",
+        status: 502,
+        phase: "translation",
+        message: `Provider response exceeded ${PROVIDER_RESPONSE_MAX_BYTES} bytes`,
+      });
       if (!resp.ok) {
         const error = createHttpError(resp.status, parseRetryAfterMs(resp.headers?.get?.("retry-after")));
         error.bodyLength = text.length;
@@ -764,7 +794,10 @@ globalThis.Echo360DirectTranslator = (() => {
       if (error?.name === "AbortError") {
         error.code = "REQUEST_TIMEOUT";
         error.status = null;
-        error.message = `Request timed out after ${Math.max(1, Number(timeoutSeconds) || 30)}s`;
+        error.message = effectiveTimeoutMs < perRequestTimeoutMs
+          ? "Translation task exceeded its 8 minute deadline"
+          : `Request timed out after ${Math.max(1, Number(timeoutSeconds) || 30)}s`;
+        if (effectiveTimeoutMs < perRequestTimeoutMs) error.code = "TRANSLATION_TIMEOUT";
       }
       observer?.({
         phase: "request-error",
@@ -863,7 +896,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    }, cfg.timeout, cfg.waitForRequest);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
     return extractOpenAiText(data);
   }
 
@@ -885,7 +918,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    }, cfg.timeout, cfg.waitForRequest);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
     return extractChatText(data);
   }
 
@@ -903,7 +936,7 @@ globalThis.Echo360DirectTranslator = (() => {
         contents: [{ role: "user", parts: [{ text: prompt.user }] }],
         generationConfig: { temperature: 0 },
       }),
-    }, cfg.timeout, cfg.waitForRequest);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
     return extractGeminiText(data);
   }
 
@@ -923,7 +956,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body,
-    }, cfg.timeout, cfg.waitForRequest);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
     const translated = Array.isArray(data?.translations) && data.translations.every((item) =>
       item && typeof item.text === "string" && item.text.trim()
     )
@@ -947,7 +980,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Accept": "application/json",
       },
       body: JSON.stringify(texts.map((text) => ({ Text: text }))),
-    }, cfg.timeout, cfg.waitForRequest);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
     const translated = Array.isArray(data)
       ? data.map((item) => {
         const text = item?.translations?.[0]?.text;
@@ -986,7 +1019,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 queueWaitMs: event.queueWaitMs,
               });
             }
-          }),
+          }, cfg.deadlineAt),
           cfg.retries,
           {
             shouldRetry: (error) => !cfg.googleRateLimitCircuit?.isOpen?.() && isRetryableError(error),
@@ -1155,6 +1188,9 @@ globalThis.Echo360DirectTranslator = (() => {
     const onPartialVtt = handlers.onPartialVtt || (() => {});
     const partialEmitIntervalMs = Math.max(0, Number(handlers.partialEmitIntervalMs) || 400);
     let lastPartialEmitAt = 0;
+    const deadlineAt = Number.isFinite(Number(handlers.deadlineAt))
+      ? Number(handlers.deadlineAt)
+      : Date.now() + 8 * 60 * 1000;
 
     function emitPartialVtt(force = false) {
       if (!onPartialVtt) return;
@@ -1232,6 +1268,7 @@ globalThis.Echo360DirectTranslator = (() => {
       retries: effectiveRetries,
       waitForRequest: createRateLimiter(effectiveRps),
       googleRateLimitCircuit: isGoogleWeb ? createGoogleRateLimitCircuit() : null,
+      deadlineAt,
     };
     const lines = String(payload.vtt_text || "").replace(/\r/g, "").split("\n");
     const items = [];
@@ -1597,6 +1634,9 @@ globalThis.Echo360DirectTranslator = (() => {
 
     async function worker() {
       while (nextBatch < batches.length) {
+        if (Date.now() >= deadlineAt) {
+          throw makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
+        }
         cfg.googleRateLimitCircuit?.throwIfOpen?.();
         const batchNo = nextBatch;
         nextBatch += 1;
@@ -1678,6 +1718,9 @@ globalThis.Echo360DirectTranslator = (() => {
 
       async function repairWorker() {
         while (nextRepair < deferredFailures.length) {
+          if (Date.now() >= deadlineAt) {
+            throw makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
+          }
           const item = deferredFailures[nextRepair];
           nextRepair += 1;
           const batchFailures = [];
@@ -1740,12 +1783,9 @@ globalThis.Echo360DirectTranslator = (() => {
       const noTargetTranslations = isGoogleWeb && metrics.targetResults === 0;
       const firstAttemptVtt = translatedVtt;
 
-      // Keep the requested 1.4.2 fast profile as the first attempt, but do
-      // not leave the user with a misleading "no translations" error when
-      // the unofficial endpoint rejects a high-concurrency burst. A single
-      // bounded recovery attempt makes the default fast again while still
-      // recovering from the common Safari/Google Load failed or HTTP 429
-      // failure mode.
+      // If the already-paced first attempt produced no usable output, make one
+      // final serial probe rather than replaying the same traffic shape. This
+      // remains bounded and cannot recreate a retry burst.
       if (
         isGoogleWeb &&
         !cfg.googleRateLimitCircuit?.isOpen?.() &&
@@ -1772,6 +1812,7 @@ globalThis.Echo360DirectTranslator = (() => {
         try {
           const recoveryHandlers = {
             ...handlers,
+            deadlineAt,
             onProgress: (current, total, line = "", details = {}) => {
               handlers.onProgress?.(
                 current,
@@ -1795,7 +1836,7 @@ globalThis.Echo360DirectTranslator = (() => {
             },
             recoveryHandlers
           );
-          const recoveryWarning = `Google Web 高速配置（concurrency=${workers}, rps=${effectiveRps}）未获得可用中文结果，已自动切换到 concurrency=${recoverySettings.concurrency}, rps=${recoverySettings.rps} 重试。`;
+          const recoveryWarning = `Google Web 首轮配置（concurrency=${workers}, rps=${effectiveRps}）未获得可用中文结果，已自动切换到 concurrency=${recoverySettings.concurrency}, rps=${recoverySettings.rps} 进行一次串行探测。`;
           return {
             ...recovered,
             translated_vtt: mergePartialVtt(recovered.translated_vtt, firstAttemptVtt, payload.vtt_text),
@@ -1835,7 +1876,7 @@ globalThis.Echo360DirectTranslator = (() => {
             firstAttemptVtt,
             payload.vtt_text
           );
-          recoveryError.message = `${recoveryError.message || "Google Web 翻译失败"}；已从 1.4.2 高速配置自动降级到 concurrency=${recoverySettings.concurrency}, rps=${recoverySettings.rps} 重试，仍未获得中文结果`;
+          recoveryError.message = `${recoveryError.message || "Google Web 翻译失败"}；已降级到 concurrency=${recoverySettings.concurrency}, rps=${recoverySettings.rps} 进行串行探测，仍未获得中文结果`;
           throw recoveryError;
         }
       }
@@ -1864,6 +1905,9 @@ globalThis.Echo360DirectTranslator = (() => {
       error.code = code;
       error.metrics = { ...metrics };
       error.failed_items = failedItems.slice(0, 30);
+      error.failed_cues = Array.from(new Set(
+        failedItems.map((item) => Number(item?.cue)).filter((cue) => Number.isInteger(cue) && cue > 0)
+      ));
       error.failure_codes = failureCodes;
       error.warnings = warnings.slice(0, 30);
       error.provider = provider;
@@ -1894,6 +1938,12 @@ globalThis.Echo360DirectTranslator = (() => {
       // payload. Metrics/failureCodes retain the complete counts; the UI and
       // validators only promise the first 50 item-level details.
       failed_items: failedItems.slice(0, 50),
+      // Mixed routing retries whole cues. Keep the complete unique cue list
+      // separately from the bounded diagnostic sample so a multi-line cue (or
+      // more than 50 failed lines) can still be reassigned without ambiguity.
+      failed_cues: Array.from(new Set(
+        failedItems.map((item) => Number(item?.cue)).filter((cue) => Number.isInteger(cue) && cue > 0)
+      )),
       failure_codes: finalFailureCodes,
       failureCodes: finalFailureCodes,
       metrics: { ...metrics },
@@ -1911,5 +1961,5 @@ globalThis.Echo360DirectTranslator = (() => {
     return result;
   }
 
-  return { translateVtt, getProviderAdapter, inspectProbableBilingualVtt, isTargetNeutralText };
+  return { translateVtt, getProviderAdapter, inspectProbableBilingualVtt, isTargetNeutralText, normalizeTargetLanguage };
 })();

@@ -6,7 +6,8 @@ const { DEFAULT_CONFIG: defaultConfig, createModelPresets, createErrorPresenter 
 const modelPresets = createModelPresets({ includeLocalOnly: enableLocalBackend });
 const { API_KEYS_STORAGE_KEY, isKeylessProvider, buildKeyMap, stashKey, resolveForSave } = globalThis.Echo360ConfigKeys;
 const providerHints = {
-  "google-web": "免费、无需 API Key，适合先试用；质量通常不如 AI/API 模型。",
+  mixed: "多个服务并行分担字幕，失败分片自动改派；服务和比例请在完整设置中调整。",
+  "google-web": "免费、无需 API Key，适合先试用；它使用非官方网页端点，稳定性与配额没有保证。",
   deepseek: "需要 DeepSeek API Key，适合更高质量字幕翻译；Thinking 默认关闭。",
   gemini: "需要 Gemini API Key，适合更高质量字幕翻译。",
   openai: "需要 OpenAI API Key，适合更高质量字幕翻译。",
@@ -77,21 +78,32 @@ function selectedProvider() {
 // Lets users switch providers freely without losing each key they've typed.
 let localApiKeys = {};
 
+function mixedProviderSupportsTarget(provider, target) {
+  const code = String(target || "ZH").toUpperCase();
+  if (provider === "deepl" && ["YUE", "CANTONESE"].includes(code)) return false;
+  if (provider === "argos" && (["YUE", "CANTONESE", "EN"].includes(code) || !enableLocalBackend)) return false;
+  return true;
+}
+
 function refreshProviderUi() {
   const provider = selectedProvider();
   const isKeyless = isKeylessProvider(provider);
   const apiKeyEl = document.getElementById("apiKey");
   document.getElementById("providerHint").textContent = providerHints[provider] || "";
   document.getElementById("apiKeyHint").textContent = isKeyless
-    ? provider === "custom-backend"
+    ? provider === "mixed"
+      ? "混合模式的各服务 API Key 和权重请在“完整设置”中配置。"
+      : provider === "custom-backend"
       ? "地址和站点权限请在“完整设置”中配置。"
       : provider === "argos"
       ? "Argos 不需要 API Key；会使用本机后端和已安装的离线模型。"
-      : "Google Translate 不需要 API Key；如果翻译质量不理想，请切换到 AI/API 模型。"
+      : "Google Translate 不需要 API Key，但使用非官方网页端点，稳定性与配额没有保证。"
     : "API Key 只保存在 Chrome 本地 storage。";
   apiKeyEl.disabled = isKeyless;
   apiKeyEl.placeholder = isKeyless
-    ? provider === "argos"
+    ? provider === "mixed"
+      ? "请在完整设置中配置各服务"
+      : provider === "argos"
       ? "Argos 不需要 API Key"
       : provider === "custom-backend"
         ? "自定义后端不使用 API Key"
@@ -186,6 +198,26 @@ async function saveConfig() {
       endpoint,
       ...resolveForSave(mergedKeys, provider),
     };
+    if (provider === "mixed") {
+      const selected = (Array.isArray(config.mixedProviders) ? config.mixedProviders : [])
+        .filter((item) => item?.enabled !== false && mixedProviderSupportsTarget(item?.provider, config.target));
+      const minimumProviders = config.mixedPriorityEnabled === true ? 1 : 2;
+      if (selected.length < minimumProviders) {
+        const error = new Error(config.mixedPriorityEnabled === true
+          ? "优先级混合翻译尚未配置至少一个兼容服务，请先打开完整设置。"
+          : "混合翻译尚未配置至少两个兼容服务，请先打开完整设置。");
+        error.code = "MIXED_PROVIDERS_REQUIRED";
+        throw error;
+      }
+      const missingKeys = selected
+        .map((item) => item.provider)
+        .filter((item) => !isKeylessProvider(item) && !String(mergedKeys[item] || "").trim());
+      if (missingKeys.length > 0) {
+        const error = new Error(`混合翻译仍缺少 API Key：${missingKeys.join("、")}。请先打开完整设置。`);
+        error.code = "PROVIDER_API_KEY_MISSING";
+        throw error;
+      }
+    }
     delete config.useLocalBackend;
     delete config.backendUrl;
     await storageSet({

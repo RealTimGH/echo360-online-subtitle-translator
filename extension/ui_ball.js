@@ -31,6 +31,16 @@
     }
   }
 
+  function replayResultRing(group) {
+    // Re-start the one-shot completion animation even when a caller reports
+    // the same result kind twice (for example after remounting a cached track).
+    // The forced reflow is limited to this user-visible state transition; the
+    // regular progress path only changes the text and busy state.
+    group.classList.remove("echo360-ball-result-ring");
+    void group.offsetWidth;
+    group.classList.add("echo360-ball-result-ring");
+  }
+
   // Split floating action control: the large, easy-to-hit primary surface
   // performs the common one-click workflow. Two explicit secondary targets
   // retain panel access and provide direct AI JSON import without using
@@ -43,8 +53,8 @@
     ball.type = "button";
     ball.id = "echo360-translator-ball";
     ball.innerHTML = QUICK_ICON;
-    ball.title = "一键加载翻译，并导出 AI 翻译材料";
-    ball.setAttribute("aria-label", "一键加载翻译字幕并导出 AI 翻译材料");
+    ball.title = "一键加载翻译字幕（AI 材料导出可在设置中开启）";
+    ball.setAttribute("aria-label", "一键加载翻译字幕（AI 材料导出可在设置中开启）");
     ball.addEventListener("click", () => invoke(onQuickTranslate, "quick translation"));
 
     const secondary = document.createElement("div");
@@ -95,12 +105,13 @@
       setStatus(message = "", kind = "info") {
         const text = String(message || "").trim();
         group.dataset.kind = kind;
+        if (kind === "success" || kind === "cache") replayResultRing(group);
         if (text) {
           ball.title = text;
           ball.setAttribute("aria-label", `一键字幕翻译：${text}`);
         } else {
-          ball.title = "一键加载翻译，并导出 AI 翻译材料";
-          ball.setAttribute("aria-label", "一键加载翻译字幕并导出 AI 翻译材料");
+          ball.title = "一键加载翻译字幕（AI 材料导出可在设置中开启）";
+          ball.setAttribute("aria-label", "一键加载翻译字幕（AI 材料导出可在设置中开启）");
         }
       },
       setImportReady(ready = false) {

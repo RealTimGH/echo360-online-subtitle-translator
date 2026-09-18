@@ -118,6 +118,9 @@
     // grouped. pointer-events:none is set in CSS; children re-enable as needed.
     const root = document.createElement("div");
     root.id = "echo360-ui-root";
+    root.dataset.echo360Host = ns.hostSupport?.isInstructureMediaHost?.()
+      ? "instructure-media"
+      : "echo360";
     document.body.appendChild(root);
 
     function showPanel() {

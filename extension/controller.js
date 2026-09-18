@@ -1066,12 +1066,24 @@
       .some((track) => !!String(track.getAttribute?.("src") || "").trim());
   }
 
-  function confirmRetranslation() {
+  function quickTranslateAutoExportEnabled() {
+    // Config is loaded during init and refreshed by the storage watcher. The
+    // setting is opt-in, so an unavailable or legacy config must not trigger
+    // an automatic download or clipboard write. An explicit true remains
+    // enabled for users who have already chosen it.
+    return lastKnownConfig?.quickTranslateAutoExport === true;
+  }
+
+  function confirmRetranslation({ autoExport = quickTranslateAutoExportEnabled() } = {}) {
     const message = [
       "当前视频已经存在翻译字幕。",
       "是否清除当前结果并重新翻译？",
-      "确认后会重新生成完整 JSON、复制 AI 提示词，并重新开始翻译。",
-      "选择“取消”将保留当前字幕，也不会重复下载 AI 翻译材料。",
+      autoExport
+        ? "确认后会重新生成完整 JSON、复制 AI 提示词，并重新开始翻译。"
+        : "确认后会清除当前结果并重新开始翻译。",
+      autoExport
+        ? "选择“取消”将保留当前字幕，也不会重复下载 AI 翻译材料。"
+        : "选择“取消”将保留当前字幕。",
     ].join("\n");
     try {
       return typeof window.confirm === "function" && window.confirm(message);
@@ -1081,30 +1093,33 @@
     }
   }
 
-  function runQuickWorkflow(forceRefresh = false) {
+  function runQuickWorkflow(forceRefresh = false, { autoExport = quickTranslateAutoExportEnabled() } = {}) {
     // Keep the one-click action as one workflow even after the user confirms
     // a retranslation. The material export and provider request share the
     // same prefetched source snapshot; the force flag only controls
     // translation-cache/track invalidation.
-    const manualRun = prepareManualTranslation({ quick: true });
+    const manualRun = autoExport ? prepareManualTranslation({ quick: true }) : Promise.resolve(true);
     const translationRun = onClickTranslate(forceRefresh);
     return Promise.allSettled([manualRun, translationRun]);
   }
 
   async function quickTranslate() {
+    const autoExport = quickTranslateAutoExportEnabled();
     const video = ns.video.getPrimaryVideo?.();
     if (hasExistingTranslation(video)) {
-      if (!confirmRetranslation()) {
-        ns.ui.setStatusText("当前翻译字幕已保留，未重新翻译，也未重复下载材料。", "info");
+      if (!confirmRetranslation({ autoExport })) {
+        ns.ui.setStatusText(autoExport
+          ? "当前翻译字幕已保留，未重新翻译，也未重复下载材料。"
+          : "当前翻译字幕已保留，未重新翻译。", "info");
         return false;
       }
-      return runQuickWorkflow(true);
+      return runQuickWorkflow(true, { autoExport });
     }
 
-    // Start material export first so Clipboard API invocation is closest to
-    // the user's click. The normal translation/cache path then runs in
-    // parallel and reuses the same prepared source snapshot when available.
-    return runQuickWorkflow(false);
+    // When enabled, start material export first so Clipboard API invocation is
+    // closest to the user's click. The normal translation/cache path then runs
+    // in parallel and reuses the same prepared source snapshot when available.
+    return runQuickWorkflow(false, { autoExport });
   }
 
   async function onClickTranslate(forceRefresh = false) {
@@ -1367,7 +1382,7 @@
         if (mounted && cacheSurfaceWarnings.length === 0) {
           ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
-          ns.ui.setStatusText("命中本地缓存");
+          ns.ui.setStatusText("命中本地缓存", "cache");
         } else if (mounted) {
           ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
@@ -1635,7 +1650,10 @@
           metrics: result.metrics || null,
         });
         ns.ui.clearError?.();
-        ns.ui.setStatusText(result.cache_hit ? "缓存命中" : "翻译完成", "success");
+        ns.ui.setStatusText(
+          result.cache_hit ? "缓存命中" : "翻译完成",
+          result.cache_hit ? "cache" : "success"
+        );
       }
 
       if (mounted) {

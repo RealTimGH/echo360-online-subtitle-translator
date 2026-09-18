@@ -124,10 +124,11 @@ function setupControllerWithRenderer() {
   return { ns: window.Echo360Translator, video, domMount };
 }
 
-function setupManualController() {
+function setupManualController({ quickTranslateAutoExport = true } = {}) {
   const setup = setupControllerWithRenderer();
   const ns = setup.ns;
   let callbacks = null;
+  ns.storage.getConfig.mockResolvedValue({ target: "ZH", quickTranslateAutoExport });
   ns.storage.sha256Text = vi.fn(async () => "source-hash");
   ns.translationService = {
     resolveSourceVtt: vi.fn(async () => ({
@@ -320,7 +321,32 @@ describe("controller track sync in Echo360 native CC mode", () => {
       "source-vtt",
       ORIG_VTT
     );
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存");
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
+  });
+
+  it("skips automatic AI material export when the quick-action setting is disabled, including cache hits", async () => {
+    const { ns, callbacks } = setupManualController({ quickTranslateAutoExport: false });
+    ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => ({
+      cacheKey: "source::config",
+      translatedVtt: TRANS_VTT,
+    }));
+    ns.translationService.buildCacheKey = vi.fn(async () => ({
+      sourceKey: "source",
+      configSig: "config",
+      cacheKey: "source::config",
+    }));
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+    await ns.controller.init();
+    ns.manualTranslation.copyText.mockClear();
+    ns.manualTranslation.downloadText.mockClear();
+
+    await callbacks().onQuickTranslate();
+
+    expect(ns.manualTranslation.copyText).not.toHaveBeenCalled();
+    expect(ns.manualTranslation.downloadText).not.toHaveBeenCalled();
+    expect(ns.storage.getCacheStore).toHaveBeenCalledOnce();
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
   });
 
   it("asks before retranslation and does not export duplicate AI materials when cancelled", async () => {
@@ -341,6 +367,19 @@ describe("controller track sync in Echo360 native CC mode", () => {
       "当前翻译字幕已保留，未重新翻译，也未重复下载材料。",
       "info"
     );
+  });
+
+  it("does not promise AI material regeneration in the retranslation confirmation when disabled", async () => {
+    const { ns, callbacks } = setupManualController({ quickTranslateAutoExport: false });
+    await ns.controller.init();
+    ns.renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    await callbacks().onQuickTranslate();
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("确认后会清除当前结果并重新开始翻译"));
+    expect(confirm.mock.calls[0][0]).not.toContain("重新生成完整 JSON");
+    expect(confirm.mock.calls[0][0]).not.toContain("复制 AI 提示词");
   });
 
   it("uses the same material-export workflow after confirming retranslation", async () => {

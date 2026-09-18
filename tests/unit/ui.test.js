@@ -144,6 +144,32 @@ describe("manual AI workflow controls", () => {
     expect(fileClick).not.toHaveBeenCalled();
   });
 
+  it("keeps settings and other non-conflicting controls usable while translation is busy", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+
+    const ui = window.Echo360Translator.ui;
+    ui.updateActionButtons("翻译中…", true);
+
+    expect(document.getElementById("echo360-translator-btn").disabled).toBe(true);
+    expect(document.getElementById("echo360-translator-force-btn").disabled).toBe(true);
+    expect(document.getElementById("echo360-translator-ball").disabled).toBe(true);
+    expect(document.getElementById("echo360-translator-manual-btn").disabled).toBe(false);
+    expect(document.getElementById("echo360-translator-settings-btn").disabled).toBe(false);
+    expect(document.getElementById("echo360-translator-collapse-btn").disabled).toBe(false);
+
+    document.getElementById("echo360-translator-settings-btn").click();
+    await Promise.resolve();
+    expect(document.getElementById("echo360-translator-popover").style.display).toBe("block");
+  });
+
   it("uses the split floating control for quick translation, panel disclosure, and AI import", async () => {
     setupUi({
       enabled: true,
@@ -190,6 +216,51 @@ describe("manual AI workflow controls", () => {
     await Promise.resolve();
     expect(document.getElementById("echo360-translator-panel").classList.contains("echo360-panel-visible")).toBe(true);
     expect(document.activeElement.textContent).toBe("从文件导入");
+  });
+
+  it("gives cache hits their own blue result state and replays the ring", () => {
+    setupUi({ enabled: true, size: "medium" });
+    const ball = document.getElementById("echo360-translator-ball");
+    const group = document.getElementById("echo360-translator-ball-group");
+
+    window.Echo360Translator.ui.setStatusText("翻译完成", "success");
+    expect(group.dataset.kind).toBe("success");
+    expect(group.classList.contains("echo360-ball-result-ring")).toBe(true);
+
+    window.Echo360Translator.ui.setStatusText("命中本地缓存", "cache");
+    expect(group.dataset.kind).toBe("cache");
+    expect(group.classList.contains("echo360-ball-result-ring")).toBe(true);
+    expect(document.getElementById("echo360-status-text").classList.contains("echo360-status-cache")).toBe(true);
+    expect(ball.title).toBe("命中本地缓存");
+  });
+
+  it("raises the floating surfaces in an Instructure Media frame", () => {
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    Object.defineProperty(window, "location", {
+      value: { hostname: "sydney.instructuremedia.com", pathname: "/media/player" },
+      configurable: true,
+      writable: true,
+    });
+    window.Echo360Translator = makeFullNs({
+      hostSupport: {
+        isSupportedPlayerDocument: vi.fn(() => true),
+        isInstructureMediaHost: vi.fn(() => true),
+      },
+      storage: {
+        getPrefs: vi.fn(async () => ({ enabled: true, size: "medium" })),
+        getConfig: vi.fn(async () => ({ target: "ZH" })),
+        getOnboardingSeen: vi.fn(async () => true),
+        setOnboardingSeen: vi.fn(async () => {}),
+      },
+    });
+    loadUiModules();
+    window.Echo360Translator.ui.ensurePanel();
+
+    const root = document.getElementById("echo360-ui-root");
+    expect(root.dataset.echo360Host).toBe("instructure-media");
+    expect(document.getElementById("echo360-translator-ball-group")).not.toBeNull();
+    expect(document.getElementById("echo360-translator-panel")).not.toBeNull();
   });
 });
 

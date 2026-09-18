@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import platform
 import sys
 from pathlib import Path
@@ -18,6 +19,16 @@ from backend.runtime import (
 
 TRANSLATOR_MODE = "--translator"
 REGISTER_URL_SCHEME_MODE = "--register-url-scheme"
+
+
+def is_loopback_host(host: str) -> bool:
+    normalized = str(host or "").strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def strip_protocol_url_args(arguments: list[str]) -> list[str]:
@@ -53,6 +64,11 @@ def run_server(arguments: list[str]) -> int:
         description="Local backend for Echo360 Online Subtitle Translator",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Listen address (default: 127.0.0.1)")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Explicitly allow an unauthenticated non-loopback listener (unsafe; use only behind a trusted authenticated proxy)",
+    )
     parser.add_argument("--port", default=8765, type=int, help="Listen port (default: 8765)")
     parser.add_argument(
         "--log-level",
@@ -61,6 +77,12 @@ def run_server(arguments: list[str]) -> int:
     )
     args = parser.parse_args(arguments)
 
+    if not is_loopback_host(args.host) and not args.allow_remote:
+        parser.error(
+            "refusing an unauthenticated non-loopback listener; keep --host on loopback "
+            "or explicitly pass --allow-remote behind a trusted authenticated proxy"
+        )
+
     # Windows cannot receive a browser URL until a handler exists.  Register
     # on every ordinary server start as a repair path for moved/extracted apps.
     register_windows_url_scheme()
@@ -68,6 +90,10 @@ def run_server(arguments: list[str]) -> int:
     import uvicorn
     from backend.app import app
 
+    # On macOS the native AppKit executable starts this PyInstaller binary as
+    # a child and captures its stdout/stderr. Keeping the Python process as a
+    # normal Uvicorn core avoids embedding a second GUI event loop and keeps
+    # the same server path for CLI, Windows, tests, and the native host.
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 

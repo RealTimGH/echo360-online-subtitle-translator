@@ -9,7 +9,7 @@
 ## 功能概览
 
 1. 在当前 Echo360 录播课页面或 Canvas 内嵌视频中寻找 VTT 字幕源（播放器 CC、网络抓取、`transcript-file` API 等）。
-2. Google、DeepSeek、Gemini、OpenAI、DeepL、Azure AI Translator 由扩展直接请求（`direct_translator.js`）；Argos 自动使用固定的本机后端；“自定义后端”只在用户明确选择该服务时使用其 URL。
+2. Google、DeepSeek、Gemini、OpenAI、DeepL、Azure AI Translator 由扩展直接请求（`direct_translator.js`）；Argos 自动使用固定的本机后端；“自定义后端”只在用户明确选择该服务时使用其 URL；“混合翻译”可以同时调度这些路径。
 3. Argos 后端调用仓库内的 VTT 翻译脚本作为离线/fallback 工具：`translator/translate_vtt_zh_deepl_native.py`。设置里不再有容易产生矛盾状态的通用“使用本地后端”开关。
 4. 扩展将翻译后的 VTT 显示在当前 Echo360 视频上；**默认使用浏览器 `<track>` 字幕轨**。设置中可勾选 **使用原生 CC 注入（Beta）** 尝试注入 Echo360 原生 CC（倍速下仍可能漏译；本课程没有原生字幕位时会自动回退）。
 5. **边翻译边显示**（1.3.0）：点击翻译后立即挂载字幕，未完成的 cue 显示 `正在翻译中...`，随批次完成逐步替换为译文。
@@ -29,17 +29,24 @@
 
 若所有策略都失败，控制面板会提示「未找到可用字幕源」。
 
+Instructure Media 返回的 SRT 字幕（没有 `WEBVTT` 头、使用逗号毫秒时间码）会在翻译前转换为 WebVTT，保留字幕文字和时间轴。本地后端也支持此输入格式；没有时间轴的 Transcript 纯文本或含空字幕条目的输入仍会被拒绝。
+时间轴后的字幕正文即使以 `Note`、`STYLE`、`REGION` 等词开头也正常参与翻译，不会被误当成格式元数据。
+
 ## 翻译与显示流程
 
-**直连翻译路径**（Google、DeepSeek、Gemini、OpenAI、DeepL、Azure AI Translator）：
+**自动翻译路径**（直连 Provider、Argos 与支持异步契约的自定义后端）：
 
 1. 点击 `加载翻译字幕` → 若可挂载，立刻显示字幕（未完成 cue 为 `正在翻译中...`）。
 2. 翻译进行中 → 每批 partial VTT 热更新已译 cue；状态栏显示 `翻译中 X/Y（已开始显示）`。
 3. 全部完成 → 用最终 VTT 做一次增量收尾，无需重新挂载。
 
+翻译期间仍可打开字幕设置和查看诊断信息；启动另一轮翻译等冲突操作会暂时禁用。
+
+设置页的「一键翻译时自动下载字幕并复制提示词」默认关闭。新安装和升级时，如果用户没有设置过该选项，一键按钮只启动字幕翻译，不自动下载 AI 翻译 JSON 材料或写入剪贴板；已明确开启的用户设置会保留。仍可在「AI 手动翻译」中按需导出。
+
 **限制：**
 
-- 增量预览目前仅支持扩展内直连翻译（`direct_translator.js` → background job）；本地 FastAPI 后端路径仍等整份 VTT 返回后再显示。
+- 扩展内直连任务和本项目 FastAPI 异步任务都支持按批次返回 `partial_vtt`；只实现旧版同步 `/translate` 的自定义后端会等完整 VTT 返回后再显示。
 - 命中本地翻译缓存时直接显示完整字幕，不会走增量流程。
 
 ### AI 手动翻译
@@ -99,7 +106,7 @@ backend/      FastAPI 开发/fallback 服务和本地翻译缓存
 extension/    Chrome/Safari 扩展源码
 translator/   VTT 翻译脚本（后端/fallback 调用）
 scripts/      扩展构建脚本
-tests/        Vitest 单元测试（覆盖 extension 核心逻辑）
+tests/        Vitest 单元/属性测试与 Python 后端/CLI 测试
 ```
 
 扩展主要模块：
@@ -111,6 +118,7 @@ canvas_course_bridge.js   仅限 Canvas 课程内容页/external_tools 的无数
 browser_api.js            Chrome / Safari storage 与 runtime API 抽象
 config_keys.js            popup/options 共用的 per-provider API Key 逻辑
 constants.js              共享默认值和选项列表
+background_contracts.js   service worker 路由、sender 与 target 的纯契约
 host_support.js           Echo360 / Canvas Instructure Media 播放器识别与宿主适配
 vtt.js                    纯 VTT 解析、格式化、双语与增量预览工具
 manual_translation.js     手动 AI 精简 JSON、字面值/标签校验与本地 VTT 重建
@@ -142,7 +150,7 @@ popup.js / options.js     扩展弹窗与选项页
 
 ## 后端启动
 
-后端与翻译 CLI 支持 Python 3.9 及以上版本。macOS 上建议使用采用 OpenSSL 的 Homebrew/pyenv Python；Xcode 自带的 LibreSSL Python 可启动程序，但当前 `urllib3` 不对该 TLS 栈提供完整支持。
+后端与翻译 CLI 支持 Python 3.10 及以上版本。macOS 上建议使用采用 OpenSSL 的 Homebrew/pyenv Python；不要使用 Xcode 自带的旧版 LibreSSL Python，因为当前依赖不再支持该运行时组合。
 
 先进入仓库根目录：
 
@@ -153,22 +161,22 @@ cd /path/to/echo360-online-subtitle-translator
 macOS / Linux:
 
 ```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 8765 --reload
+python -m venv backend/.venv
+source backend/.venv/bin/activate
+python -m pip install -r backend/requirements.txt
+python -m backend.launcher --host 127.0.0.1 --port 8765 --log-level info
 ```
 
 Windows (PowerShell):
 
 ```powershell
-cd backend
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 8765 --reload
+py -m venv backend\.venv
+backend\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+python -m backend.launcher --host 127.0.0.1 --port 8765 --log-level info
 ```
+
+`backend.launcher` 默认拒绝非 loopback 监听。只有部署在可信、已认证并终止 TLS 的反向代理后，才可显式使用 `--allow-remote`；CORS 不能替代认证。
 
 健康检查：
 
@@ -188,6 +196,8 @@ Invoke-WebRequest http://127.0.0.1:8765/health
 
 - macOS：解压 `echo360-online-subtitle-translator-backend-macos-*.tar.gz`，把 `Echo360 Subtitle Backend.app` 放进“应用程序”并至少打开一次；
 - Windows：解压 `echo360-online-subtitle-translator-backend-windows-x64.zip`，首次运行 `Echo360SubtitleBackend\install-and-launch-echo360-subtitle-backend.cmd`，它只在当前用户下注册启动协议，不需要管理员权限。
+
+macOS 包使用系统 AppKit 原生窗口显示运行状态和增量日志；Python/Uvicorn 作为同一 App 包内的后端核心子进程运行，不嵌入 WebView 或 Tk。关闭窗口会同时停止后端核心。
 
 程序固定监听 `127.0.0.1:8765`；选择 Argos 时扩展自动使用该地址，不再要求用户配置 Backend URL。关闭程序即可停止后端。翻译缓存写入当前用户的系统缓存目录，不会写入应用安装目录。
 
@@ -224,14 +234,14 @@ python scripts\smoke-backend.py --check-argos
 3. 点击 `加载已解压的扩展程序`。
 4. 选择当前仓库下的 `extension/` 目录。
 
-进入 Echo360 classroom 页面后，右下角会出现**分体收纳球**：点击大按钮会检查缓存并加载或启动默认翻译，同时复制 AI 提示词并下载完整 `.translate.json`；旁边的箭头打开滑出式面板，导入图标在字幕会话准备好后可读取 AI 返回的 `.translated.json` 或完整 `.vtt`。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。如需清除当前缓存并重新翻译，在面板中点击 `重新翻译`。
+进入 Echo360 classroom 页面后，右下角会出现**分体收纳球**：点击大按钮会检查缓存并加载或启动默认翻译；只有在设置中开启「一键翻译时自动下载字幕并复制提示词」后，它才会同时复制 AI 提示词并下载完整 `.translate.json`。旁边的箭头打开滑出式面板，导入图标在字幕会话准备好后可读取 AI 返回的 `.translated.json` 或完整 `.vtt`。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。如需清除当前缓存并重新翻译，在面板中点击 `重新翻译`。
 
 ## 发布构建
 
 先在仓库根目录安装 Node 依赖：
 
 ```bash
-npm install
+npm ci
 ```
 
 上传 Chrome Web Store 时请使用 store 构建：
@@ -277,13 +287,13 @@ npm run check
 npm run test:coverage
 ```
 
-安装 `backend/requirements.txt` 后，可另行运行 Python 后端/CLI 冒烟回归：
+`npm run check` 已包含 Python 后端/CLI 回归；只想单独运行这一子集时使用：
 
 ```bash
 npm run test:python
 ```
 
-`npm run check` 会检查全部 JavaScript/Python 源文件语法，运行扩展测试，并生成 store/dev 两种扩展构建。测试文件位于 `tests/unit/`、`tests/property/` 和 `tests/python/`；配置见 `vitest.config.js`。
+`npm run check` 会检查全部 JavaScript/Python 源文件语法与扩展资源引用，运行 JavaScript 和 Python 测试，并生成 store/dev 两种扩展构建。测试文件位于 `tests/unit/`、`tests/property/` 和 `tests/python/`；配置见 `vitest.config.mjs`。贡献与完整本地门禁见 [`CONTRIBUTING.md`](CONTRIBUTING.md)，安全问题报告方式见 [`SECURITY.md`](SECURITY.md)。
 
 ## 默认参数
 
@@ -292,14 +302,18 @@ npm run test:python
 - target: `ZH`
 - max_paragraphs: `6`（Google 网页端点会按单条字幕刷新进度）
 - max_chars: `1200`
-- concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `48`，Azure AI Translator 为 `8`，其他 provider 不变
-- rps: `0`（首次请求不额外限速；失败时才自动尝试 `3` RPS 恢复）
+- concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `3`，Azure AI Translator 为 `8`，其他 provider 不变
+- rps: 通用配置默认保存为 `0`；Google Translate 会把它解释为安全基线 `3 RPS`，其他 provider 仍按各自适配器处理
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: 默认空
 - deepseek_thinking_mode: `disabled`
 
-支持的 provider：`google-web`、`deepseek`、`openai`、`gemini`、`deepl`、`azure`、`argos` 与 `custom-backend`。`google-web`、`argos`、`custom-backend` 不需要 API Key；Azure 需要用户自己的 Translator 订阅密钥。自定义后端必须实现与本项目 `/translate`、`/translate-async`、`/translate-async/{job_id}` 相同的 JSON 契约。
+支持的 provider：`mixed`、`google-web`、`deepseek`、`openai`、`gemini`、`deepl`、`azure`、`argos` 与 `custom-backend`。`google-web`、`argos`、`custom-backend` 不需要 API Key；Azure 需要用户自己的 Translator 订阅密钥。自定义后端必须实现与本项目 `/translate`、`/translate-async`、`/translate-async/{job_id}` 相同的 JSON 契约。
+
+混合翻译采用“分流”而不是“重复请求”：每个字幕 cue 只发给一个 provider，通过平滑加权轮询接近用户设置的目标比例，并按原始 cue 顺序重组结果。各 provider 的工作并行执行且相互隔离；认证/配置错误或 Google 熔断会立即把该 provider 从本次任务的健康池移出，失败或不完整的分片会按健康状态、当前负载和权重依次转交给尚未尝试的 provider。目标比例不是硬性保证，发生故障、配额耗尽或目标语言不兼容时会自动偏离。完整设置页允许勾选任意已有 provider、填写各自 API Key 和权重；未开启多级优先级时至少需要两个与目标语言兼容的 provider。混合配置和 provider 独立 model/endpoint 会进入缓存签名，避免切换组合后误用旧缓存。
+
+可选的**多级优先级**默认关闭。开启后，每级可放一个或多个服务，并通过上移／下移调整整组顺序；默认只用第一级。为后续级别设置递增的字幕条数阈值，整份字幕总数**超过**阈值时，该级加入前几级共同按权重翻译。例如第二级设 500、第三级设 1,500：500 条以内仅第一级，501–1,500 条前两级，1,501 条起三级共同参与。同一 cue 内换行仍算一条。未达到阈值的服务不会被故障转移提前调用；已启用服务失败时优先向较高级别改派。开启时允许只选一个服务；关闭后恢复原有混合逻辑并保留分组设置。调研依据和完整边界规则见 [多级优先级调研](docs/mixed-priority-routing-research.md)。
 
 目标语言选项：`ZH`、`ZH-HK`、`YUE`、`EN`、`JA`、`KO`、`FR`、`DE`、`ES`、`IT`、`PT`、`RU`、`AR`、`HI`。
 
@@ -331,13 +345,15 @@ Azure AI Translator provider：
 
 Google Translate provider：
 
-- `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用
+- `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用；Google 官方社区明确说明该端点不受维护，不建议用于生产
 - 所有构建都由扩展前端直接请求，不受 Argos 或自定义后端配置影响
-- 后端/脚本路径的 Google 并发上限为 `48`（原 `96` 的一半），仍保持 `rps=0, max_chars=1200, max_paragraphs=1`
+- 后端/脚本路径和扩展直连路径都把 Google 限制为共享 `3 RPS / 3 并发`，仍保持 `max_chars=1200, max_paragraphs=1`
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量和接口稳定性，建议改用官方 API provider（如 `azure`/`deepl`）或 AI provider，并填写自己的 API Key
 
-`google-web` 的直接扩展路径最多使用 `48` 个 worker，是原 `96` 上限的一半；默认 `rps=0`（不增加请求间隔），显式设置正数 `rps` 时仍会按该值排队。每条字幕独立处理；零星 `HTTP 429` 仍按 `Retry-After` 或指数退避重试，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试、跳过原来的 Google 低并发恢复，并自动拉起本地后端改用 Argos。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。
+`google-web` 的直接扩展和 Python 路径默认使用共享 `3 RPS / 3 并发`；即使旧配置为 `rps=0`，也会应用这一安全基线，较低的显式 RPS 值仍会保留。每条字幕独立处理；零星 `HTTP 429` 会遵循 `Retry-After` 或带抖动的指数退避，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试，并自动拉起本地后端改用 Argos；在混合模式中则把失败分片转交给其余健康 provider。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。调研依据：[Google 开发者社区关于该非官方端点的说明](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639)、[Google Cloud Translation 官方配额（仅作正式 API 对照）](https://docs.cloud.google.com/translate/quotas)。
+
+混合路由的设计参考了成熟网关的加权分流、重试/故障转移和异常实例摘除模式，而不是把同一字幕重复发送给所有服务：[Envoy Gateway 负载均衡](https://gateway.envoyproxy.io/docs/concepts/load-balancing/)、[Envoy 异常检测](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier)、[Azure Circuit Breaker pattern](https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker)、[Azure Bulkhead pattern](https://learn.microsoft.com/azure/architecture/patterns/bulkhead)。
 
 Argos Translate provider：
 
@@ -377,7 +393,10 @@ TRANSLATOR_API_KEY=... python translator/translate_vtt_zh_deepl_native.py input.
 ```bash
 export TRANSLATOR_SCRIPT=/absolute/path/to/translate_vtt_zh_deepl_native.py
 export TRANSLATOR_PYTHON_BIN=/absolute/path/to/python
+export TRANSLATOR_TASK_TIMEOUT_SECONDS=480
 ```
+
+整任务 deadline 默认 480 秒，并被限制在 30–480 秒范围内；超时后后端会先终止、再强制回收翻译进程树。前端会为终止清理和类型化错误回传额外保留一分钟轮询窗口，因此不允许把后端期限调到客户端窗口之外。
 
 翻译脚本来自上游仓库 [bryanxianyu/VTT-Translator](https://github.com/bryanxianyu/VTT-Translator)，当前仓库内为 vendor 快照（`translator/translate_vtt_zh_deepl_native.py`）。
 
@@ -411,4 +430,4 @@ export TRANSLATOR_PYTHON_BIN=/absolute/path/to/python
 - 探针默认不抓取详细网络请求 body。
 - 如果录播存在独立开场片段，扩展会优先使用强 media-id 映射，其次使用 timeline/state 兜底匹配。
 - 仅 Transcript 面板、无播放器 CC 的课时依赖 `transcript-file` API（1.2.2）；这类页面没有 Echo360 原生 CC DOM 可注入，会被 `hasNativeCaptionCapability()` 判定为无能力并直接使用浏览器字幕轨。
-- 增量预览的 partial VTT 由 `direct_translator.js` 每批产出并经 `background.js` job 轮询；`buildIncrementalPreviewVtt()` 负责把未译 cue 替换为占位文案。
+- 增量预览的 partial VTT 由 `direct_translator.js` 或 FastAPI 异步任务按批次产出，经 job 轮询交给 `buildIncrementalPreviewVtt()` 把未译 cue 替换为占位文案；旧版同步自定义后端没有这一能力。

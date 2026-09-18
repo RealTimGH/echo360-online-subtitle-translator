@@ -489,7 +489,12 @@
     track.srclang = "zh";
     track.kind = "subtitles";
     track.setAttribute("data-echo360-translated", "1");
-    if (resolvedSourceMeta.sourceId) track.setAttribute("data-echo360-source-id", resolvedSourceMeta.sourceId);
+    if (resolvedSourceMeta.sourceId) {
+      track.setAttribute(
+        "data-echo360-source-id",
+        ns.errorUtils?.redactUrl?.(resolvedSourceMeta.sourceId) || "subtitle-source"
+      );
+    }
     if (resolvedSourceMeta.mediaId) track.setAttribute("data-echo360-media-id", resolvedSourceMeta.mediaId);
     if (resolvedSourceMeta.mapSource) track.setAttribute("data-echo360-map-source", resolvedSourceMeta.mapSource);
     track.setAttribute("data-echo360-source-max-end", String(Math.round(resolvedSourceMeta.stats?.maxEnd || 0)));

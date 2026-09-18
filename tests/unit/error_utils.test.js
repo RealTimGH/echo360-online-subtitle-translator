@@ -8,6 +8,54 @@ function loadErrors() {
 }
 
 describe("structured error model", () => {
+  it("exposes one canonical target code for the legacy Cantonese alias", () => {
+    const errors = loadErrors();
+    expect(errors.normalizeTargetCode("cantonese")).toBe("YUE");
+    expect(errors.normalizeTargetCode("zh-hk")).toBe("ZH-HK");
+  });
+
+  it("streams text within the shared byte limit", async () => {
+    const errors = loadErrors();
+    const response = new Response(new TextEncoder().encode("hello"));
+    await expect(errors.readBoundedResponseText(response, 5)).resolves.toBe("hello");
+  });
+
+  it("cancels a streamed response as soon as the shared byte limit is crossed", async () => {
+    const errors = loadErrors();
+    const response = new Response(new Uint8Array(6));
+    await expect(errors.readBoundedResponseText(response, 5)).rejects.toMatchObject({
+      code: "RESOURCE_TOO_LARGE",
+      status: 413,
+    });
+  });
+
+  it("describes the active-job admission limit as retryable local backpressure", () => {
+    const errors = loadErrors();
+    const model = errors.normalizeError({
+      code: "TOO_MANY_ACTIVE_JOBS",
+      status: 429,
+      message: "后台翻译任务已达到并发上限（4）",
+    }, { phase: "backend" });
+    expect(model.title).toBe("后台翻译任务已满");
+    expect(model.retryable).toBe(true);
+    expect(model.recommendation).toContain("等待已有任务完成");
+  });
+
+  it("supports boundary-specific errors when a response exceeds its byte limit", async () => {
+    const errors = loadErrors();
+    const response = new Response("", { headers: { "content-length": "11" } });
+    await expect(errors.readBoundedResponseText(response, 10, {
+      code: "BACKEND_RESPONSE_TOO_LARGE",
+      status: 502,
+      phase: "backend",
+      message: "Backend response exceeded 10 bytes",
+    })).rejects.toMatchObject({
+      code: "BACKEND_RESPONSE_TOO_LARGE",
+      status: 502,
+      phase: "backend",
+    });
+  });
+
   it("recognizes only conservative unchanged neutral captions for a Chinese target", () => {
     const errors = loadErrors();
     expect(errors.isTargetNeutralText("F.", "F.", "ZH")).toBe(true);
@@ -310,6 +358,49 @@ ignored metadata
     expect(errors.countTranslatableLines(vtt)).toBe(1);
   });
 
+  it("keeps metadata-like words when they are cue text while excluding metadata blocks", () => {
+    const errors = loadErrors();
+    const vtt = `WEBVTT
+NOTE this metadata is not provider input
+metadata body
+
+STYLE
+::cue { color: white; }
+
+REGION
+id:caption-region
+
+1
+00:00:00.000 --> 00:00:01.000
+Note we've got the same changing demand. But
+
+2
+00:00:01.000 --> 00:00:02.000
+STYLE is also valid caption text
+
+3
+00:00:02.000 --> 00:00:03.000
+REGION is also valid caption text
+
+4
+00:00:03.000 --> 00:00:04.000
+WEBVTT is also valid caption text
+`;
+
+    expect(errors.isTranslatableVttLine("NOTE metadata")).toBe(false);
+    expect(errors.isTranslatableVttLine("STYLE metadata")).toBe(false);
+    expect(errors.isTranslatableVttLine("REGION metadata")).toBe(false);
+    expect(errors.isTranslatableVttLine("WEBVTT metadata")).toBe(false);
+    expect(errors.isTranslatableVttLine("Note caption", { insideCue: true })).toBe(true);
+    expect(errors.countTranslatableLines(vtt)).toBe(4);
+    expect(errors.timedCueTextEntries(vtt).map((entry) => entry.text)).toEqual([
+      "Note we've got the same changing demand. But",
+      "STYLE is also valid caption text",
+      "REGION is also valid caption text",
+      "WEBVTT is also valid caption text",
+    ]);
+  });
+
   it("keeps the nested root diagnosis while exposing the outer boundary", () => {
     const errors = loadErrors();
     const model = errors.normalizeError({
@@ -327,5 +418,28 @@ ignored metadata
     expect(model.boundaryCode).toBe("INTERNAL_ERROR");
     expect(model.summary).toContain("HTTP 429");
     expect(errors.serializeError(model).boundary_code).toBe("INTERNAL_ERROR");
+  });
+
+  it("does not re-wrap rendered detail rows when a model crosses another UI boundary", () => {
+    const errors = loadErrors();
+    const rawDetails = {
+      cause: { code: "HTTP_429", status: 429, message: "rate limited" },
+      source: "backend",
+    };
+    const first = errors.normalizeError({
+      code: "INTERNAL_ERROR",
+      status: 500,
+      message: "local adapter failed",
+      details: rawDetails,
+    }, { phase: "backend" });
+
+    const second = errors.normalizeError(first, { phase: "backend" });
+
+    expect(second.extraDetails).toEqual(first.extraDetails);
+    expect(second.details.filter((item) => item.label === "结构化附加信息")).toHaveLength(1);
+    expect(second.details.find((item) => item.label === "结构化附加信息").value)
+      .toBe(JSON.stringify(first.extraDetails));
+    expect(second.details.find((item) => item.label === "结构化附加信息").value)
+      .not.toContain("阶段");
   });
 });

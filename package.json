@@ -2,7 +2,7 @@
   "name": "echo360-online-subtitle-translator",
   "private": true,
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
   },
   "scripts": {
     "build": "node scripts/build-extension.mjs all",
@@ -11,19 +11,22 @@
     "build:backend": "node scripts/build-backend.mjs",
     "safari:prepare": "npm run build:store && npm run safari:sync && node scripts/verify-safari-xcode-resources.mjs --required",
     "safari:sync": "node scripts/sync-safari-xcode-resources.mjs",
-    "check": "npm run check:syntax && npm test && npm run build && npm run safari:sync && npm run check:safari",
+    "check": "npm run check:syntax && npm run check:structure && npm run check:docs && npm test && npm run test:python && npm run build && npm run safari:sync && npm run check:safari",
     "check:syntax": "node scripts/check-syntax.mjs",
+    "check:structure": "node scripts/validate-extension-structure.mjs",
+    "check:docs": "node scripts/validate-docs.mjs",
+    "check:dependencies": "npm audit --audit-level=moderate",
     "check:safari": "node scripts/verify-safari-xcode-resources.mjs",
     "test": "vitest run",
-    "test:python": "python3 -m unittest discover -s tests/python -p 'test_*.py'",
+    "test:python": "node scripts/test-python.mjs",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
-    "@vitest/coverage-istanbul": "^3.2.6",
+    "@vitest/coverage-istanbul": "^4.1.11",
     "fast-check": "^4.8.0",
     "istanbul-lib-instrument": "^6.0.3",
     "jsdom": "^26.1.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }

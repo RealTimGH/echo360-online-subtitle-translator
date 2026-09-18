@@ -112,6 +112,16 @@ describe("normalizeTimedText", () => {
 
   it("returns empty for non-timed content", () => {
     expect(vtt.normalizeTimedText("<html>not subtitles</html>")).toBe("");
+    expect(vtt.normalizeTimedText("Transcript --> explanation without timestamps")).toBe("");
+  });
+
+  it("preserves caption timestamp examples, identifiers, multiline text and BOM/CRLF input", () => {
+    const normalized = vtt.normalizeTimedText("\uFEFF1\r\n00:00:02,720 --> 00:00:06,590\r\nExample 00:00:01,234\r\nSecond line\r\n\r\n320\r\n00:23:09,100 --> 00:23:12,070\r\nEnd\r\n");
+    expect(vtt.parseVttCues(normalized)).toMatchObject([
+      { id: "1", startMs: 2720, endMs: 6590, text: "Example 00:00:01,234\nSecond line" },
+      { id: "320", startMs: 1389100, endMs: 1392070, text: "End" },
+    ]);
+    expect(vtt.normalizeTimedText(normalized)).toBe(normalized);
   });
 });
 

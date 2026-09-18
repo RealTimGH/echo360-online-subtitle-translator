@@ -22,7 +22,9 @@ function setup() {
     isVideoLikelyActive: vi.fn(() => false),
   };
   const ns = makeFullNs({ video: videoMock });
+  ns.browserApi.runtime = { sendMessage: vi.fn() };
   window.Echo360Translator = ns;
+  evalModule("error_utils.js");
   evalModule("vtt.js");
   evalModule("source_finder.js");
   return window.Echo360Translator.sourceFinder;
@@ -51,6 +53,35 @@ describe("fetchTranscriptFileVtt", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("rejects plaintext Instructure Media resources before fetching", async () => {
+    setLocation("/lesson/abc/classroom");
+    const result = await sourceFinder.fetchTextResource("http://media.instructuremedia.com/captions/source.vtt");
+    expect(result).toMatchObject({ ok: false, code: "RESOURCE_HOST_NOT_ALLOWED" });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch an oversized resource through the service worker", async () => {
+    setLocation("/lesson/abc/classroom");
+    global.fetch.mockResolvedValue({
+      ok: true,
+      headers: { get: vi.fn(() => "5000001") },
+      text: vi.fn(),
+    });
+    const result = await sourceFinder.fetchTextResource("https://media.instructuremedia.com/captions/source.vtt");
+    expect(result).toMatchObject({ ok: false, code: "RESOURCE_TOO_LARGE", status: 413 });
+    expect(window.Echo360Translator.browserApi.runtime.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not start another source request after the shared deadline", async () => {
+    setLocation("/lesson/abc/classroom");
+    const result = await sourceFinder.fetchTextResource(
+      "https://media.instructuremedia.com/captions/source.vtt",
+      { deadlineAt: Date.now() - 1 }
+    );
+    expect(result).toMatchObject({ ok: false, code: "SOURCE_RESOLUTION_TIMEOUT" });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   it("returns empty (and never fetches) when no media id can be discovered", async () => {
     setLocation("/lesson/abc/classroom");
     const result = await sourceFinder.fetchTranscriptFileVtt(null);
@@ -67,7 +98,11 @@ describe("fetchTranscriptFileVtt", () => {
 
     expect(global.fetch).toHaveBeenCalledWith(
       "https://echo360.net.au/api/ui/echoplayer/lessons/abc/medias/media-1/transcript-file?format=vtt",
-      { credentials: "include" }
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      })
     );
     expect(result.text).toBe(VTT.trimEnd());
     expect(result.strongMapped).toBe(true);
@@ -210,6 +245,7 @@ describe("fetchTextResource", () => {
     expect(sendMessage).toHaveBeenCalledWith({
       type: "fetch-text-resource",
       url: "https://apse2.nv.instructuremedia.com/captions/c-123.vtt",
+      timeoutMs: 20000,
     });
   });
 

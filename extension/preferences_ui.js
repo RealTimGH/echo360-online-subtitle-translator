@@ -8,9 +8,19 @@
     apiKey: "",
     customBackendUrl: "http://127.0.0.1:8765",
     provider: "google-web",
+    mixedProviders: [
+      { provider: "google-web", weight: 60, enabled: true, priorityGroup: "" },
+      { provider: "argos", weight: 40, enabled: true, priorityGroup: "" },
+    ],
+    mixedPriorityEnabled: false,
+    mixedPriorityGroups: [],
+    providerConfigs: {},
     model: "",
     endpoint: "",
     target: "ZH",
+    // Automatic AI material export is opt-in. Explicit stored choices are
+    // merged on top of this default by the popup/options storage loaders.
+    quickTranslateAutoExport: false,
     maxParagraphs: 6,
     maxChars: 1200,
     concurrency: 96,
@@ -27,6 +37,7 @@
   });
 
   const PROVIDER_DEFAULTS = Object.freeze({
+    mixed: Object.freeze({ model: "", endpoint: "" }),
     "google-web": Object.freeze({ model: "", endpoint: "" }),
     openai: Object.freeze({ model: "gpt-5-nano", endpoint: "" }),
     deepseek: Object.freeze({ model: "deepseek-v4-flash", endpoint: "" }),
@@ -38,6 +49,7 @@
   });
 
   const PROVIDER_LABELS = Object.freeze({
+    mixed: "混合翻译（并行）",
     "google-web": "Google Translate",
     deepseek: "DeepSeek",
     gemini: "Gemini",
@@ -49,7 +61,7 @@
   });
 
   function createModelPresets({ includeLocalOnly = true } = {}) {
-    const providers = ["google-web", "deepseek", "gemini", "openai", "deepl", "azure"];
+    const providers = ["mixed", "google-web", "deepseek", "gemini", "openai", "deepl", "azure"];
     if (includeLocalOnly) providers.push("argos");
     providers.push("custom-backend");
     return providers.map((provider) => {

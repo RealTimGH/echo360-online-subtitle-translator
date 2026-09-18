@@ -9,7 +9,7 @@ Current extension version: **1.6.0**
 ## What It Does
 
 1. Finds the VTT subtitle source for the current Echo360 lecture or Canvas-embedded video (player CC, network capture, `transcript-file` API, etc.).
-2. Google, DeepSeek, Gemini, OpenAI, DeepL, and Azure AI Translator are called directly (`direct_translator.js`). Argos automatically uses the fixed loopback backend; the custom backend URL is used only when that provider is explicitly selected.
+2. Google, DeepSeek, Gemini, OpenAI, DeepL, and Azure AI Translator are called directly (`direct_translator.js`). Argos automatically uses the fixed loopback backend; the custom backend URL is used only when that provider is explicitly selected; Mixed Translation can schedule all of these routes together.
 3. The Argos backend calls `translator/translate_vtt_zh_deepl_native.py` for offline/fallback work. There is no longer a contradictory global “use local backend” switch.
 4. Displays translated subtitles on the active Echo360 video; **the default is the browser `<track>` renderer**. Enable **使用原生 CC 注入（Beta）** in settings to try Echo360 native CC injection (may still miss cues at higher playback speeds; falls back automatically when the lesson has no native caption slot).
 5. **Incremental display while translating** (1.3.0): subtitles mount immediately on click; pending cues show `正在翻译中...` until each batch completes.
@@ -27,17 +27,24 @@ Current extension version: **1.6.0**
 
 If every strategy fails, the control panel reports that no usable subtitle source was found.
 
+SRT captions returned by Instructure Media (no `WEBVTT` header and comma-separated milliseconds) are converted to WebVTT before translation, preserving caption text and timing. The local backend also accepts this input format. Untimed transcript text and inputs containing empty cues are still rejected.
+Caption text after a timing line remains translatable even when it starts with words such as `Note`, `STYLE`, or `REGION`; these words are not treated as format metadata inside a cue.
+
 ## Translation and Display Flow
 
-**Direct translation path** (Google, DeepSeek, Gemini, OpenAI, DeepL, and Azure AI Translator):
+**Automatic translation paths** (direct providers, Argos, and custom backends that implement the async contract):
 
 1. Click `加载翻译字幕` → if mountable, subtitles appear immediately (pending cues show `正在翻译中...`).
 2. While translating → each partial VTT hot-updates completed cues; status shows `翻译中 X/Y（已开始显示）`.
 3. On completion → a final incremental refresh applies the full VTT without tearing down the renderer.
 
+Subtitle settings and diagnostics remain accessible during translation. Conflicting actions, such as starting another translation, are temporarily disabled.
+
+The settings option **一键翻译时自动下载字幕并复制提示词** is disabled by default. On a new install or upgrade, one-click subtitle translation does not automatically download the AI translation JSON or write a prompt to the clipboard unless the user has explicitly enabled the setting; an existing explicit choice is preserved. Materials remain available through the manual AI translation workflow.
+
 **Limits:**
 
-- Incremental preview is only available on the in-extension direct path (`direct_translator.js` → background job). The local FastAPI backend still waits for the full VTT before display.
+- Both in-extension direct jobs and this project's FastAPI async jobs return batched `partial_vtt` updates. A legacy custom backend that implements only synchronous `/translate` waits for the complete VTT before display.
 - A local translation cache hit mounts the complete subtitles immediately (no incremental flow).
 
 ### Manual AI translation
@@ -95,7 +102,7 @@ backend/      FastAPI dev/fallback service and local translation cache
 extension/    Chrome/Safari extension source
 translator/   VTT translator script (backend/fallback path)
 scripts/      Extension build scripts
-tests/        Vitest unit tests for core extension logic
+tests/        Vitest unit/property tests and Python backend/CLI tests
 ```
 
 Main extension modules:
@@ -107,6 +114,7 @@ canvas_course_bridge.js   Data-free proof bridge limited to Canvas course-conten
 browser_api.js            Chrome / Safari storage and runtime API abstraction
 config_keys.js            Shared per-provider API key logic for popup/options
 constants.js              Shared defaults and option lists
+background_contracts.js   Pure service-worker route, sender, and target contracts
 host_support.js           Echo360 / Canvas Instructure Media host detection and adapter helpers
 vtt.js                    Pure VTT parsing, formatting, bilingual, and incremental preview helpers
 manual_translation.js     Manual-AI compact JSON, literal/tag checks, strict import, and local VTT rebuild
@@ -136,7 +144,7 @@ popup.js / options.js     Extension popup and options page
 
 ## Backend Setup
 
-The backend and translator CLI support Python 3.9 or later. On macOS, prefer a Homebrew/pyenv Python built with OpenSSL; the Xcode-provided LibreSSL Python can start the application, but its TLS stack is not fully supported by current `urllib3` releases.
+The backend and translator CLI support Python 3.10 or later. On macOS, prefer a Homebrew/pyenv Python built with OpenSSL; do not use the older Xcode-provided LibreSSL Python because the current dependency set no longer supports that runtime combination.
 
 First, go to the repo root:
 
@@ -147,22 +155,22 @@ cd /path/to/echo360-online-subtitle-translator
 macOS / Linux:
 
 ```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 8765 --reload
+python -m venv backend/.venv
+source backend/.venv/bin/activate
+python -m pip install -r backend/requirements.txt
+python -m backend.launcher --host 127.0.0.1 --port 8765 --log-level info
 ```
 
 Windows (PowerShell):
 
 ```powershell
-cd backend
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 8765 --reload
+py -m venv backend\.venv
+backend\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+python -m backend.launcher --host 127.0.0.1 --port 8765 --log-level info
 ```
+
+`backend.launcher` rejects non-loopback listeners by default. Use `--allow-remote` only behind a trusted authenticated, TLS-terminating proxy; CORS is not authentication.
 
 Health check:
 
@@ -182,6 +190,8 @@ Release artifacts bundle Python, FastAPI, the translator, the Argos/CTranslate2 
 
 - macOS: extract `echo360-online-subtitle-translator-backend-macos-*.tar.gz`, move `Echo360 Subtitle Backend.app` to Applications, and open it at least once;
 - Windows: extract `echo360-online-subtitle-translator-backend-windows-x64.zip`, then run `Echo360SubtitleBackend\install-and-launch-echo360-subtitle-backend.cmd` once. It registers the launch protocol for the current user only and does not require administrator rights.
+
+The macOS package uses a native AppKit window for status and incremental logs; Python/Uvicorn runs as the backend-core child inside the same app bundle, without an embedded WebView or Tk. Closing the window also stops the backend core.
 
 The program listens only on `127.0.0.1:8765`; selecting Argos makes the extension use that address automatically, with no user-facing Backend URL. Quit the program to stop it. Translation cache files go to the current user's platform cache directory rather than the application directory.
 
@@ -216,14 +226,14 @@ Simplified and Traditional Chinese models are bundled by default. Repeat `--argo
 3. Click `Load unpacked`.
 4. Select the `extension/` directory in this repository.
 
-On an Echo360 classroom page, a **split dock control** appears at the bottom right. Its large button checks the cache and loads/starts the default translation while copying the AI prompt and downloading the complete `.translate.json` input. The adjacent disclosure button opens the slide-out panel, and the import button becomes available when the current source session is ready so an AI-produced `.translated.json` can be loaded quickly. First-time installs see a one-time onboarding bubble. You can also configure the provider and API key from the extension popup (`popup.html`) or options page (`options.html`); keys are stored per provider and switch automatically when you change provider. Use `重新翻译` in the panel to clear the current cache and rerun translation.
+On an Echo360 classroom page, a **split dock control** appears at the bottom right. Its large button checks the cache and loads/starts the default translation. It also copies the AI prompt and downloads the complete `.translate.json` input only when **一键翻译时自动下载字幕并复制提示词** is enabled in settings; that option is off by default. The adjacent disclosure button opens the slide-out panel, and the import button becomes available when the current source session is ready so an AI-produced `.translated.json` can be loaded quickly. First-time installs see a one-time onboarding bubble. You can also configure the provider and API key from the extension popup (`popup.html`) or options page (`options.html`); keys are stored per provider and switch automatically when you change provider. Use `重新翻译` in the panel to clear the current cache and rerun translation.
 
 ## Release Builds
 
 Install Node dependencies at the repo root first:
 
 ```bash
-npm install
+npm ci
 ```
 
 Use the store build for Chrome Web Store submission:
@@ -268,13 +278,13 @@ npm run check
 npm run test:coverage
 ```
 
-After installing `backend/requirements.txt`, run the Python backend/CLI smoke regressions separately:
+`npm run check` already includes the Python backend/CLI regressions. To run only that subset:
 
 ```bash
 npm run test:python
 ```
 
-`npm run check` syntax-checks every JavaScript and Python source file, runs the extension test suite, and produces both store and development builds. Tests live under `tests/unit/`, `tests/property/`, and `tests/python/`; see `vitest.config.js` for JavaScript test configuration.
+`npm run check` validates JavaScript/Python syntax and extension resource references, runs both JavaScript and Python tests, and produces store and development builds. Tests live under `tests/unit/`, `tests/property/`, and `tests/python/`; see `vitest.config.mjs` for JavaScript test configuration. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full local gate and [`SECURITY.md`](SECURITY.md) for private vulnerability reporting.
 
 ## Defaults
 
@@ -283,14 +293,19 @@ npm run test:python
 - target: `ZH`
 - max_paragraphs: `6` (the Google web endpoint refreshes progress per cue)
 - max_chars: `1200`
-- concurrency: the shared setting defaults to `96`; Google Translate is capped at `48`, Azure AI Translator at `8`, with other providers unchanged
-- rps: `0` (no added pacing on the first run; recovery uses `3` RPS only after a failed run)
+- concurrency: the shared setting defaults to `96`; Google Translate is capped at `3`, Azure AI Translator at `8`, with other providers unchanged
+- rps: the shared setting is stored as `0`; Google Translate interprets it as the safe `3 RPS` baseline, while other adapters retain their own behavior
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: empty by default
 - deepseek_thinking_mode: `disabled`
 
-Supported providers: `google-web`, `deepseek`, `openai`, `gemini`, `deepl`, `azure`, `argos`, and `custom-backend`. `google-web`, `argos`, and `custom-backend` do not require API keys; Azure requires the user's own Translator subscription key. A custom backend must implement the same `/translate`, `/translate-async`, and `/translate-async/{job_id}` JSON contract as this project.
+Supported providers: `mixed`, `google-web`, `deepseek`, `openai`, `gemini`, `deepl`, `azure`, `argos`, and `custom-backend`. `google-web`, `argos`, and `custom-backend` do not require API keys; Azure requires the user's own Translator subscription key. A custom backend must implement the same `/translate`, `/translate-async`, and `/translate-async/{job_id}` JSON contract as this project.
+
+Mixed Translation distributes work instead of duplicating it: every subtitle cue is sent to one provider, using smooth weighted round-robin to approach the user's target ratios, then results are reassembled in original cue order. Provider routes execute concurrently and remain isolated. Authentication/configuration failures and an open Google circuit remove that provider from the task's healthy pool; failed or incomplete shards move to an untried provider according to health, current load, and weight. Ratios are targets rather than guarantees and may change during failures, quota exhaustion, or target-language incompatibility. The full settings page lets users select any existing providers, enter their individual API keys, and adjust weights; at least two target-compatible providers are required when priority tiers are disabled. The mix and provider-specific model/endpoint configuration are included in the cache signature.
+
+Optional **priority tiers** are off by default. When enabled, each tier can contain one or more providers, with whole-group up/down controls. Only the first tier participates by default. Later tiers join cumulatively when the total subtitle cue count **exceeds** their strictly increasing thresholds. For thresholds of 500 and 1,500, up to 500 cues use tier 1, 501–1,500 use tiers 1–2, and 1,501 or more use all three. All eligible providers share the entire task according to their weights. Multiple lines within one cue count as one subtitle. Providers below their activation threshold cannot receive failover requests; eligible failovers prefer higher-priority tiers. Priority mode allows a single selected provider. Disabling it restores the original mixed behavior while retaining tier settings. See the [research and routing contract](docs/mixed-priority-routing-research.md).
+
 
 Target language options: `ZH`, `ZH-HK`, `YUE`, `EN`, `JA`, `KO`, `FR`, `DE`, `ES`, `IT`, `PT`, `RU`, `AR`, `HI`.
 
@@ -319,13 +334,15 @@ Azure AI Translator provider:
 - Official references: [authentication](https://learn.microsoft.com/azure/ai-services/translator/text-translation/reference/authentication), [Translate API](https://learn.microsoft.com/rest/api/translator/translator/translate?view=rest-translator-v3.0), and [language support](https://learn.microsoft.com/azure/ai-services/translator/language-support).
 
 Google Translate provider:
-- `google-web` uses an unofficial web endpoint and does not require an API key, so it is useful for quick first-run testing
+- `google-web` uses an unofficial web endpoint and does not require an API key, so it is useful for quick first-run testing; Google's developer community states that this endpoint is unmaintained and not recommended for production
 - Every build calls it directly from the extension frontend; Argos/custom-backend settings cannot reroute it
-- The backend/script path caps Google concurrency at `48` (half of the former `96`) while retaining `rps=0, max_chars=1200, max_paragraphs=1`
+- Both the backend/script and direct extension paths use a shared `3 RPS / 3 concurrent` Google profile while retaining `max_chars=1200, max_paragraphs=1`
 - This endpoint is unofficial, so stability, availability, and translation quality are not guaranteed
 - For better subtitle quality and API stability, use an official API provider such as `azure`/`deepl`, or an AI provider, with your own API key
 
-For the direct extension path, `google-web` uses at most `48` workers, half of the former `96`-worker cap, with default `rps=0` (no added pacing). An explicitly supplied positive `rps` is still honored. Each cue is handled independently. Isolated `HTTP 429` responses still use `Retry-After` or exponential backoff, but five 429 responses within ten seconds open a circuit breaker: new Google requests and retries stop, the old adaptive Google recovery is skipped, and the local backend is launched so Argos can take over. The Python backend uses the same threshold and preserves Google cues that already succeeded while Argos fills the unfinished cues. Any cues that still fail keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports the effective concurrency/RPS, progress, circuit breaker, fallback, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly.
+Both direct extension and Python `google-web` paths default to a shared `3 RPS / 3 concurrent` profile. Even an older stored `rps=0` receives this safe baseline, while a lower explicit RPS value is preserved. Each cue is handled independently. Isolated `HTTP 429` responses honor `Retry-After` or use jittered exponential backoff, but five 429 responses within ten seconds open a circuit breaker: new Google requests and retries stop, and the local backend is launched so Argos can take over; Mixed Translation instead reassigns the failed shard to another healthy provider. The Python backend uses the same threshold and preserves Google cues that already succeeded while Argos fills the unfinished cues. Any cues that still fail keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports effective concurrency/RPS, progress, circuit breaker, fallback, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly. Research references: [Google developer-community note on the unofficial endpoint](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639) and [official Google Cloud Translation quotas (formal API comparison only)](https://docs.cloud.google.com/translate/quotas).
+
+The mixed router follows mature gateway patterns for weighted traffic distribution, failover, and unhealthy-upstream ejection instead of sending each cue redundantly to every service: [Envoy Gateway load balancing](https://gateway.envoyproxy.io/docs/concepts/load-balancing/), [Envoy outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier), [Azure Circuit Breaker pattern](https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker), and [Azure Bulkhead pattern](https://learn.microsoft.com/azure/architecture/patterns/bulkhead).
 
 Argos Translate provider:
 
@@ -363,7 +380,10 @@ Optional environment overrides:
 ```bash
 export TRANSLATOR_SCRIPT=/absolute/path/to/translate_vtt_zh_deepl_native.py
 export TRANSLATOR_PYTHON_BIN=/absolute/path/to/python
+export TRANSLATOR_TASK_TIMEOUT_SECONDS=480
 ```
+
+The whole-task deadline defaults to 480 seconds and is bounded to 30–480 seconds. On expiry, the backend terminates and then forcibly reaps the translator process tree. The frontend keeps polling for one additional minute so cleanup and the typed terminal error can arrive; the backend deadline therefore cannot be configured beyond the client window.
 
 The translator script comes from [bryanxianyu/VTT-Translator](https://github.com/bryanxianyu/VTT-Translator), and this repository keeps a vendored snapshot at `translator/translate_vtt_zh_deepl_native.py`.
 
@@ -397,5 +417,5 @@ The extension keeps one local translated VTT cache entry. Bilingual display is r
 - Detailed network body capture in the probe is disabled by default.
 - If a separated intro clip exists, the extension prefers strong media-id mapping first and timeline/state matching as fallback.
 - Transcript-panel-only lessons without player CC rely on the `transcript-file` API (1.2.2); those pages have no native CC DOM to inject into, so `hasNativeCaptionCapability()` detects that and uses the browser track directly.
-- Incremental preview partial VTT is emitted per batch by `direct_translator.js`, polled via `background.js` jobs; `buildIncrementalPreviewVtt()` replaces untranslated cues with placeholder text.
+- Incremental preview partial VTT is emitted per batch by `direct_translator.js` or FastAPI async jobs and polled into `buildIncrementalPreviewVtt()`, which replaces untranslated cues with placeholder text. Legacy synchronous custom backends do not provide this capability.
 Beta-first rendering, capability detection, and perf/UI polish

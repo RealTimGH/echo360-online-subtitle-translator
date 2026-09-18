@@ -37,18 +37,31 @@ binaries += collect_dynamic_libs("sentencepiece")
 binaries += collect_dynamic_libs("onnxruntime")
 datas += collect_data_files("certifi")
 datas += collect_data_files("onnxruntime")
-hiddenimports += ["onnxruntime.capi._pybind_state"]
+hiddenimports += [
+    "onnxruntime.capi._pybind_state",
+]
 
 for package_name in (
+    "anyio",
     "argostranslate",
+    "certifi",
+    "charset-normalizer",
     "ctranslate2",
+    "fastapi",
+    "h11",
+    "idna",
     "minisbd",
     "numpy",
     "onnxruntime",
+    "pydantic",
+    "requests",
     "sacremoses",
     "sentencepiece",
     "spacy",
+    "starlette",
     "stanza",
+    "torch",
+    "urllib3",
     "uvicorn",
 ):
     datas += copy_metadata(package_name)
@@ -90,12 +103,15 @@ executable = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    # This executable is the Python server core. On macOS the build script
+    # moves it beside a small native AppKit host, which captures its output.
+    # Keeping console mode here makes the core's logs available to that pipe
+    # and preserves the CLI-compatible Windows artifact.
     console=True,
     disable_windowed_traceback=False,
-    # Finder/browser URL opens are delivered as argv values on macOS.  Keep
-    # the launch URL available to backend.launcher so it can be discarded
-    # before argparse processes normal server flags.
-    argv_emulation=True,
+    # The native host forwards ordinary command-line options itself. The
+    # backend only needs the URL scheme to launch the app, not its URL payload.
+    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
@@ -120,6 +136,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleDisplayName": "Echo360 Subtitle Backend",
             "CFBundleName": "Echo360 Subtitle Backend",
+            "LSBackgroundOnly": False,
+            "LSUIElement": False,
             "LSMinimumSystemVersion": "12.0",
             "CFBundleURLTypes": [
                 {

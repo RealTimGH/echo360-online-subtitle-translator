@@ -18,6 +18,8 @@ describe("extension release metadata", () => {
   it("declares the Canvas/Instructure Media frame support needed by the player adapter", () => {
     const manifest = JSON.parse(readFileSync(resolve(PROJECT_ROOT, "extension/manifest.json"), "utf8"));
     expect(manifest.permissions).toEqual(expect.arrayContaining(["storage", "clipboardRead", "clipboardWrite"]));
+    expect(manifest.content_security_policy?.extension_pages)
+      .toBe("script-src 'self'; object-src 'self'");
     expect(manifest.host_permissions).toContain("*://*.instructuremedia.com/*");
     expect(manifest.host_permissions).not.toContain("*://canvas.sydney.edu.au/*");
     expect(manifest.host_permissions).toContain("http://[::1]:8765/*");
