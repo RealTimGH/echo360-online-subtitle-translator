@@ -8,12 +8,20 @@
   // its own file — see extension/ui_*.js.
   let handlers = {
     onTranslate: null,
+    onQuickTranslate: null,
     onForceTranslate: null,
     onPrefsChanged: null,
     onTargetChanged: null,
+    onManualPrepare: null,
+    onManualDownloadVtt: null,
+    onManualCopyPrompt: null,
+    onManualDownloadPrompt: null,
+    onManualImport: null,
+    onManualToggleMode: null,
   };
 
   let activePanel = null;
+  let activeBall = null;
   let activePopover = null;
   let activeFailureActions = null;
 
@@ -110,11 +118,15 @@
     // grouped. pointer-events:none is set in CSS; children re-enable as needed.
     const root = document.createElement("div");
     root.id = "echo360-ui-root";
+    root.dataset.echo360Host = ns.hostSupport?.isInstructureMediaHost?.()
+      ? "instructure-media"
+      : "echo360";
     document.body.appendChild(root);
 
     function showPanel() {
       onboarding.dismiss();
       ball.hide();
+      ball.setPanelExpanded?.(true);
       panel.show();
       activePanel?.setStatusLive?.(activeFailureActions?.isVisible?.() !== true);
     }
@@ -126,11 +138,27 @@
       // the compact control surface and the user can explicitly open details.
       activeFailureActions?.collapse?.();
       panel.hide();
+      ball.setPanelExpanded?.(false);
       activePanel?.setStatusLive?.(true);
       ball.show();
     }
 
-    const ball = ns.uiBall.create(root, { onActivate: showPanel });
+    const ball = ns.uiBall.create(root, {
+      onQuickTranslate: () => {
+        onboarding.dismiss();
+        return handlers.onQuickTranslate?.();
+      },
+      onOpenPanel: showPanel,
+      onImport: async () => {
+        const result = await panel.triggerManualImport?.();
+        if (result === false) {
+          showPanel();
+          panel.openManual?.({ prepare: false });
+          panel.focusManualFileImport?.();
+        }
+        return result;
+      },
+    });
     const onboarding = ns.uiOnboarding.create(root, ball);
     const panel = ns.uiPanel.create(root, handlers, {
       onCollapse: hidePanel,
@@ -160,6 +188,7 @@
     });
 
     activePanel = panel;
+    activeBall = ball;
     activePopover = popover;
     attachConsoleCapture();
 
@@ -196,10 +225,12 @@
 
   function setStatusText(text, kind = "info") {
     activePanel?.setStatusText(text, kind);
+    activeBall?.setStatus?.(text, kind);
   }
 
   function updateActionButtons(text, disabled = false) {
     activePanel?.updateActionButtons(text, disabled);
+    activeBall?.setBusy?.(disabled);
   }
 
   function appendLog(level, ...values) {
@@ -212,6 +243,8 @@
 
   function showTranslationFailureActions(options) {
     activePopover?.hide();
+    activeBall?.hide();
+    activeBall?.setPanelExpanded?.(true);
     activePanel?.show();
     activeFailureActions?.show(options);
     activePanel?.setStatusLive?.(true);
@@ -228,6 +261,8 @@
     // configuration popover; it must not compete with the actionable error
     // card when a save/open/translation operation fails.
     activePopover?.hide();
+    activeBall?.hide();
+    activeBall?.setPanelExpanded?.(true);
     activePanel?.show();
     activeFailureActions?.show({ ...options, error: model, context: options.context || options });
     const summary = model?.summary || model?.message || "发生未知错误";
@@ -254,6 +289,19 @@
     setStatusText,
     setStatusLive: (enabled) => activePanel?.setStatusLive?.(enabled),
     updateActionButtons,
+    setManualReady: (details) => {
+      activePanel?.setManualReady?.(details);
+      activeBall?.setImportReady?.(true);
+    },
+    setManualBusy: (message) => activePanel?.setManualBusy?.(message),
+    setManualMessage: (message, kind) => activePanel?.setManualMessage?.(message, kind),
+    showManualRecovery: () => {
+      activePopover?.hide();
+      activeBall?.hide();
+      activeBall?.setPanelExpanded?.(true);
+      activePanel?.show();
+      activePanel?.openManual?.({ prepare: false });
+    },
     appendLog,
     clearLogs,
     showTranslationFailureActions,

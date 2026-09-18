@@ -7,11 +7,13 @@ describe("config_keys (shared per-provider API key logic)", () => {
     evalModule("config_keys.js");
   });
 
-  it("treats google-web and argos as keyless and cloud API providers as needing a key", () => {
+  it("treats mixed, google-web and argos as keyless and cloud API providers as needing a key", () => {
     const api = globalThis.Echo360ConfigKeys;
+    expect(api.isKeylessProvider("mixed")).toBe(true);
     expect(api.isKeylessProvider("google-web")).toBe(true);
     expect(api.isKeylessProvider("argos")).toBe(true);
     expect(api.isKeylessProvider("deepseek")).toBe(false);
+    expect(api.isKeylessProvider("azure")).toBe(false);
     expect(api.isKeylessProvider("")).toBe(false);
   });
 

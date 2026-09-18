@@ -190,6 +190,18 @@
         return callApi(rawApi.tabs.remove, rawApi.tabs, [tabId], "RUNTIME_MESSAGE_ERROR");
       },
     },
+    permissions: {
+      contains(permissions) {
+        if (typeof rawApi.permissions?.contains !== "function") return Promise.resolve(false);
+        return callApi(rawApi.permissions.contains, rawApi.permissions, [permissions], "PERMISSION_CHECK_FAILED");
+      },
+      request(permissions) {
+        if (typeof rawApi.permissions?.request !== "function") {
+          return Promise.reject(toApiError("permissions.request is unavailable", "BACKEND_PERMISSION_DENIED"));
+        }
+        return callApi(rawApi.permissions.request, rawApi.permissions, [permissions], "BACKEND_PERMISSION_DENIED");
+      },
+    },
     storage: {
       local: {
         get(keys) {

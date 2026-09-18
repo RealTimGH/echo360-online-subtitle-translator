@@ -13,11 +13,15 @@
     PREFS_KEY_PREFIX: "echo360TranslatorPrefs::",
     ONBOARDING_KEY: "echo360TranslatorOnboardingSeen",
     PROVIDER_LABELS: {
+      mixed: "混合翻译（并行）",
       "google-web": "Google Translate",
       deepseek: "DeepSeek",
       gemini: "Gemini",
       openai: "OpenAI",
       deepl: "DeepL",
+      azure: "Azure AI Translator F0",
+      argos: "Argos Translate（本地）",
+      "custom-backend": "自定义后端",
     },
     TARGET_OPTIONS: ["ZH", "ZH-HK", "YUE", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU", "AR", "HI"],
     TARGET_LABELS: {

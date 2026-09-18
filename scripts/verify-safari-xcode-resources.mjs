@@ -96,17 +96,28 @@ function resourcePhaseBlocks(resourcesSection) {
   )].map((match) => ({ id: match[1], body: match[2] }));
 }
 
+function extensionResourceGroup(project) {
+  const match = project.match(
+    /\n\t\t([A-F0-9]{24}) \/\* Resources \*\/ = \{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = \(\n((?:(?!\n\t\t[A-F0-9]{24} \/\* )[\s\S])*?)(\n?\t\t\t\);\n\t\t\tname = Resources;\n\t\t\tpath = "Shared \(Extension\)";)/
+  );
+  return match ? { id: match[1], body: match[2] } : null;
+}
+
 function verify(project, resourcesToVerify, options = {}) {
   const projectFilePath = options.projectFilePath || projectPath;
   const expectedResourceRoot = options.expectedResourceRoot || storeExtensionRoot;
   const fileRefs = section(project, "/* Begin PBXFileReference section */", "/* End PBXFileReference section */");
   const buildFiles = section(project, "/* Begin PBXBuildFile section */", "/* End PBXBuildFile section */");
   const resources = section(project, "/* Begin PBXResourcesBuildPhase section */", "/* End PBXResourcesBuildPhase section */");
+  const extensionGroup = extensionResourceGroup(project);
   const extensionPhases = resourcePhaseBlocks(resources)
     .filter(({ body }) => body.includes("/* page_probe.js in Resources */"));
 
   const missingFileRefs = resourcesToVerify.filter((name) => !new RegExp(`/\\* ${escaped(name)} \\*/`).test(fileRefs));
   const missingBuildFiles = resourcesToVerify.filter((name) => !new RegExp(`/\\* ${escaped(name)} in Resources \\*/`).test(buildFiles));
+  const missingExtensionGroupResources = extensionGroup
+    ? resourcesToVerify.filter((name) => !extensionGroup.body.includes(`/* ${name} */`))
+    : resourcesToVerify;
   const missingTargetResources = extensionPhases.map(({ id, body }) => ({
     id,
     missing: resourcesToVerify.filter((name) => !body.includes(`/* ${name} in Resources */`)),
@@ -136,12 +147,14 @@ function verify(project, resourcesToVerify, options = {}) {
   }).map((name) => ({ name, path: fileRefPaths.get(name) }));
 
   if (extensionPhases.length !== 2 || missingFileRefs.length || missingBuildFiles.length ||
+      missingExtensionGroupResources.length ||
       missingTargetResources.length || unexpectedTargetResources.length ||
       unresolvedPaths.length || wrongResourcePaths.length) {
     const details = {
       extensionResourcePhaseCount: extensionPhases.length,
       missingFileRefs,
       missingBuildFiles,
+      missingExtensionGroupResources,
       missingTargetResources,
       unexpectedTargetResources,
       unresolvedPaths,
@@ -163,4 +176,12 @@ if (!fs.existsSync(projectPath)) {
   console.log(`Safari Xcode resources OK: ${buildResult.fileCount} generated files; ${result.resourceCount} top-level resources in ${result.extensionResourcePhaseCount} extension targets.`);
 }
 
-export { extensionResources, manifestScripts, relativeFiles, resourcePhaseBlocks, verify, verifyStoreBuild };
+export {
+  extensionResourceGroup,
+  extensionResources,
+  manifestScripts,
+  relativeFiles,
+  resourcePhaseBlocks,
+  verify,
+  verifyStoreBuild,
+};

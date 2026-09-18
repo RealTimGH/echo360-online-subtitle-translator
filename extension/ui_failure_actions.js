@@ -563,6 +563,17 @@
         count: entry.count,
       });
       setPanelVisible(true);
+      // History lives below the current diagnosis card. Selecting a record
+      // must reveal both the diagnostic rows and the card itself; otherwise
+      // the selected history row is visible while the requested detail stays
+      // above the scroll position.
+      refs.details.open = true;
+      try {
+        panel.scrollIntoView?.({ block: "start", inline: "nearest", behavior: "smooth" });
+      } catch (_) {
+        // Older embedded WebViews may expose only the argument-free form.
+        try { panel.scrollIntoView?.(); } catch (_) {}
+      }
       refs.retry.hidden = true;
       refs.retry.setAttribute("aria-hidden", "true");
       refs.cancel.hidden = true;

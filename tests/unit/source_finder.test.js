@@ -22,7 +22,9 @@ function setup() {
     isVideoLikelyActive: vi.fn(() => false),
   };
   const ns = makeFullNs({ video: videoMock });
+  ns.browserApi.runtime = { sendMessage: vi.fn() };
   window.Echo360Translator = ns;
+  evalModule("error_utils.js");
   evalModule("vtt.js");
   evalModule("source_finder.js");
   return window.Echo360Translator.sourceFinder;
@@ -51,6 +53,35 @@ describe("fetchTranscriptFileVtt", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("rejects plaintext Instructure Media resources before fetching", async () => {
+    setLocation("/lesson/abc/classroom");
+    const result = await sourceFinder.fetchTextResource("http://media.instructuremedia.com/captions/source.vtt");
+    expect(result).toMatchObject({ ok: false, code: "RESOURCE_HOST_NOT_ALLOWED" });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch an oversized resource through the service worker", async () => {
+    setLocation("/lesson/abc/classroom");
+    global.fetch.mockResolvedValue({
+      ok: true,
+      headers: { get: vi.fn(() => "5000001") },
+      text: vi.fn(),
+    });
+    const result = await sourceFinder.fetchTextResource("https://media.instructuremedia.com/captions/source.vtt");
+    expect(result).toMatchObject({ ok: false, code: "RESOURCE_TOO_LARGE", status: 413 });
+    expect(window.Echo360Translator.browserApi.runtime.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not start another source request after the shared deadline", async () => {
+    setLocation("/lesson/abc/classroom");
+    const result = await sourceFinder.fetchTextResource(
+      "https://media.instructuremedia.com/captions/source.vtt",
+      { deadlineAt: Date.now() - 1 }
+    );
+    expect(result).toMatchObject({ ok: false, code: "SOURCE_RESOLUTION_TIMEOUT" });
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
   it("returns empty (and never fetches) when no media id can be discovered", async () => {
     setLocation("/lesson/abc/classroom");
     const result = await sourceFinder.fetchTranscriptFileVtt(null);
@@ -67,7 +98,11 @@ describe("fetchTranscriptFileVtt", () => {
 
     expect(global.fetch).toHaveBeenCalledWith(
       "https://echo360.net.au/api/ui/echoplayer/lessons/abc/medias/media-1/transcript-file?format=vtt",
-      { credentials: "include" }
+      expect.objectContaining({
+        credentials: "include",
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      })
     );
     expect(result.text).toBe(VTT.trimEnd());
     expect(result.strongMapped).toBe(true);
@@ -210,6 +245,7 @@ describe("fetchTextResource", () => {
     expect(sendMessage).toHaveBeenCalledWith({
       type: "fetch-text-resource",
       url: "https://apse2.nv.instructuremedia.com/captions/c-123.vtt",
+      timeoutMs: 20000,
     });
   });
 
@@ -274,6 +310,41 @@ describe("canonicalizeSourceId", () => {
     setLocation("/lti-app/embed/perspective/player", "https://sydney.instructuremedia.com");
     const source = "https://sydney.instructuremedia.com/api/media_management/caption_files/media-1?lang=en";
     expect(sourceFinder.canonicalizeSourceId(source)).toBe(source);
+  });
+});
+
+describe("source track selection", () => {
+  beforeEach(() => {
+    sourceFinder = setup();
+    document.body.innerHTML = "";
+  });
+
+  it("never selects the extension's generated translated track as the source", () => {
+    const video = document.createElement("video");
+    const translated = document.createElement("track");
+    translated.src = "blob:echo360-generated";
+    translated.label = "翻译字幕 (双语)";
+    translated.setAttribute("data-echo360-translated", "1");
+    const original = document.createElement("track");
+    original.src = "https://media.example/original.vtt";
+    video.append(translated, original);
+    document.body.appendChild(video);
+
+    expect(sourceFinder.findBestTrackElement(video)).toBe(original);
+    expect(sourceFinder.isExtensionTranslatedTrack(translated)).toBe(true);
+    expect(sourceFinder.isExtensionTranslatedTrack(original)).toBe(false);
+  });
+
+  it("removes translated TextTrack objects before exporting cues or evaluating native capability", () => {
+    const translated = { label: "翻译字幕", mode: "showing", cues: [{ startTime: 0, endTime: 1, text: "译文" }] };
+    const original = { label: "English (CC)", mode: "disabled", cues: [{ startTime: 0, endTime: 1, text: "Original" }] };
+    const video = {
+      querySelectorAll: () => [],
+      textTracks: [translated, original],
+    };
+
+    expect(sourceFinder.collectTextTrackObjects(video)).toEqual([original]);
+    expect(sourceFinder.hasNativeCaptionCapability(video)).toBe(true);
   });
 });
 

@@ -5,6 +5,14 @@
   const INSTRUCTURE_MEDIA_HOST_RE = /(^|\.)instructuremedia\.com$/i;
   const STATIC_ASSET_EXT_RE = /\.(?:avif|bmp|css|gif|html?|ico|jpe?g|js|json|map|mjs|mp4|m4s|mpd|png|svg|ts|ttf|wasm|webm|woff2?)(?:[?#]|$)/i;
   const TEXT_TRACK_HINT_RE = /(?:\.vtt|webvtt|subtitle|caption|transcript|media[_-]?track|text[_-]?track|timedtext)/i;
+  const MAX_TEXT_RESOURCE_BYTES = 5_000_000;
+  const TEXT_RESOURCE_TIMEOUT_MS = 20_000;
+
+  function remainingResourceTimeout(options = {}) {
+    const deadlineAt = Number(options.deadlineAt);
+    if (!Number.isFinite(deadlineAt)) return TEXT_RESOURCE_TIMEOUT_MS;
+    return Math.max(0, Math.min(TEXT_RESOURCE_TIMEOUT_MS, deadlineAt - Date.now()));
+  }
 
   function logUrl(value) {
     return ns.errorUtils?.redactUrl?.(value) || String(value || "");
@@ -12,7 +20,9 @@
 
   function specificErrorCode(error, fallback = "RESOURCE_FETCH_FAILED") {
     const inferred = ns.errorUtils?.getErrorCode?.(error);
-    return inferred && !ns.errorUtils?.isGenericCode?.(inferred) ? inferred : fallback;
+    if (inferred && !ns.errorUtils?.isGenericCode?.(inferred)) return inferred;
+    const explicit = String(error?.code || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
+    return explicit && !["ERROR", "UNKNOWN", "UNKNOWN_ERROR"].includes(explicit) ? explicit : fallback;
   }
 
   function validStatus(value) {
@@ -23,8 +33,7 @@
   function isInstructureMediaResource(url) {
     try {
       const parsed = new URL(url);
-      return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
-        INSTRUCTURE_MEDIA_HOST_RE.test(parsed.hostname);
+      return parsed.protocol === "https:" && INSTRUCTURE_MEDIA_HOST_RE.test(parsed.hostname);
     } catch (_) {
       return false;
     }
@@ -35,19 +44,44 @@
   // from a different media subdomain with stricter headers. The service worker
   // fallback uses the declared Instructure host permission while keeping the
   // request target allowlisted; this avoids adding a broad arbitrary proxy.
-  async function fetchTextResource(url) {
+  async function fetchTextResource(url, options = {}) {
     let contentError = null;
     try {
-      const resp = await fetch(url, { credentials: "include" });
-      if (resp.ok) return { ok: true, text: await resp.text(), via: "content" };
+      const parsed = new URL(url, location.href);
+      if (INSTRUCTURE_MEDIA_HOST_RE.test(parsed.hostname) && parsed.protocol !== "https:") {
+        return {
+          ok: false,
+          error: "Instructure Media 字幕资源必须使用 HTTPS",
+          code: "RESOURCE_HOST_NOT_ALLOWED",
+          status: null,
+        };
+      }
+    } catch (_) {
+      // Let fetch report malformed non-Instructure candidates consistently.
+    }
+    const timeoutMs = remainingResourceTimeout(options);
+    if (timeoutMs <= 0) {
+      return { ok: false, error: "字幕源解析已超过总时限", code: "SOURCE_RESOLUTION_TIMEOUT", status: null };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { credentials: "include", cache: "no-store", signal: controller.signal });
+      if (resp.ok) {
+        const text = await ns.errorUtils.readBoundedResponseText(resp, MAX_TEXT_RESOURCE_BYTES);
+        return { ok: true, text, via: "content" };
+      }
       contentError = new Error(`HTTP ${resp.status}`);
       contentError.code = `HTTP_${resp.status}`;
       contentError.status = resp.status;
     } catch (err) {
       contentError = err;
+    } finally {
+      clearTimeout(timer);
     }
 
-    if (!isInstructureMediaResource(url) || !ns.browserApi?.runtime?.sendMessage) {
+    if (contentError?.code === "RESOURCE_TOO_LARGE" ||
+      !isInstructureMediaResource(url) || !ns.browserApi?.runtime?.sendMessage) {
       return {
         ok: false,
         error: contentError?.message || String(contentError || "fetch failed"),
@@ -56,9 +90,14 @@
       };
     }
     try {
+      const remainingMs = remainingResourceTimeout(options);
+      if (remainingMs <= 0) {
+        return { ok: false, error: "字幕源解析已超过总时限", code: "SOURCE_RESOLUTION_TIMEOUT", status: null };
+      }
       const response = await ns.browserApi.runtime.sendMessage({
         type: "fetch-text-resource",
         url,
+        timeoutMs: remainingMs,
       });
       if (response?.ok && typeof response.data?.text === "string") {
         return { ok: true, text: response.data.text, via: "service-worker" };
@@ -94,6 +133,22 @@
     }
   }
 
+  // A translated track is an output surface, never a source candidate. The
+  // renderer marks its injected <track> explicitly, but the corresponding
+  // TextTrack object does not expose that data attribute. Keep the label check
+  // as a second signal for tracks that survived a SPA transition or were
+  // created by an older extension build.
+  function isExtensionTranslatedTrack(track) {
+    const element = track?.nodeType === 1 ? track : track?.element;
+    if (element?.hasAttribute?.("data-echo360-translated")) return true;
+    const labels = [
+      track?.label,
+      element?.label,
+      element?.getAttribute?.("label"),
+    ].map((value) => String(value || "").trim());
+    return labels.some((label) => /(?:翻译字幕|translated\s+subtitle)/i.test(label));
+  }
+
   function collectTextTrackObjects(video) {
     const player = getPlayerForVideo(video);
     const lists = [
@@ -108,7 +163,7 @@
     const seen = new Set();
     for (const list of lists) {
       for (const track of asArray(list)) {
-        if (!track || seen.has(track)) continue;
+        if (!track || isExtensionTranslatedTrack(track) || seen.has(track)) continue;
         seen.add(track);
         tracks.push(track);
       }
@@ -136,6 +191,7 @@
       ...asArray(player?.querySelectorAll?.("track")),
     ];
     for (const track of trackEls) {
+      if (isExtensionTranslatedTrack(track)) continue;
       add(track.getAttribute?.("src"));
       add(track.src);
       add(track.getAttribute?.("data-src"));
@@ -167,8 +223,9 @@
   }
 
   function findBestTrackElement(video) {
-    const hasUsableSrc = (track) => !!String(track?.getAttribute?.("src") || "").trim();
-    const tracks = Array.from(video.querySelectorAll("track")).filter(hasUsableSrc);
+    const hasUsableSrc = (track) =>
+      !!String(track?.getAttribute?.("src") || "").trim() && !isExtensionTranslatedTrack(track);
+    const tracks = Array.from(video?.querySelectorAll?.("track") || []).filter(hasUsableSrc);
     if (tracks.length > 0) return tracks[0];
     const textTracks = Array.from(document.querySelectorAll("track")).filter(hasUsableSrc);
     return textTracks[0] || null;
@@ -203,10 +260,10 @@
   function hasNativeCaptionCapability(video) {
     if (!video) return false;
     const nativeTrackEls = Array.from(video.querySelectorAll("track[src]")).filter(
-      (t) => !!String(t.getAttribute("src") || "").trim() && !t.hasAttribute("data-echo360-translated")
+      (t) => !!String(t.getAttribute("src") || "").trim() && !isExtensionTranslatedTrack(t)
     );
     if (nativeTrackEls.length > 0) return true;
-    if (Array.from(video.textTracks || []).some((t) => !(t.label || "").includes("翻译"))) return true;
+    if (collectTextTrackObjects(video).length > 0) return true;
     return !!findCaptionToggleButton(video);
   }
 
@@ -305,20 +362,31 @@
     return { lessonId, resourceIds, hintIds };
   }
 
-  async function tryTranscriptFileForMediaIds(lessonId, mediaIds, video) {
+  async function tryTranscriptFileForMediaIds(lessonId, mediaIds, video, options = {}) {
     if (mediaIds.length === 0) return { best: null, attempts: [] };
     const nowSec = Number(video?.currentTime || 0);
     let best = null;
     const attempts = [];
     for (const mediaId of mediaIds) {
+      const timeoutMs = remainingResourceTimeout(options);
+      if (timeoutMs <= 0) {
+        attempts.push({ strategy: "transcript-file", outcome: "deadline", code: "SOURCE_RESOLUTION_TIMEOUT", error: "source resolution deadline exceeded" });
+        break;
+      }
       const url = `${location.origin}/api/ui/echoplayer/lessons/${encodeURIComponent(lessonId)}/medias/${encodeURIComponent(mediaId)}/transcript-file?format=vtt`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const resp = await fetch(url, { credentials: "include" });
+        const resp = await fetch(url, {
+          credentials: "include",
+          cache: "no-store",
+          signal: controller.signal,
+        });
         if (!resp.ok) {
           attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "fetch-failed", code: `HTTP_${resp.status}`, status: resp.status, error: `HTTP ${resp.status}` });
           continue;
         }
-        const rawText = await resp.text();
+        const rawText = await ns.errorUtils.readBoundedResponseText(resp, MAX_TEXT_RESOURCE_BYTES);
         const text = vttApi.normalizeTimedText
           ? vttApi.normalizeTimedText(rawText)
           : rawText;
@@ -343,6 +411,8 @@
         attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "usable", code: "OK", cueCount: stats.cueCount });
       } catch (error) {
         attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "exception", code: specificErrorCode(error, "RESOURCE_NETWORK_ERROR"), status: validStatus(error?.status), error: error?.message || String(error) });
+      } finally {
+        clearTimeout(timer);
       }
     }
     return { best, attempts };
@@ -369,7 +439,7 @@
   // network request whose URL contains "vtt"/"caption"/"subtitle". Hitting
   // it directly finds a real, cue-timed VTT even when collectCandidateSubtitleUrls()
   // and the <track>/TextTrack based lookups all come up empty.
-  async function fetchTranscriptFileVtt(video) {
+  async function fetchTranscriptFileVtt(video, options = {}) {
     const empty = { text: "", sourceId: "", strongMapped: false, sourceMeta: null, diagnostics: { candidateCount: 0, attempts: [] } };
     const { lessonId, resourceIds, hintIds } = collectTranscriptMediaIdCandidates();
     if (!lessonId || (resourceIds.length === 0 && hintIds.length === 0)) return empty;
@@ -377,7 +447,7 @@
     // Interactive-media resource ids map directly to this lesson's transcript.
     // When one of them hits, stop immediately — do not keep probing React-fiber
     // hint UUIDs that mostly 404 and clutter the console.
-    let probe = await tryTranscriptFileForMediaIds(lessonId, resourceIds, video);
+    let probe = await tryTranscriptFileForMediaIds(lessonId, resourceIds, video, options);
     let best = probe.best;
     const diagnostics = { candidateCount: resourceIds.length + hintIds.length, attempts: [...probe.attempts] };
     if (best) {
@@ -392,7 +462,7 @@
       return { ...buildTranscriptFileResult(best), diagnostics };
     }
 
-    probe = await tryTranscriptFileForMediaIds(lessonId, hintIds, video);
+    probe = await tryTranscriptFileForMediaIds(lessonId, hintIds, video, options);
     best = probe.best;
     diagnostics.attempts.push(...probe.attempts);
     if (!best) return { ...empty, diagnostics: { ...diagnostics, attempts: diagnostics.attempts.slice(0, 30) } };
@@ -448,7 +518,7 @@
     }
   }
 
-  async function fetchBestVttFromCandidates(video) {
+  async function fetchBestVttFromCandidates(video, options = {}) {
     const candidates = collectCandidateSubtitleUrls(video);
     const diagnostics = [];
     const nowSec = Number(video?.currentTime || 0);
@@ -458,8 +528,12 @@
     const activeVideoBoost = videoApi.isVideoLikelyActive(video) ? 50_000 : 0;
     let best = null;
     for (const item of candidates) {
+      if (remainingResourceTimeout(options) <= 0) {
+        diagnostics.push({ outcome: "deadline", code: "SOURCE_RESOLUTION_TIMEOUT", error: "source resolution deadline exceeded" });
+        break;
+      }
       try {
-        const fetched = await fetchTextResource(item.url);
+        const fetched = await fetchTextResource(item.url, options);
         if (!fetched.ok) {
           diagnostics.push({ url: item.url, outcome: "fetch-failed", code: fetched.code || "RESOURCE_FETCH_FAILED", status: fetched.status || null, error: fetched.error || "fetch failed" });
           continue;
@@ -617,6 +691,7 @@
 
   ns.sourceFinder = {
     findBestTrackElement,
+    isExtensionTranslatedTrack,
     hasNativeCaptionCapability,
     exportVttFromTextTracks,
     collectCandidateSubtitleUrls,

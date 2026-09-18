@@ -379,7 +379,11 @@
     // native surface is hidden by the CC toggle, while keeping the same VTT
     // timing and incremental update lifecycle.
     if (customCaptionMode) {
-      const displayBilingual = !!fallbackBilingual;
+      // The preference name is historical: false means the user explicitly
+      // selected native-CC injection. Instructure Media otherwise gets an
+      // independent overlay which coexists with Vidstack's own CC surface.
+      const nativeInjection = !useNativeSubtitles;
+      const displayBilingual = nativeInjection ? true : !!fallbackBilingual;
       if (incremental && ns.playerCaptionRenderer.isMounted()) {
         if (ns.playerCaptionRenderer.update({
           video,
@@ -388,6 +392,7 @@
           size,
           bilingual: displayBilingual,
           reverseOrder: fallbackReverseOrder,
+          nativeInjection,
         })) {
           lastTranslatedTrack = { mode: "instructure-caption" };
           commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
@@ -404,6 +409,7 @@
         size,
         bilingual: displayBilingual,
         reverseOrder: fallbackReverseOrder,
+        nativeInjection,
       });
       if (mounted) {
         lastTranslatedTrack = { mode: "instructure-caption" };
@@ -483,7 +489,12 @@
     track.srclang = "zh";
     track.kind = "subtitles";
     track.setAttribute("data-echo360-translated", "1");
-    if (resolvedSourceMeta.sourceId) track.setAttribute("data-echo360-source-id", resolvedSourceMeta.sourceId);
+    if (resolvedSourceMeta.sourceId) {
+      track.setAttribute(
+        "data-echo360-source-id",
+        ns.errorUtils?.redactUrl?.(resolvedSourceMeta.sourceId) || "subtitle-source"
+      );
+    }
     if (resolvedSourceMeta.mediaId) track.setAttribute("data-echo360-media-id", resolvedSourceMeta.mediaId);
     if (resolvedSourceMeta.mapSource) track.setAttribute("data-echo360-map-source", resolvedSourceMeta.mapSource);
     track.setAttribute("data-echo360-source-max-end", String(Math.round(resolvedSourceMeta.stats?.maxEnd || 0)));

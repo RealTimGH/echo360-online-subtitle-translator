@@ -9,7 +9,13 @@
     SIZE_MAP,
   } = ns.constants;
   const extensionApi = ns.browserApi;
-  const KEYLESS_PROVIDERS = new Set(["google-web", "argos"]);
+  const KEYLESS_PROVIDERS = new Set(["mixed", "google-web", "argos", "custom-backend"]);
+  const DEFAULT_ARGOS_BACKEND_URL = "http://127.0.0.1:8765";
+  const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
+  const normalizeTargetCode = (target = "ZH") => {
+    const code = String(target || "ZH").trim().toUpperCase();
+    return code === "CANTONESE" ? "YUE" : code;
+  };
   // Schema history:
   //   v2 – defaulted to Echo360 native CC injection (useNativeSubtitles=false).
   //   v3 – native CC injection demoted to an opt-in Beta; default is the
@@ -146,6 +152,14 @@
   }
 
   function buildConfigSignature(cfg) {
+    const mixedPriorityActive = cfg.provider === "mixed" && cfg.mixedPriorityEnabled === true;
+    const mixedProvidersSignature = cfg.provider === "mixed"
+      ? JSON.stringify((Array.isArray(cfg.mixedProviders) ? cfg.mixedProviders : []).map((item) => {
+        if (mixedPriorityActive || !item || typeof item !== "object" || Array.isArray(item)) return item;
+        const { priorityGroup: _priorityGroup, ...withoutPriorityGroup } = item;
+        return withoutPriorityGroup;
+      }))
+      : "";
     return JSON.stringify([
       // Invalidate caches created before the strict result/error contract. A
       // syntactically valid VTT from an older build may still contain only
@@ -154,27 +168,59 @@
       cfg.provider,
       cfg.model,
       cfg.endpoint || "",
-      String(cfg.target || "").toUpperCase(),
+      normalizeTargetCode(cfg.target || "ZH"),
       Number(cfg.maxParagraphs) || 0,
       Number(cfg.maxChars) || 0,
       cfg.reasoningEffort || "",
       cfg.deepseekThinkingMode || "",
       cfg.deeplFormality || "",
+      cfg.provider === "azure" ? (cfg.azureRegion || "") : "",
+      cfg.provider === "custom-backend" ? (cfg.customBackendUrl || cfg.backendUrl || "") : "",
+      mixedProvidersSignature,
+      cfg.provider === "mixed" ? JSON.stringify(cfg.providerConfigs || {}) : "",
+      // Priority routing is meaningful only for the mixed provider. Ignore
+      // dormant settings on single-provider configurations, and ignore the
+      // group list while the feature is disabled so editing a future policy
+      // does not evict a cache that cannot use it yet.
+      cfg.provider === "mixed" ? cfg.mixedPriorityEnabled === true : "",
+      cfg.provider === "mixed" && cfg.mixedPriorityEnabled === true
+        ? JSON.stringify(cfg.mixedPriorityGroups || [])
+        : "",
+      cfg.provider === "mixed" && (cfg.mixedProviders || []).some((item) => item?.provider === "custom-backend" && item?.enabled !== false)
+        ? (cfg.customBackendUrl || cfg.backendUrl || "")
+        : "",
     ]);
   }
 
   async function getConfig() {
-    const { [STORAGE_KEY]: value } = await extensionApi.storage.local.get(STORAGE_KEY);
-    const config = value || {
+    const [configObj, keysObj] = await Promise.all([
+      extensionApi.storage.local.get(STORAGE_KEY),
+      extensionApi.storage.local.get(API_KEYS_STORAGE_KEY),
+    ]);
+    const value = configObj[STORAGE_KEY];
+    const separateKeys = keysObj[API_KEYS_STORAGE_KEY] || {};
+    const defaults = {
       apiKey: "",
       apiKeys: {},
       appearance: "auto",
-      useLocalBackend: false,
-      backendUrl: "http://127.0.0.1:8765",
+      customBackendUrl: DEFAULT_ARGOS_BACKEND_URL,
       provider: "google-web",
+      mixedProviders: [
+        { provider: "google-web", weight: 60, enabled: true, priorityGroup: "" },
+        { provider: "argos", weight: 40, enabled: true, priorityGroup: "" },
+      ],
+      // Priority groups are an opt-in routing policy. Keep the policy dormant
+      // by default so existing mixed translations retain their weighted
+      // distribution behavior after an upgrade.
+      mixedPriorityEnabled: false,
+      mixedPriorityGroups: [],
+      providerConfigs: {},
       model: "",
       endpoint: "",
       target: "ZH",
+      // Automatic AI material export is opt-in. An explicit stored boolean
+      // below still wins, so upgrades do not overwrite a user's choice.
+      quickTranslateAutoExport: false,
       maxParagraphs: 6,
       maxChars: 1200,
       concurrency: 96,
@@ -187,63 +233,53 @@
       slowSplitThreshold: 0,
       deepseekThinkingMode: "disabled",
       deeplFormality: "",
+      azureRegion: "",
     };
+    const config = { ...defaults, ...(value || {}) };
+    config.target = normalizeTargetCode(config.target);
+    config.mixedPriorityEnabled = config.mixedPriorityEnabled === true;
+    config.mixedPriorityGroups = Array.isArray(config.mixedPriorityGroups)
+      ? config.mixedPriorityGroups
+      : [];
+    // Missing or malformed values use the default-off behavior. Keep explicit
+    // true for users who have already enabled the setting, including on upgrades.
+    config.quickTranslateAutoExport = config.quickTranslateAutoExport === true;
     // Resolve the effective API key for the current provider from the per-provider
     // map, falling back to the legacy single apiKey field for migration.
+    config.apiKeys = { ...(config.apiKeys || {}), ...separateKeys };
     const provider = config.provider || "google-web";
     const effectiveApiKey = KEYLESS_PROVIDERS.has(provider)
       ? ""
       : (config.apiKeys?.[provider] ?? config.apiKey ?? "");
     const resolved = { ...config, apiKey: effectiveApiKey, apiKeys: config.apiKeys || {} };
-    // Restore the 1.4.2 Google Web speed profile for installations that were
-    // previously migrated to the temporary 3/3 or 24/6 safety profiles.
-    // Keep explicit non-safety settings untouched.
-    if (
-      provider === "google-web" &&
-      (
-        (Number(config.concurrency) === 3 && Number(config.rps) === 3) ||
-        (Number(config.concurrency) === 24 && Number(config.rps) === 6) ||
-        (Number(config.concurrency) === 24 && Number(config.rps) === 12) ||
-        (Number(config.concurrency) === 48 && Number(config.rps) === 12) ||
-        (Number(config.concurrency) === 1 && Number(config.rps) === 3)
-      )
-    ) {
-      resolved.concurrency = 96;
-      resolved.rps = 0;
-      try {
-        await extensionApi.storage.local.set({
-          [STORAGE_KEY]: { ...config, concurrency: 96, rps: 0 },
-        });
-        console.info("[echo360-translator][storage] restored 1.4.2 Google web speed settings", {
-          concurrency: 96,
-          rps: 0,
-        });
-      } catch (err) {
-        console.warn("[echo360-translator][storage] could not persist Google web rate migration", {
-          error: ns.errorUtils?.serializeError?.(err, { phase: "preferences" }) || {
-            code: "STORAGE_ERROR",
-            message: String(err?.message || err || "设置保存失败"),
-          },
-        });
-      }
-    }
     if (!isLocalBackendEnabled() && provider === "argos") {
-      return {
+      const fallback = {
         ...resolved,
         provider: "google-web",
         model: "",
         endpoint: "",
         apiKey: "",
-        useLocalBackend: false,
+        backendUrl: DEFAULT_ARGOS_BACKEND_URL,
       };
+      delete fallback.useLocalBackend;
+      return fallback;
     }
-    if (!isLocalBackendEnabled()) {
-      return { ...resolved, useLocalBackend: false };
-    }
-    if (provider === "argos") {
-      return { ...resolved, useLocalBackend: true };
-    }
-    return resolved;
+    const migratedCustomUrl = String(
+      value?.customBackendUrl ||
+      (provider === "custom-backend" ? value?.backendUrl : "") ||
+      DEFAULT_ARGOS_BACKEND_URL
+    ).trim();
+    const routed = {
+      ...resolved,
+      customBackendUrl: migratedCustomUrl,
+      // Routing is provider-owned. Argos always uses the packaged endpoint;
+      // only the explicit custom-backend provider uses a configurable URL.
+      backendUrl: provider === "custom-backend" || provider === "mixed"
+        ? migratedCustomUrl
+        : DEFAULT_ARGOS_BACKEND_URL,
+    };
+    delete routed.useLocalBackend;
+    return routed;
   }
 
   async function saveConfig(config) {

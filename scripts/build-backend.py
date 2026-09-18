@@ -22,6 +22,9 @@ DEFAULT_ARGOS_TARGETS = ("zh", "zt")
 WINDOWS_BACKEND_EXECUTABLE = "echo360-subtitle-backend.exe"
 WINDOWS_INSTALL_SCRIPT_NAME = "install-and-launch-echo360-subtitle-backend.cmd"
 BACKEND_URL_SCHEME = "echo360-subtitle-backend"
+MACOS_NATIVE_HOST_SOURCE = REPO_ROOT / "backend" / "macos_app.swift"
+MACOS_NATIVE_HOST_NAME = "echo360-subtitle-backend"
+MACOS_PYTHON_CORE_NAME = "echo360-subtitle-backend-core"
 
 
 def normalized_platform_name() -> str:
@@ -180,6 +183,76 @@ endlocal
     return script_path
 
 
+def install_macos_native_host() -> None:
+    """Put a small AppKit host in front of the packaged Python core.
+
+    The PyInstaller executable remains in the bundle next to the native
+    executable. Keeping it in Contents/MacOS preserves PyInstaller's
+    relative lookup of Contents/Frameworks while allowing AppKit to own the
+    process that Finder launches.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    app = PYINSTALLER_DIST / "Echo360 Subtitle Backend.app"
+    macos_dir = app / "Contents" / "MacOS"
+    launcher = macos_dir / MACOS_NATIVE_HOST_NAME
+    python_core = macos_dir / MACOS_PYTHON_CORE_NAME
+    if not MACOS_NATIVE_HOST_SOURCE.is_file():
+        raise FileNotFoundError(f"Native macOS host source not found: {MACOS_NATIVE_HOST_SOURCE}")
+    if not launcher.is_file():
+        raise FileNotFoundError(f"PyInstaller executable not found: {launcher}")
+    if python_core.exists():
+        raise FileExistsError(f"Refusing to overwrite an existing packaged core: {python_core}")
+
+    shutil.move(str(launcher), str(python_core))
+    native_temp = macos_dir / f"{MACOS_NATIVE_HOST_NAME}.native"
+    if native_temp.exists():
+        native_temp.unlink()
+    swiftc = shutil.which("swiftc")
+    codesign = shutil.which("codesign")
+    if swiftc is None:
+        raise RuntimeError("swiftc is required to build the native macOS AppKit host")
+    if codesign is None:
+        raise RuntimeError("codesign is required to sign the native macOS AppKit host")
+
+    swift_arch = {"arm64": "arm64", "x64": "x86_64"}.get(normalized_architecture())
+    if swift_arch is None:
+        raise RuntimeError(f"Unsupported macOS architecture for the native host: {normalized_architecture()}")
+
+    swift_env = dict(os.environ)
+    swift_env["SWIFT_MODULECACHE_PATH"] = str(BUILD_ROOT / "swift-module-cache")
+    swift_env["CLANG_MODULE_CACHE_PATH"] = str(BUILD_ROOT / "clang-module-cache")
+    Path(swift_env["SWIFT_MODULECACHE_PATH"]).mkdir(parents=True, exist_ok=True)
+    Path(swift_env["CLANG_MODULE_CACHE_PATH"]).mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            swiftc,
+            "-O",
+            "-target",
+            f"{swift_arch}-apple-macosx12.0",
+            "-framework",
+            "AppKit",
+            "-framework",
+            "Foundation",
+            str(MACOS_NATIVE_HOST_SOURCE),
+            "-o",
+            str(native_temp),
+        ],
+        check=True,
+        cwd=REPO_ROOT,
+        env=swift_env,
+    )
+    native_temp.replace(launcher)
+
+    # Re-sign only the generated app. This is an ad-hoc signature for local
+    # use and CI; release distribution can replace it with Developer ID and
+    # notarization credentials.
+    subprocess.run([codesign, "--force", "--sign", "-", str(python_core)], check=True)
+    subprocess.run([codesign, "--force", "--deep", "--sign", "-", str(app)], check=True)
+    print(f"Installed native AppKit host: {launcher.relative_to(REPO_ROOT)}")
+
+
 def archive_output() -> Path:
     system = normalized_platform_name()
     arch = normalized_architecture()
@@ -244,6 +317,7 @@ def main() -> int:
         cwd=REPO_ROOT,
         env=env,
     )
+    install_macos_native_host()
     archive = archive_output()
     print(f"Built backend: {archive.relative_to(REPO_ROOT)}")
     return 0

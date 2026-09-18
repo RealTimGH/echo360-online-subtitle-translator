@@ -3,7 +3,11 @@
 (() => {
   const root = globalThis;
 
-  const KEYLESS_PROVIDERS = new Set(["google-web", "argos"]);
+  // `mixed` owns no credential itself. Its selected child providers resolve
+  // their own keys inside the service worker, keeping secrets out of content
+  // scripts just like the single-provider path.
+  const KEYLESS_PROVIDERS = new Set(["mixed", "google-web", "argos", "custom-backend"]);
+  const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
 
   function isKeylessProvider(provider) {
     return KEYLESS_PROVIDERS.has(provider);
@@ -44,5 +48,12 @@
     };
   }
 
-  root.Echo360ConfigKeys = { KEYLESS_PROVIDERS, isKeylessProvider, buildKeyMap, stashKey, resolveForSave };
+  root.Echo360ConfigKeys = {
+    KEYLESS_PROVIDERS,
+    API_KEYS_STORAGE_KEY,
+    isKeylessProvider,
+    buildKeyMap,
+    stashKey,
+    resolveForSave,
+  };
 })();

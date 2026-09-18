@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { evalModule, makeFullNs } from "../helpers/load-module.js";
 
 const ORIGINAL_VTT = `WEBVTT
@@ -66,7 +66,7 @@ describe("player_caption_renderer", () => {
     expect(surface.hidden).toBe(true);
     expect(overlay.textContent).toBe("你好世界");
     expect(overlay.firstElementChild.style.color).toBe("rgb(255, 255, 255)");
-    expect(surface.style.getPropertyValue("visibility")).toBe("hidden");
+    expect(surface.style.getPropertyValue("visibility")).toBe("");
 
     video.currentTime = 3;
     video.dispatchEvent(new Event("timeupdate"));
@@ -97,7 +97,7 @@ describe("player_caption_renderer", () => {
     expect(surface.parentElement.querySelector("script")).toBeNull();
   });
 
-  it("hides and restores the host caption surface when the extension overlay is removed", () => {
+  it("keeps and restores the host caption surface in independent overlay mode", () => {
     const { renderer, video, surface, nativeCaption } = setupPlayer();
 
     renderer.mount({
@@ -115,6 +115,52 @@ describe("player_caption_renderer", () => {
     expect(nativeCaption.style.display).toBe("block");
     expect(surface.style.getPropertyValue("visibility")).toBe("");
     expect(renderer.isMounted()).toBe(false);
+  });
+
+  it("only occupies the native caption surface in explicit native-injection mode", () => {
+    const { renderer, video, surface } = setupPlayer();
+
+    renderer.mount({
+      video,
+      originalVtt: ORIGINAL_VTT,
+      translatedVtt: TRANSLATED_VTT,
+      bilingual: true,
+      nativeInjection: true,
+    });
+
+    expect(surface.style.getPropertyValue("visibility")).toBe("hidden");
+    renderer.update({
+      originalVtt: ORIGINAL_VTT,
+      translatedVtt: TRANSLATED_VTT,
+      nativeInjection: false,
+    });
+    expect(surface.style.getPropertyValue("visibility")).toBe("");
+  });
+
+  it("moves the independent overlay above a visible native cue", () => {
+    const { renderer, video, surface, nativeCaption } = setupPlayer();
+    nativeCaption.setAttribute("data-part", "cue");
+    vi.spyOn(video.parentElement, "getBoundingClientRect").mockReturnValue({
+      top: 0, bottom: 360, left: 0, right: 640, width: 640, height: 360,
+    });
+    vi.spyOn(surface, "getBoundingClientRect").mockReturnValue({
+      top: 0, bottom: 360, left: 0, right: 640, width: 640, height: 360,
+    });
+    vi.spyOn(nativeCaption, "getBoundingClientRect").mockReturnValue({
+      top: 280, bottom: 320, left: 100, right: 540, width: 440, height: 40,
+    });
+
+    renderer.mount({
+      video,
+      originalVtt: ORIGINAL_VTT,
+      translatedVtt: TRANSLATED_VTT,
+      bilingual: true,
+    });
+
+    const overlay = surface.parentElement.querySelector(":scope > [data-echo360-instructure-caption=\"1\"]");
+    expect(overlay.style.paddingBottom).toBe("88px");
+    expect(overlay.textContent).toBe("你好世界");
+    expect(surface.style.getPropertyValue("visibility")).toBe("");
   });
 
   it("mounts before Vidstack creates its optional native captions surface", () => {

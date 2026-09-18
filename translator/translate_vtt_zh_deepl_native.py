@@ -23,6 +23,8 @@ import re
 import sys
 import threading
 import time
+import unicodedata
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Callable, List
 from urllib.parse import quote
@@ -60,11 +62,11 @@ GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE = 1
-# Run Google Web at half of the former 96-worker cap. A zero RPS means that
-# the translator does not add a pacing delay between requests.
-GOOGLE_WEB_DEFAULT_CONCURRENCY = 48
-GOOGLE_WEB_DEFAULT_RPS = 0.0
-GOOGLE_WEB_MAX_RPS = 0.0
+# The undocumented Google Web endpoint has no stable published quota. Pace it
+# at a conservative three requests/second with at most three in-flight calls.
+GOOGLE_WEB_DEFAULT_CONCURRENCY = 3
+GOOGLE_WEB_DEFAULT_RPS = 3.0
+GOOGLE_WEB_MAX_RPS = 3.0
 GOOGLE_WEB_MAX_RETRIES = 2
 GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5
 GOOGLE_WEB_429_WINDOW_SECONDS = 10.0
@@ -96,20 +98,35 @@ SPLIT_FALLBACK_PROVIDERS = {"openai", "deepseek", "gemini", "google-web"}
 
 AI_LINE_SEPARATOR = "\n<<<VTT_TRANSLATOR_LINE_BREAK_8F3B>>>\n"
 YUE_TARGET_CODES = {"YUE", "CANTONESE"}
+TARGET_CODE_ALIASES = {"CANTONESE": "YUE"}
 TRADITIONAL_CHINESE_TARGET_CODES = {"ZH-HK"}
 CJK_TARGET_CODES = {"ZH", "ZH-HK", "YUE", "CANTONESE"}
+TARGET_NEUTRAL_CODE_STOPWORDS = {
+    "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
+    "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
+    "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
+}
 SUPPORTED_TARGET_CODES = {
     "ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE",
     "ES", "IT", "PT", "RU", "AR", "HI",
 }
+
+
+def normalize_target_code(target: object = "ZH") -> str:
+    code = str(target or "ZH").strip().upper()
+    return TARGET_CODE_ALIASES.get(code, code)
+
+
 FALLBACK_MODES = {"immediate", "deferred", "deferred-fastpath"}
 
 CLI_ERROR_CODES = {
     "INVALID_REQUEST",
     "INVALID_SOURCE_VTT",
+    "SOURCE_ALREADY_TRANSLATED",
     "EMPTY_TRANSLATABLE_VTT",
     "UNSUPPORTED_PROVIDER",
     "UNSUPPORTED_TARGET_LANGUAGE",
+    "PROVIDER_CONFIG_ERROR",
     "PROVIDER_API_KEY_MISSING",
     "INVALID_REASONING_EFFORT",
     "UNSUPPORTED_PROVIDER_PROTOCOL",
@@ -138,6 +155,51 @@ TIMECODE_RE = re.compile(
 WEBVTT_RE = re.compile(r"^\s*WEBVTT", re.IGNORECASE)
 INDEX_RE = re.compile(r"^\s*\d+\s*$")
 VOICE_TAG_RE = re.compile(r"^(?P<prefix>\s*<v\b[^>]*>)(?P<body>.*?)(?P<suffix>\s*</v>\s*)?$")
+
+
+def _caption_plain_text(value: object) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", str(value or ""))).strip()
+
+
+def _comparable_caption(value: object) -> str:
+    return unicodedata.normalize("NFKC", _caption_plain_text(value)).casefold()
+
+
+def has_cjk_text(value: object) -> bool:
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", str(value or "")))
+
+
+def is_target_neutral_text(source_value: object, translated_value: object, target: str = "ZH") -> bool:
+    """Accept only unchanged Chinese-target captions with no translation need.
+
+    Ordinary English that a provider failed to translate remains a failure.
+    Neutral content is limited to symbols/numbers, URLs/emails, and clearly
+    code-like or label-like tokens such as ``ITLS6111`` and ``F.``.
+    """
+    target_code = normalize_target_code(target)
+    if target_code not in CJK_TARGET_CODES:
+        return False
+    source = _caption_plain_text(source_value)
+    translated = _caption_plain_text(translated_value)
+    if not source or not translated or _comparable_caption(source) != _comparable_caption(translated):
+        return False
+    if has_cjk_text(source):
+        return True
+    if not re.search(r"[^\W\d_]", source, re.UNICODE):
+        return True
+    if (
+        re.fullmatch(r"(?:(?:https?|ftp)://|www\.)\S+", source, re.IGNORECASE)
+        or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
+    ):
+        return True
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9._:/+#&()'’\-]*", source):
+        upper = source.upper()
+        has_digit = bool(re.search(r"\d", source))
+        all_upper = source == upper
+        code_word = re.sub(r"[.)]+$", "", upper)
+        if (has_digit or (all_upper and len(source) <= 32)) and code_word not in TARGET_NEUTRAL_CODE_STOPWORDS:
+            return True
+    return False
 
 
 def _error_code_from_text(message: str) -> str:
@@ -364,9 +426,9 @@ def should_translate(line: str) -> bool:
     # caption such as "123" is valid cue text; numeric cue identifiers are
     # excluded by timed_text_line_indices() because they occur before the
     # cue's timecode.
-    if is_header(line) or is_timecode(line):
-        return False
-    if re.match(r"^(?:NOTE|STYLE|REGION)\b", line.strip(), re.IGNORECASE):
+    # Format keywords only introduce metadata outside timed cues. A lecturer
+    # saying "Note ..." is caption text and must never disappear from totals.
+    if is_timecode(line):
         return False
     return True
 
@@ -392,6 +454,46 @@ def timed_text_line_indices(lines: List[str]) -> list[int]:
             continue
         indexes.append(index)
     return indexes
+
+
+def inspect_probable_bilingual_source(lines: List[str], minimum_cues: int = 3, minimum_ratio: float = 0.6) -> dict:
+    """Detect a rendered bilingual track before any provider is called.
+
+    The extension's output has one CJK line followed by a source-language
+    line in the same cue. This high-confidence shape is a source contamination
+    signal, not a general language detector; ordinary multiline captions are
+    left alone unless most cues have the mixed-language pattern.
+    """
+    cue_blocks: list[list[str]] = []
+    in_cue = False
+    for line in lines:
+        if is_timecode(line):
+            cue_blocks.append([])
+            in_cue = True
+            continue
+        if not line.strip():
+            in_cue = False
+            continue
+        if in_cue and should_translate(line):
+            cue_blocks[-1].append(line)
+
+    mixed_cues = sum(
+        1
+        for block in cue_blocks
+        if len(block) >= 2 and
+        any(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", line) for line in block) and
+        any(not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", line) for line in block)
+    )
+    cue_count = len(cue_blocks)
+    ratio = mixed_cues / cue_count if cue_count else 0.0
+    return {
+        "probable": cue_count >= minimum_cues and mixed_cues >= minimum_cues and ratio >= minimum_ratio,
+        "cueCount": cue_count,
+        "mixedCueCount": mixed_cues,
+        "multilineCueCount": sum(1 for block in cue_blocks if len(block) > 1),
+        "textLineCount": sum(len(block) for block in cue_blocks),
+        "ratio": ratio,
+    }
 
 
 def read_text(path: Path) -> List[str]:
@@ -437,6 +539,11 @@ def build_text_batches(
 
     for ordinal, line_idx in enumerate(translatable_idx):
         text_len = len(text_for_len.get(line_idx, lines[line_idx]) if text_for_len else lines[line_idx])
+        if max_chars > 0 and text_len > max_chars:
+            raise ValueError(
+                "INVALID_REQUEST: one subtitle text line exceeds max_chars "
+                f"({text_len} > {max_chars})"
+            )
         would_exceed_chars = max_chars > 0 and current_ids and (current_chars + text_len > max_chars)
         would_exceed_paragraphs = max_paragraphs > 0 and len(current_ids) >= max_paragraphs
         if would_exceed_chars or would_exceed_paragraphs:
@@ -545,6 +652,33 @@ def normalize_gemini_endpoint(endpoint: str, model: str) -> str:
     if "/models/" in ep:
         return f"{ep}:generateContent"
     return f"{ep}/models/{model}:generateContent"
+
+
+def resolve_provider_endpoint(provider: str, endpoint: str = "", model: str = "") -> str:
+    provider_name = (provider or "google-web").strip().lower()
+    if provider_name in KEYLESS_PROVIDERS:
+        return ""
+    defaults = provider_defaults(provider_name)
+    resolved = (endpoint or "").strip() or str(defaults["endpoint"])
+    if provider_name in {"openai", "deepseek", "gemini"} and resolved in {
+        "https://api-free.deepl.com/v2/translate",
+        "https://api.deepl.com/v2/translate",
+    }:
+        resolved = str(defaults["endpoint"])
+    if provider_name in {"openai", "deepseek"}:
+        resolved = normalize_openai_compatible_endpoint(resolved, provider_name)
+    elif provider_name == "gemini":
+        resolved = normalize_gemini_endpoint(resolved, model or str(defaults["model"]))
+    parsed = urlsplit(resolved)
+    loopback = (parsed.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    if parsed.username or parsed.password or not parsed.hostname or (
+        parsed.scheme != "https" and not (parsed.scheme == "http" and loopback)
+    ):
+        raise ValueError(
+            "PROVIDER_CONFIG_ERROR: provider endpoint must use HTTPS "
+            "(HTTP is allowed only for loopback development)"
+        )
+    return resolved
 
 
 def split_voice_tag(line: str) -> tuple[str, str, str]:
@@ -1234,7 +1368,7 @@ def translate_lines_native(
     provider_name = (provider or "google-web").strip().lower()
     if provider_name not in {"deepl", "openai", "deepseek", "gemini", "google-web", "argos"}:
         raise ValueError(f"UNSUPPORTED_PROVIDER: Unsupported provider: {provider_name}")
-    target_code = str(target_lang or "ZH").strip().upper()
+    target_code = normalize_target_code(target_lang)
     if target_code not in SUPPORTED_TARGET_CODES:
         raise ValueError(
             f"UNSUPPORTED_TARGET_LANGUAGE: unsupported target language '{target_code}'; "
@@ -1252,8 +1386,8 @@ def translate_lines_native(
 
     effective_rps = rps
     if provider_name == "google-web":
-        # Match the 1.4.2 speed profile while keeping one cue per batch so
-        # partial VTT updates remain independent and observable.
+        # Apply the conservative Google profile while keeping one cue per batch
+        # so partial VTT updates remain independent and observable.
         concurrency = max(1, min(int(concurrency or GOOGLE_WEB_DEFAULT_CONCURRENCY), GOOGLE_WEB_DEFAULT_CONCURRENCY))
         chunk = 1
         max_paragraphs = 1
@@ -1288,6 +1422,13 @@ def translate_lines_native(
     total = len(translatable_idx)
     if total == 0:
         raise ValueError("EMPTY_TRANSLATABLE_VTT: VTT 中没有可翻译文本")
+    source_structure = inspect_probable_bilingual_source(lines)
+    if target_code in CJK_TARGET_CODES and source_structure["probable"]:
+        raise ValueError(
+            "SOURCE_ALREADY_TRANSLATED: detected a probable bilingual translated track in the source VTT; "
+            f"{source_structure['mixedCueCount']}/{source_structure['cueCount']} cues contain mixed-language lines; "
+            "remove the generated translation track and resolve the original source"
+        )
     out_lines = list(lines)
     failed_items: list[dict] = []
     provider_results = 0
@@ -1564,9 +1705,12 @@ def translate_lines_native(
                     staged_failures.append((idx_in_batch, empty_message))
                 staged_lines.append((line_idx, lines[line_idx]))
                 continue
-            if idx_in_batch not in failed_indexes and target_requires_cjk and not re.search(
-                r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", translated_text
-            ):
+            target_compatible = (
+                not target_requires_cjk
+                or has_cjk_text(translated_text)
+                or is_target_neutral_text(source_texts[line_idx], translated_text, target_lang)
+            )
+            if idx_in_batch not in failed_indexes and target_requires_cjk and not target_compatible:
                 target_message = "NO_TARGET_TRANSLATION: Provider returned a non-empty result without recognizable target-language text"
                 failed_indexes.add(idx_in_batch)
                 if translated_text.strip().casefold() == str(source_texts[line_idx]).strip().casefold():
@@ -1587,7 +1731,7 @@ def translate_lines_native(
                 else:
                     staged_lines.append((line_idx, translated_text))
             staged_provider_results += 1
-            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", translated_text):
+            if target_requires_cjk and target_compatible:
                 staged_target_results += 1
             if translated_text.strip().casefold() == str(source_texts[line_idx]).strip().casefold():
                 staged_unchanged_results += 1
@@ -1687,10 +1831,12 @@ def translate_lines_native(
             )
             return False
         target_requires_cjk = str(target_lang or "ZH").strip().upper() in CJK_TARGET_CODES
-        if target_requires_cjk and not re.search(
-            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]",
-            normalized,
-        ):
+        target_compatible = (
+            not target_requires_cjk
+            or has_cjk_text(normalized)
+            or is_target_neutral_text(source_texts[line_idx], normalized, target_lang)
+        )
+        if target_requires_cjk and not target_compatible:
             _record_argos_fallback_failure(
                 line_idx,
                 "NO_TARGET_TRANSLATION: Argos returned a result without recognizable target-language text",
@@ -1707,7 +1853,7 @@ def translate_lines_native(
         _remove_failure_for_line(line_idx)
         provider_results += 1
         fallback_provider_results += 1
-        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", normalized):
+        if target_requires_cjk and target_compatible:
             target_results += 1
         if normalized.casefold() == str(source_texts[line_idx]).strip().casefold():
             unchanged_results += 1
@@ -2087,7 +2233,7 @@ def main():
     except (OSError, UnicodeError) as exc:
         _emit_cli_error("TRANSLATOR_INPUT_READ_FAILED", f"Unable to read input VTT: {exc}", phase="source")
         return 1
-    normalized_target = args.target.strip().upper()
+    normalized_target = normalize_target_code(args.target)
     if normalized_target not in SUPPORTED_TARGET_CODES:
         _emit_cli_error(
             "UNSUPPORTED_TARGET_LANGUAGE",
@@ -2108,6 +2254,7 @@ def main():
         except ValueError as exc:
             _emit_cli_error("UNSUPPORTED_TARGET_LANGUAGE", str(exc), phase="config")
             return 1
+    args.target = normalized_target
     if args.provider not in KEYLESS_PROVIDERS and not (args.key or "").strip():
         _emit_cli_error("PROVIDER_API_KEY_MISSING", f"--key is required for provider={args.provider}", phase="config")
         return 1
@@ -2118,20 +2265,12 @@ def main():
         )
 
     defaults = provider_defaults(args.provider)
-    resolved_endpoint = args.endpoint
-    if args.provider in KEYLESS_PROVIDERS:
-        resolved_endpoint = ""
-    if args.provider in {"openai", "deepseek", "gemini"} and resolved_endpoint in {
-        "https://api-free.deepl.com/v2/translate",
-        "https://api.deepl.com/v2/translate",
-    }:
-        resolved_endpoint = str(defaults["endpoint"])
-    if args.provider in {"openai", "deepseek"}:
-        resolved_endpoint = normalize_openai_compatible_endpoint(resolved_endpoint, args.provider)
-
     resolved_model = args.model or str(defaults["model"])
-    if args.provider == "gemini":
-        resolved_endpoint = normalize_gemini_endpoint(resolved_endpoint, resolved_model)
+    try:
+        resolved_endpoint = resolve_provider_endpoint(args.provider, args.endpoint, resolved_model)
+    except ValueError as exc:
+        _emit_cli_error("PROVIDER_CONFIG_ERROR", str(exc), phase="config")
+        return 1
     resolved_chunk = max(1, int(args.chunk if args.chunk is not None else defaults["chunk"]))
     resolved_concurrency = max(1, int(args.concurrency if args.concurrency is not None else defaults["concurrency"]))
     resolved_max_chars = max(0, int(args.max_chars if args.max_chars is not None else defaults.get("max_chars", 0)))

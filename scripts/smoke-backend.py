@@ -24,6 +24,12 @@ def packaged_executable(dist_root: Path) -> Path:
     return dist_root / "Echo360SubtitleBackend" / executable_name
 
 
+def packaged_core_executable(dist_root: Path) -> Path:
+    if platform.system() == "Darwin":
+        return dist_root / "Echo360 Subtitle Backend.app" / "Contents" / "MacOS" / "echo360-subtitle-backend-core"
+    return packaged_executable(dist_root)
+
+
 def unused_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -109,16 +115,22 @@ def main() -> int:
     executable = packaged_executable(args.dist_root.resolve())
     if not executable.is_file():
         raise FileNotFoundError(f"Packaged backend executable not found: {executable}")
+    core_executable = packaged_core_executable(args.dist_root.resolve())
+    if not core_executable.is_file():
+        raise FileNotFoundError(f"Packaged backend core executable not found: {core_executable}")
 
     with tempfile.TemporaryDirectory(prefix="echo360-packaged-runtime-") as runtime_dir:
         env = dict(os.environ)
         env["ECHO360_CACHE_DIR"] = str(Path(runtime_dir) / "cache")
         env["ECHO360_CONFIG_DIR"] = str(Path(runtime_dir) / "config")
         env["ECHO360_DATA_DIR"] = str(Path(runtime_dir) / "data")
-        check_translator_dispatch(executable, env)
+        # The macOS AppKit host is intentionally not a CLI dispatcher. Test
+        # translator mode against the bundled Python core and test HTTP
+        # startup against the user-facing native host.
+        check_translator_dispatch(core_executable, env)
         check_health(executable, env)
         if args.check_argos:
-            check_argos_translation(executable, env)
+            check_argos_translation(core_executable, env)
     print(f"Packaged backend smoke test passed: {executable}")
     return 0
 

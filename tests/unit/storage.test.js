@@ -5,7 +5,7 @@
  *   getContextKey      – /lesson/:id path vs other pathname
  *   buildConfigSignature – all fields contribute to signature
  *   askApiKeyIfNeeded  – keyless provider, provider+key, provider+no key
- *   getConfig          – enableLocalBackend false → force useLocalBackend=false
+ *   getConfig          – provider-owned backend routing and legacy migration
  *   getPrefs           – useNativeSubtitles true/false, size "tiny", unknown size
  *   savePrefs          – bilingual/reverseOrder normalization
  *   getCacheStore      – valid object vs null/non-object
@@ -73,6 +73,7 @@ describe("buildConfigSignature", () => {
     reasoningEffort: "medium",
     deepseekThinkingMode: "disabled",
     deeplFormality: "default",
+    azureRegion: "australiaeast",
   });
 
   it("is deterministic", () => {
@@ -107,6 +108,112 @@ describe("buildConfigSignature", () => {
     const withEmpty   = storage.buildConfigSignature({ ...base(), endpoint: "" });
     const withMissing = storage.buildConfigSignature({ ...base(), endpoint: undefined });
     expect(withEmpty).toBe(withMissing);
+  });
+
+  it("invalidates only Azure caches when the Azure region changes", () => {
+    const azure = { ...base(), provider: "azure", model: "", endpoint: "" };
+    expect(storage.buildConfigSignature({ ...azure, azureRegion: "australiaeast" }))
+      .not.toBe(storage.buildConfigSignature({ ...azure, azureRegion: "eastus" }));
+    expect(storage.buildConfigSignature({ ...base(), azureRegion: "australiaeast" }))
+      .toBe(storage.buildConfigSignature({ ...base(), azureRegion: "eastus" }));
+  });
+
+  it("invalidates a custom-backend cache when its server URL changes", () => {
+    const custom = { ...base(), provider: "custom-backend", model: "", endpoint: "" };
+    const first = storage.buildConfigSignature({ ...custom, customBackendUrl: "https://one.example/api" });
+    const second = storage.buildConfigSignature({ ...custom, customBackendUrl: "https://two.example/api" });
+    expect(first).not.toBe(second);
+  });
+
+  it("invalidates a mixed cache when weights or provider configuration changes", () => {
+    const mixed = {
+      ...base(),
+      provider: "mixed",
+      model: "",
+      endpoint: "",
+      mixedProviders: [
+        { provider: "google-web", weight: 60, enabled: true },
+        { provider: "deepl", weight: 40, enabled: true },
+      ],
+      providerConfigs: { deepl: { model: "", endpoint: "https://api-free.deepl.com/v2" } },
+    };
+    const baseline = storage.buildConfigSignature(mixed);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      mixedProviders: [
+        { provider: "google-web", weight: 30, enabled: true },
+        { provider: "deepl", weight: 70, enabled: true },
+      ],
+    })).not.toBe(baseline);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      providerConfigs: { deepl: { model: "", endpoint: "https://api.deepl.com/v2" } },
+    })).not.toBe(baseline);
+  });
+
+  it("invalidates a mixed custom-backend cache when its URL changes", () => {
+    const mixed = {
+      ...base(),
+      provider: "mixed",
+      model: "",
+      endpoint: "",
+      mixedProviders: [
+        { provider: "google-web", weight: 50, enabled: true },
+        { provider: "custom-backend", weight: 50, enabled: true },
+      ],
+    };
+    expect(storage.buildConfigSignature({ ...mixed, customBackendUrl: "https://one.example/api" }))
+      .not.toBe(storage.buildConfigSignature({ ...mixed, customBackendUrl: "https://two.example/api" }));
+  });
+
+  it("includes active mixed priority settings but ignores dormant priority groups", () => {
+    const mixed = {
+      ...base(),
+      provider: "mixed",
+      model: "",
+      endpoint: "",
+      mixedProviders: [
+        { provider: "google-web", weight: 60, enabled: true, priorityGroup: "default" },
+        { provider: "deepl", weight: 40, enabled: true, priorityGroup: "default" },
+      ],
+      mixedPriorityEnabled: false,
+      mixedPriorityGroups: [{ id: "default", afterCues: 0 }],
+    };
+    const disabledSignature = storage.buildConfigSignature(mixed);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      mixedPriorityGroups: [{ id: "later", afterCues: 12 }],
+    })).toBe(disabledSignature);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      mixedProviders: mixed.mixedProviders.map((item) => ({ ...item, priorityGroup: "later" })),
+    })).toBe(disabledSignature);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      mixedPriorityEnabled: true,
+    })).not.toBe(disabledSignature);
+    expect(storage.buildConfigSignature({
+      ...mixed,
+      mixedPriorityEnabled: true,
+      mixedPriorityGroups: [{ id: "later", afterCues: 12 }],
+    })).not.toBe(storage.buildConfigSignature({
+      ...mixed,
+      mixedPriorityEnabled: true,
+      mixedPriorityGroups: [{ id: "later", afterCues: 24 }],
+    }));
+  });
+
+  it("ignores priority settings for a single provider cache", () => {
+    const single = { ...base(), provider: "openai" };
+    expect(storage.buildConfigSignature({
+      ...single,
+      mixedPriorityEnabled: true,
+      mixedPriorityGroups: [{ id: "later", afterCues: 12 }],
+    })).toBe(storage.buildConfigSignature({
+      ...single,
+      mixedPriorityEnabled: false,
+      mixedPriorityGroups: [{ id: "other", afterCues: 48 }],
+    }));
   });
 
   it("treats missing optional fields without throwing", () => {
@@ -158,7 +265,7 @@ describe("askApiKeyIfNeeded", () => {
 // getConfig (store build — extension-only, no local backend)
 // ---------------------------------------------------------------------------
 describe("getConfig", () => {
-  it("forces useLocalBackend=false on store build even if stored as true", async () => {
+  it("ignores the removed useLocalBackend flag for direct providers", async () => {
     const { storage } = setupStorage({
       storageData: {
         echo360TranslatorConfig: { provider: "deepseek", useLocalBackend: true },
@@ -166,7 +273,8 @@ describe("getConfig", () => {
       enableLocalBackend: false,
     });
     const cfg = await storage.getConfig();
-    expect(cfg.useLocalBackend).toBe(false);
+    expect(cfg.useLocalBackend).toBeUndefined();
+    expect(cfg.backendUrl).toBe("http://127.0.0.1:8765");
   });
 
   it("falls back to Google Web when a store build sees a stale Argos setting", async () => {
@@ -182,11 +290,11 @@ describe("getConfig", () => {
       model: "",
       endpoint: "",
       apiKey: "",
-      useLocalBackend: false,
+      backendUrl: "http://127.0.0.1:8765",
     });
   });
 
-  it("forces the local backend on for Argos in a development build", async () => {
+  it("routes Argos to the fixed packaged endpoint in a development build", async () => {
     const { storage } = setupStorage({
       storageData: {
         echo360TranslatorConfig: { provider: "argos", useLocalBackend: false, apiKey: "stale" },
@@ -194,20 +302,137 @@ describe("getConfig", () => {
       enableLocalBackend: true,
     });
     const cfg = await storage.getConfig();
-    expect(cfg.useLocalBackend).toBe(true);
+    expect(cfg.useLocalBackend).toBeUndefined();
+    expect(cfg.backendUrl).toBe("http://127.0.0.1:8765");
     expect(cfg.apiKey).toBe("");
   });
 
-  it("returns default config when nothing is stored", async () => {
+  it("uses a configurable URL only for the custom-backend provider", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "custom-backend",
+          customBackendUrl: "https://translator.example/api",
+          useLocalBackend: false,
+        },
+      },
+      enableLocalBackend: true,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.backendUrl).toBe("https://translator.example/api");
+    expect(cfg.useLocalBackend).toBeUndefined();
+  });
+
+  it("migrates a legacy custom provider backendUrl before applying the new default", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "custom-backend",
+          backendUrl: "https://legacy-translator.example/v1",
+        },
+      },
+      enableLocalBackend: true,
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.customBackendUrl).toBe("https://legacy-translator.example/v1");
+    expect(cfg.backendUrl).toBe("https://legacy-translator.example/v1");
+  });
+
+  it("defaults automatic one-click AI material export to off for a new install", async () => {
     const { storage } = setupStorage({ storageData: {} });
     const cfg = await storage.getConfig();
     expect(cfg.provider).toBe("google-web");
     expect(cfg.target).toBe("ZH");
     expect(cfg.concurrency).toBe(96);
     expect(cfg.rps).toBe(0);
+    expect(cfg.quickTranslateAutoExport).toBe(false);
+    expect(cfg.mixedPriorityEnabled).toBe(false);
+    expect(cfg.mixedPriorityGroups).toEqual([]);
+    expect(cfg.mixedProviders).toEqual([
+      { provider: "google-web", weight: 60, enabled: true, priorityGroup: "" },
+      { provider: "argos", weight: 40, enabled: true, priorityGroup: "" },
+    ]);
   });
 
-  it("restores the 1.4.2 Google 96/0 profile from the temporary 3/3 profile", async () => {
+  it("normalizes malformed priority settings to the dormant defaults", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "mixed",
+          mixedPriorityEnabled: "true",
+          mixedPriorityGroups: "not-an-array",
+        },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.mixedPriorityEnabled).toBe(false);
+    expect(cfg.mixedPriorityGroups).toEqual([]);
+  });
+
+  it("retains explicit priority enablement when the group list is malformed", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "mixed",
+          mixedPriorityEnabled: true,
+          mixedPriorityGroups: null,
+        },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.mixedPriorityEnabled).toBe(true);
+    expect(cfg.mixedPriorityGroups).toEqual([]);
+  });
+
+  it("defaults automatic one-click AI material export to off for an upgraded config without a saved choice", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "google-web",
+          maxChars: 1200,
+        },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.quickTranslateAutoExport).toBe(false);
+  });
+
+  it("preserves an explicit choice for automatic one-click AI material export", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "google-web",
+          quickTranslateAutoExport: true,
+        },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.quickTranslateAutoExport).toBe(true);
+
+    const { storage: disabledStorage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: {
+          provider: "google-web",
+          quickTranslateAutoExport: false,
+        },
+      },
+    });
+    expect((await disabledStorage.getConfig()).quickTranslateAutoExport).toBe(false);
+  });
+
+  it("canonicalizes the legacy CANTONESE target alias to YUE", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        echo360TranslatorConfig: { provider: "openai", target: "CANTONESE" },
+      },
+    });
+    const cfg = await storage.getConfig();
+    expect(cfg.target).toBe("YUE");
+    expect(storage.buildConfigSignature({ provider: "openai", target: "CANTONESE" }))
+      .toBe(storage.buildConfigSignature({ provider: "openai", target: "YUE" }));
+  });
+
+  it("preserves an explicitly stored conservative Google 3/3 profile", async () => {
     const { storage, localMock } = setupStorage({
       storageData: {
         echo360TranslatorConfig: {
@@ -218,11 +443,9 @@ describe("getConfig", () => {
       },
     });
     const cfg = await storage.getConfig();
-    expect(cfg.concurrency).toBe(96);
-    expect(cfg.rps).toBe(0);
-    expect(localMock.set).toHaveBeenCalledWith({
-      echo360TranslatorConfig: expect.objectContaining({ concurrency: 96, rps: 0 }),
-    });
+    expect(cfg.concurrency).toBe(3);
+    expect(cfg.rps).toBe(3);
+    expect(localMock.set).not.toHaveBeenCalled();
   });
 
   it("resolves apiKey from apiKeys[provider] map (per-provider key storage)", async () => {

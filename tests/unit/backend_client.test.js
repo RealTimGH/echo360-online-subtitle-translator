@@ -214,7 +214,26 @@ describe("formatJobError (via waitDirectJob)", () => {
     expect(() => client.validateTranslationResult({
       translated_vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n第一条\n\n00:00:01.000 --> 00:00:02.000\n\n",
       metrics: { total: 2, processed: 2, translated: 2, failed: 0, providerResults: 2, targetResults: 2 },
-    })).toThrowError(expect.objectContaining({ code: "INVALID_TRANSLATED_VTT" }));
+      })).toThrowError(expect.objectContaining({ code: "INVALID_TRANSLATED_VTT" }));
+  });
+
+  it("accepts source-equal neutral captions when validating a Chinese result", () => {
+    const sourceVtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nF.\n";
+    const result = client.validateTranslationResult({
+      translated_vtt: sourceVtt,
+      target: "ZH",
+      metrics: {
+        total: 1,
+        processed: 1,
+        translated: 1,
+        failed: 0,
+        providerResults: 1,
+        targetResults: 1,
+        unchangedResults: 1,
+      },
+    }, "translation", { sourceVtt, target: "ZH", provider: "argos" });
+
+    expect(result.translated_vtt).toContain("F.");
   });
 
   it("does not accept malformed timestamps as a valid translated VTT", () => {

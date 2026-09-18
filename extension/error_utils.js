@@ -6,12 +6,15 @@
   const ns = root.Echo360Translator = root.Echo360Translator || {};
 
   const PROVIDER_LABELS = {
+    mixed: "混合翻译（并行）",
     "google-web": "Google Translate 网页端点",
     deepseek: "DeepSeek",
     gemini: "Gemini",
     openai: "OpenAI",
     deepl: "DeepL",
+    azure: "Azure AI Translator F0",
     argos: "Argos Translate（本地）",
+    "custom-backend": "自定义后端",
   };
 
   const TARGET_LABELS = {
@@ -36,6 +39,123 @@
   // boundary.  A label-only map is not enough: an unknown target could
   // otherwise fall through to a successful-looking non-CJK result.
   const SUPPORTED_TARGET_CODES = new Set(Object.keys(TARGET_LABELS));
+  const CJK_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE"]);
+  const CJK_TEXT_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
+  const TARGET_NEUTRAL_CODE_STOPWORDS = new Set([
+    "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
+    "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
+    "I", "IT", "WE", "YOU", "HE", "SHE", "THEY", "YES", "NO", "OK", "OKAY",
+  ]);
+
+  function normalizeTargetCode(target = "ZH") {
+    const code = String(target || "ZH").trim().toUpperCase();
+    return code === "CANTONESE" ? "YUE" : code;
+  }
+
+  function responseTooLargeError(options = {}) {
+    return Object.assign(new Error(options.message || "响应内容超过允许的大小限制"), {
+      code: options.code || "RESOURCE_TOO_LARGE",
+      status: Number(options.status) || 413,
+      phase: options.phase || undefined,
+    });
+  }
+
+  async function readBoundedResponseText(response, maxBytes, errorOptions = {}) {
+    const limit = Number(maxBytes);
+    if (!Number.isFinite(limit) || limit <= 0) throw new TypeError("maxBytes must be positive");
+    const declaredLength = Number(response?.headers?.get?.("content-length") || 0);
+    if (Number.isFinite(declaredLength) && declaredLength > limit) throw responseTooLargeError(errorOptions);
+
+    const reader = response?.body?.getReader?.();
+    if (!reader) {
+      const text = await response.text();
+      if (new TextEncoder().encode(text).byteLength > limit) throw responseTooLargeError(errorOptions);
+      return text;
+    }
+
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let receivedBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        receivedBytes += value?.byteLength || 0;
+        if (receivedBytes > limit) {
+          try { await reader.cancel(); } catch (_) { /* best-effort cancellation */ }
+          throw responseTooLargeError(errorOptions);
+        }
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      chunks.push(decoder.decode());
+      return chunks.join("");
+    } finally {
+      reader.releaseLock?.();
+    }
+  }
+
+  // Some captions are valid target-language output even when they contain no
+  // CJK character: a number, URL, file/code token, a grade/label, or text
+  // already written in the target script.  This is intentionally a narrow
+  // exception. An ordinary English word or sentence that a provider returns
+  // unchanged must still be reported as NO_TARGET_TRANSLATION.
+  let LETTER_RE;
+  try {
+    // Construct this at runtime so an older embedded WebView can fall back
+    // without failing to parse the whole extension bundle.
+    LETTER_RE = new RegExp("\\p{L}", "u");
+  } catch (_) {
+    LETTER_RE = /[A-Za-z]/;
+  }
+
+  function captionPlainText(value) {
+    return String(value ?? "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function comparableCaption(value) {
+    const text = captionPlainText(value);
+    try {
+      return text.normalize("NFKC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+    } catch (_) {
+      return text.toLowerCase().replace(/\s+/g, " ").trim();
+    }
+  }
+
+  function isTargetNeutralText(sourceValue, translatedValue, target = "ZH") {
+    const targetCode = normalizeTargetCode(target);
+    if (!CJK_TARGET_CODES.has(targetCode)) return false;
+    const source = captionPlainText(sourceValue);
+    const translated = captionPlainText(translatedValue);
+    if (!source || !translated || comparableCaption(source) !== comparableCaption(translated)) return false;
+    if (CJK_TEXT_RE.test(source)) return true;
+
+    // Pure numbers, punctuation and symbols have no linguistic target to
+    // translate. This also covers timestamps and short numeric labels.
+    if (!LETTER_RE.test(source)) return true;
+
+    if (/^(?:(?:https?|ftp):\/\/|www\.)\S+$/i.test(source) ||
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(source)) {
+      return true;
+    }
+
+    // Uppercase abbreviations, course codes, file names and software tokens
+    // are routinely kept verbatim by subtitle translators. Exclude common
+    // English words so an unchanged "NO"/"OK" is not silently accepted.
+    if (/^[A-Z0-9][A-Z0-9._:/+#&()'’-]*$/.test(source)) {
+      const upper = source.toUpperCase();
+      const hasDigit = /\d/.test(source);
+      const allUpper = source === upper;
+      if ((hasDigit || (allUpper && source.length <= 32)) &&
+        !TARGET_NEUTRAL_CODE_STOPWORDS.has(upper.replace(/[.)]+$/, ""))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
 
   const PHASE_LABELS = {
     prepare: "准备翻译",
@@ -160,14 +280,19 @@
     return { ok: true };
   }
 
-  function isTranslatableVttLine(value) {
+  function isTranslatableVttLine(value, options = {}) {
     const line = String(value ?? "").trim();
+    const insideCue = options === true || options?.insideCue === true;
     // Numeric caption text is valid (for example, a lecturer saying “123”)
     // and is now kept because callers only invoke this helper inside a timed
     // cue. Cue identifiers are excluded by timedCueTextEntries(), where the
     // parser knows whether it is currently inside a cue body.
-    if (!line || /^WEBVTT\b/i.test(line) || VTT_TIMING_LINE_RE.test(line)) return false;
-    if (/^(?:NOTE|STYLE|REGION)\b/i.test(line)) return false;
+    if (!line || VTT_TIMING_LINE_RE.test(line)) return false;
+    // NOTE/STYLE/REGION and the WEBVTT header are metadata only at a VTT
+    // block boundary. A cue may legitimately begin with any of these words
+    // (for example, “Note we've got ...”), so do not apply the metadata
+    // prefix filter while the parser is inside a timed cue.
+    if (!insideCue && /^(?:WEBVTT|NOTE|STYLE|REGION)\b/i.test(line)) return false;
     return true;
   }
 
@@ -207,21 +332,41 @@
       cue += 1;
       for (let next = index + 1; next < lines.length && lines[next].trim() !== ""; next += 1) {
         if (VTT_TIMING_LINE_RE.test(lines[next])) break;
-        if (!isTranslatableVttLine(lines[next])) continue;
+        if (!isTranslatableVttLine(lines[next], { insideCue: true })) continue;
         entries.push({ cue, line: next + 1, text: lines[next] });
       }
     }
     return entries;
   }
 
+  function targetCompatibleText(outputText, sourceText, options = {}) {
+    if (CJK_TEXT_RE.test(String(outputText || ""))) return true;
+    return sourceText != null && isTargetNeutralText(sourceText, outputText, options.target || "ZH");
+  }
+
+  function targetCompatibleBilingualBlock(outputBlock, sourceBlock, options = {}) {
+    if (CJK_TEXT_RE.test(String(outputBlock || ""))) return true;
+    if (sourceBlock == null) return false;
+    const sourceLines = String(sourceBlock || "").split("\n").map((line) => line.trim()).filter(Boolean);
+    const outputLines = String(outputBlock || "").split("\n").map((line) => line.trim()).filter(Boolean);
+    return sourceLines.length > 0 && outputLines.length > 0 &&
+      outputLines.every((outputLine) => sourceLines.some((sourceLine) =>
+        isTargetNeutralText(sourceLine, outputLine, options.target || "ZH")
+      ));
+  }
+
   function hasCjkInEveryTimedCue(vtt, options = {}) {
     const entries = timedCueTextEntries(vtt);
     if (entries.length === 0) return false;
+    const sourceEntries = options?.sourceVtt == null ? [] : timedCueTextEntries(options.sourceVtt);
     if (options?.bilingual === true) {
       const blocks = timedCueTextBlocks(vtt);
-      return blocks.length > 0 && blocks.every((block) => /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(block));
+      const sourceBlocks = options?.sourceVtt == null ? [] : timedCueTextBlocks(options.sourceVtt);
+      return blocks.length > 0 && blocks.every((block, index) =>
+        targetCompatibleBilingualBlock(block, sourceBlocks[index], options)
+      );
     }
-    return entries.every((entry) => /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(entry.text));
+    return entries.every((entry, index) => targetCompatibleText(entry.text, sourceEntries[index]?.text, options));
   }
 
   function hasCjkInSuccessfulTimedCues(vtt, failedItems = [], expectedFailedCount = null, options = {}) {
@@ -243,6 +388,7 @@
     // that explicit format.
     if (options?.bilingual === true) {
       const blocks = timedCueTextBlocks(vtt);
+      const sourceBlocks = options?.sourceVtt == null ? [] : timedCueTextBlocks(options.sourceVtt);
       const failedCues = new Set();
       for (const item of failures) {
         const cue = positiveInteger(item?.cue, null);
@@ -250,11 +396,12 @@
         failedCues.add(cue);
       }
       return blocks.every((block, index) => failedCues.has(index + 1) ||
-        /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(block));
+        targetCompatibleBilingualBlock(block, sourceBlocks[index], options));
     }
 
     const failedLines = new Set();
     const entriesByLine = new Map(entries.map((entry) => [entry.line, entry]));
+    const sourceEntries = options?.sourceVtt == null ? [] : timedCueTextEntries(options.sourceVtt);
     for (const item of failures) {
       const cue = positiveInteger(item?.cue, null);
       const line = positiveInteger(item?.line, null);
@@ -274,8 +421,8 @@
       if (cueEntries.length !== 1) return null;
       failedLines.add(cueEntries[0].line);
     }
-    return entries.every((entry) => failedLines.has(entry.line) ||
-      /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(entry.text));
+    return entries.every((entry, index) => failedLines.has(entry.line) ||
+      targetCompatibleText(entry.text, sourceEntries[index]?.text, options));
   }
 
   // A failed_items entry is also a rendering contract: the UI must be able
@@ -840,10 +987,21 @@
     "UNSUPPORTED_PROVIDER_PROTOCOL",
     "INVALID_REASONING_EFFORT",
     "PROVIDER_CONFIG_ERROR",
+    "PROVIDER_RESPONSE_TOO_LARGE",
+    "BACKEND_RESPONSE_TOO_LARGE",
+    "TRANSLATOR_OUTPUT_TOO_LARGE",
+    "RESOURCE_TOO_LARGE",
+    "REQUEST_TOO_LARGE",
     "PROVIDER_API_KEY_MISSING",
+    "SOURCE_ALREADY_TRANSLATED",
+    "MANUAL_SESSION_SOURCE_INVALID",
+    "MANUAL_IMPORT_EMPTY",
+    "MANUAL_IMPORT_CUE_TEXT_LINE_COUNT_MISMATCH",
     "ARGOS_DEPENDENCY_MISSING",
     "ARGOS_MODEL_MISSING",
     "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+    "MIXED_PROVIDERS_REQUIRED",
+    "MIXED_ALL_PROVIDERS_FAILED",
     "ARGOS_BACKEND_LAUNCH_UNAVAILABLE",
     "ARGOS_BACKEND_START_TIMEOUT",
     "ARGOS_BACKEND_START_UNAVAILABLE",
@@ -862,7 +1020,11 @@
     "HTTP_429",
     "NETWORK_ERROR",
     "REQUEST_TIMEOUT",
+    "BACKEND_REQUEST_TIMEOUT",
     "TRANSLATION_TIMEOUT",
+    "SOURCE_RESOLUTION_TIMEOUT",
+    "TRANSLATOR_PROCESS_TIMEOUT",
+    "TOO_MANY_ACTIVE_JOBS",
     "RESOURCE_NETWORK_ERROR",
     "RESOURCE_FETCH_FAILED",
     "SUBTITLE_NETWORK_ERROR",
@@ -916,7 +1078,11 @@
     let summary = message || "发生了未分类错误";
     let recommendation = "请展开“诊断详情”，按建议处理后重试。";
 
-    if (code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN") {
+    if (code === "TOO_MANY_ACTIVE_JOBS") {
+      title = "后台翻译任务已满";
+      summary = message || "当前正在排队或运行的翻译任务已达到安全上限。";
+      recommendation = "等待已有任务完成后再重试；如果任务长期不结束，请重启本地后端或扩展。";
+    } else if (code === "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN") {
       title = "Google 限流熔断已触发";
       summary = "短时间内收到了大量 HTTP 429，扩展已停止继续请求 Google；自动 Argos 备份未能完成。";
       recommendation = "确认 Echo360 Subtitle Backend 已正确安装且可由系统启动，然后重新翻译；无需继续重试 Google。";
@@ -960,6 +1126,16 @@
       title = "没有找到可用字幕源";
       summary = "页面没有提供可解析的 WebVTT/SRT 字幕，翻译尚未开始。";
       recommendation = "确认视频已经加载，并打开页面的 Captions/Transcript；如果字幕可见但仍失败，请保留诊断详情。";
+    } else if (code === "SOURCE_ALREADY_TRANSLATED") {
+      title = "检测到译文被当作原文";
+      summary = message && message !== "Unknown translation error"
+        ? message
+        : "当前字幕源多数 cue 同时包含目标语言和原文，扩展已阻止重复翻译。";
+      recommendation = "已阻止本次请求，避免字幕条数和文件大小继续累加；刷新视频或关闭旧的翻译轨道后，再从原始单语字幕重新开始。";
+    } else if (code === "MANUAL_SESSION_SOURCE_INVALID") {
+      title = "手动翻译原字幕校验失败";
+      summary = message || "当前课程的原字幕快照已经不是有效 WebVTT。";
+      recommendation = "重新打开视频并点击“AI 手动翻译”，重新生成 JSON 翻译包和提示词。";
     } else if (code === "SUBTITLE_ACCESS_DENIED") {
       title = "字幕文件访问被拒绝";
       summary = "播放器记录到了字幕地址，但字幕服务器返回 HTTP 401/403，扩展没有权限读取。";
@@ -1010,6 +1186,10 @@
         title = "Google 网页翻译访问被拒绝";
         summary = `Google 网页端点返回 HTTP ${httpStatus}，请求没有被接受；这不是 API Key 问题。`;
         recommendation = "检查网络和扩展站点权限，等待后降低并发/RPS，或切换到需要 API Key 的 Provider。";
+      } else if (String(context.provider || "").toLowerCase() === "azure") {
+        title = "Azure Translator 认证失败";
+        summary = `Azure Translator 返回 HTTP ${httpStatus}，订阅密钥、资源区域或资源权限不匹配。`;
+        recommendation = "检查 Azure 订阅密钥；如果使用多服务或区域型资源，还要在高级设置填写 Azure 门户显示的 Region/Location。";
       } else {
         title = "翻译服务认证失败";
         summary = `上游服务返回 HTTP ${httpStatus}，API Key 无效、过期或没有权限。`;
@@ -1052,10 +1232,18 @@
       title = "无法连接翻译服务";
       summary = "网络请求失败：浏览器没有完成翻译请求（Safari 常见显示为 Load failed）。";
       recommendation = "检查网络、站点权限和 Endpoint；不要立即连续重试，必要时切换 Provider。";
-    } else if (code === "REQUEST_TIMEOUT" || code === "TRANSLATION_TIMEOUT") {
-      title = "翻译请求超时";
-      summary = "翻译服务在规定时间内没有返回结果。";
-      recommendation = "降低并发或增加单请求超时时间，然后重试。";
+    } else if (code === "REQUEST_TIMEOUT" || code === "BACKEND_REQUEST_TIMEOUT" || code === "TRANSLATION_TIMEOUT" || code === "TRANSLATOR_PROCESS_TIMEOUT" || code === "SOURCE_RESOLUTION_TIMEOUT") {
+      title = code === "SOURCE_RESOLUTION_TIMEOUT" ? "字幕源解析超时" : "翻译请求超时";
+      summary = code === "TRANSLATOR_PROCESS_TIMEOUT"
+        ? "本地翻译进程超过整任务期限，后端已将其终止以释放任务槽位。"
+        : code === "SOURCE_RESOLUTION_TIMEOUT"
+          ? "扩展在共享时间预算内没有找到可用的字幕轨。"
+          : "翻译服务在规定时间内没有返回结果。";
+      recommendation = code === "TRANSLATOR_PROCESS_TIMEOUT"
+        ? "检查本地后端日志和网络状况；可降低字幕规模或并发后重试。"
+        : code === "SOURCE_RESOLUTION_TIMEOUT"
+          ? "确认播放器和字幕已加载，刷新页面后重试。"
+          : "降低并发或增加单请求超时时间，然后重试。";
     } else if (code === "ARGOS_DEPENDENCY_MISSING") {
       title = "缺少 Argos Translate 运行依赖";
       summary = "本地后端可以运行，但当前 Python 环境没有安装可选的 Argos Translate 依赖。";
@@ -1074,6 +1262,18 @@
         ? "翻译任务创建成功响应不完整，没有返回任务 ID。"
         : "扩展轮询的任务已过期、被清理，或后台 Service Worker 重启了。";
       recommendation = "重新开始翻译；如果频繁发生，请检查扩展是否被系统挂起。";
+    } else if (code === "MIXED_PROVIDERS_REQUIRED") {
+      title = "混合翻译服务不足";
+      summary = message || "混合翻译至少需要两个支持当前目标语言的服务。";
+      recommendation = "打开完整设置，勾选至少两个兼容服务并填写它们需要的 API Key。";
+    } else if (code === "MIXED_PRIORITY_CONFIG_INVALID") {
+      title = "混合翻译优先级配置无效";
+      summary = message || "请检查翻译分组与字幕数量阈值。";
+      recommendation = "打开完整设置，为每级选择至少一个兼容服务，并按级别填写递增的正整数阈值；或关闭多级优先级以使用原有调度。";
+    } else if (code === "MIXED_ALL_PROVIDERS_FAILED") {
+      title = "混合翻译的所有候选服务均失败";
+      summary = message || "当前分片已尝试所有健康服务，但仍未得到完整译文。";
+      recommendation = "检查各服务 API Key、配额、网络和本地后端状态，然后重试或调整服务比例。";
     } else if (code === "UNSUPPORTED_PROVIDER" || code === "PROVIDER_CONFIG_ERROR") {
       title = "翻译服务配置无效";
       summary = code === "UNSUPPORTED_PROVIDER"
@@ -1100,6 +1300,18 @@
       title = "字幕中没有可翻译文本";
       summary = "VTT 有时间轴，但没有可翻译的字幕文字。";
       recommendation = "确认字幕文件不是空文件，也不是只有时间轴/样式块。";
+    } else if (code === "RESOURCE_TOO_LARGE" || code === "REQUEST_TOO_LARGE") {
+      title = "字幕内容超过大小限制";
+      summary = message || "当前字幕文件或翻译请求超过了安全上限。";
+      recommendation = "请拆分字幕文件或减少本次翻译内容后重试。";
+    } else if (code === "PROVIDER_RESPONSE_TOO_LARGE") {
+      title = "翻译服务响应过大";
+      summary = message || "Provider 返回的数据超过安全上限，扩展已停止读取。";
+      recommendation = "检查 Endpoint 是否指向正确的 JSON API；若使用代理，请排查它是否返回了错误页或超大调试数据。";
+    } else if (code === "BACKEND_RESPONSE_TOO_LARGE" || code === "TRANSLATOR_OUTPUT_TOO_LARGE") {
+      title = "后端响应过大";
+      summary = message || "本地或自定义后端返回的数据超过安全上限。";
+      recommendation = "确认 Backend URL 指向兼容的翻译后端，并检查代理或调试中间层是否放大了响应。";
     } else if (code === "RESOURCE_HOST_NOT_ALLOWED") {
       title = "字幕地址不在允许的站点范围内";
       summary = "扩展拒绝读取这个字幕地址，避免把页面数据发送到未知站点。";
@@ -1132,13 +1344,13 @@
         ? "把 Backend URL 改回 http://127.0.0.1:8765 后重试。"
         : "Windows 请先运行发布包内的“安装并启动”入口；macOS 请把应用移到 Applications 并至少打开一次。";
     } else if (code === "BACKEND_DISABLED" || code === "BACKEND_URL_MISSING" || code === "BACKEND_REQUEST_ERROR" || code === "BACKEND_NETWORK_ERROR") {
-      title = "本地后端请求失败";
-      summary = message || "扩展没有得到本地后端的有效响应。";
-      recommendation = "检查本地后端是否运行、Backend URL 是否正确；不需要本地后端时请关闭该选项。";
+      title = "后端请求失败";
+      summary = message || "扩展没有得到 Argos 或自定义后端的有效响应。";
+      recommendation = "Argos 请确认本机后端已安装并能启动；自定义后端请检查 URL、站点权限、网络与协议版本。";
     } else if (code === "BACKEND_URL_INVALID") {
       title = "Backend 地址无效";
-      summary = "本地后端地址只允许使用 HTTP/HTTPS 的 localhost、127.0.0.1 或 [::1]。";
-      recommendation = "把 Backend URL 改为例如 http://127.0.0.1:8765，然后再次保存。";
+      summary = "Backend URL 必须是远程 HTTPS，或仅在 localhost、127.0.0.1、[::1] 上使用 HTTP；不能包含账号、密码、查询参数或片段。";
+      recommendation = "使用例如 http://127.0.0.1:8765 的本机地址，或改用可信的 https:// 自定义后端后重新保存。";
     } else if (code === "PROVIDER_API_KEY_MISSING") {
       title = "缺少翻译服务 API Key";
       summary = `Provider ${PROVIDER_LABELS[context.provider] || context.provider || "当前服务"} 没有可用 API Key。`;
@@ -1207,6 +1419,14 @@
         ? "翻译进程结束了，但没有生成结果文件。"
         : "翻译进程生成了文件，但文件没有有效的带时间轴字幕。";
       recommendation = "结果不会写入缓存；检查脚本错误输出后重试。";
+    } else if (code === "MANUAL_IMPORT_EMPTY") {
+      title = "没有导入字幕内容";
+      summary = "剪贴板或文件内容为空，无法校验翻译结果。";
+      recommendation = "重新复制完整的 WebVTT，或选择包含字幕内容的 .vtt 文件。";
+    } else if (code === "MANUAL_IMPORT_CUE_TEXT_LINE_COUNT_MISMATCH") {
+      title = "译文包含重复或缺失字幕行";
+      summary = message || "某个 cue 的字幕行数与原文不一致，译文可能被重复追加。";
+      recommendation = "每个 cue 只保留与原文相同数量的字幕行；不要把原文和译文同时粘回单语译文文件。";
     } else if (code === "TRANSLATION_CANCELLED") {
       title = "翻译已取消";
       summary = "翻译进程被取消，未将不完整结果宣布为成功。";
@@ -1408,6 +1628,12 @@
       ].filter(Boolean).join("；");
       if (sourceValue) details.push({ label: "字幕源", value: sourceValue });
       if (source.sourceId) details.push({ label: "字幕源地址", value: source.sourceId });
+      if (stats.textLineCount != null) {
+        details.push({
+          label: "字幕结构",
+          value: `${formatNumber(stats.cueCount)} 个 cue，${formatNumber(stats.textLineCount)} 行字幕文字；多行 cue ${formatNumber(stats.multilineCueCount || 0)} 个`,
+        });
+      }
     }
     if (model.candidateCount != null || model.sourceStrategy) {
       details.push({
@@ -1515,7 +1741,18 @@
     };
     const descriptor = describe(code, status, message, metrics, failureCodes, sourceContext);
     const upstreamTitle = clean(errorLike?.title || problem.title || "", 240);
-    const rawDetails = errorLike?.details || problem.details || null;
+    // `normalizeError` is called at more than one UI boundary.  A model that
+    // has already been normalized carries its rendered detail rows in
+    // `details`, while the original structured payload is kept in
+    // `extraDetails`.  Prefer that preserved payload and, when it is absent,
+    // treat an own `extraDetails` property as authoritative even when its
+    // value is null.  Falling back to `errorLike.details` in that case wraps
+    // the generated rows in a new "结构化附加信息" row on every re-entry.
+    const hasPreservedDetails = errorLike && typeof errorLike === "object" &&
+      Object.prototype.hasOwnProperty.call(errorLike, "extraDetails");
+    const rawDetails = hasPreservedDetails
+      ? errorLike.extraDetails
+      : errorLike?.details ?? problem.details ?? null;
     const extraDetails = rawDetails && typeof rawDetails === "object" ? sanitizeDetails(rawDetails) : rawDetails;
     const boundaryCode = normalizeCodeValue(
       context.boundaryCode || errorObject.boundary_code || errorObject.boundaryCode || problem.boundary_code ||
@@ -1641,6 +1878,8 @@
     serializeError,
     redactUrl,
     normalizeCode: normalizeCodeValue,
+    normalizeTargetCode,
+    readBoundedResponseText,
     isGenericCode,
     isWrapperCode,
     normalizeHttpStatus,
@@ -1648,6 +1887,7 @@
     formatDebugLog,
     isTranslatableVttLine,
     countTranslatableLines,
+    isTargetNeutralText,
     hasCjkInEveryTimedCue,
     hasCjkInSuccessfulTimedCues,
     timedCueTextEntries,

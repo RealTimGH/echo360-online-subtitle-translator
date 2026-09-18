@@ -15,6 +15,10 @@ function chromeApiMock() {
       create: vi.fn((properties, callback) => callback({ id: 7, ...properties })),
       remove: vi.fn((tabId, callback) => callback(tabId)),
     },
+    permissions: {
+      contains: vi.fn((_permissions, callback) => callback(false)),
+      request: vi.fn((_permissions, callback) => callback(true)),
+    },
     storage: {
       local: {
         get: vi.fn((key, callback) => callback({ [key]: store[key] })),
@@ -47,6 +51,8 @@ describe("shared WebExtension API adapter", () => {
       url: "chrome-extension://test/options.html",
     });
     await expect(api.tabs.remove(7)).resolves.toBe(7);
+    await expect(api.permissions.contains({ origins: ["https://translator.example/*"] })).resolves.toBe(false);
+    await expect(api.permissions.request({ origins: ["https://translator.example/*"] })).resolves.toBe(true);
   });
 
   it("preserves a specific nested diagnosis instead of a generic boundary code", () => {

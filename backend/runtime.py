@@ -5,7 +5,9 @@ import os
 import platform
 import shutil
 import sys
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -195,6 +197,53 @@ def _seed_copy_is_complete(target_dir: Path, manifest: dict) -> bool:
     return True
 
 
+@contextmanager
+def _seed_install_lock(seeds_root: Path, seed_id: str, timeout_seconds: float = 90.0):
+    """Serialize seed installation across server and translator processes.
+
+    The frozen server launches the same executable in ``--translator`` mode.
+    Without a cross-process lock, a late starter can delete a model directory
+    that an earlier process has just finished installing and is about to load.
+    ``mkdir`` is atomic on every supported platform and avoids an additional
+    runtime dependency in the packaged application.
+    """
+    lock_dir = seeds_root / f".{seed_id}.install.lock"
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            lock_dir.mkdir()
+            try:
+                (lock_dir / "owner.json").write_text(
+                    json.dumps({"pid": os.getpid(), "created_at": time.time()}),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            break
+        except FileExistsError:
+            # A process killed during first-run extraction can leave only the
+            # lock directory behind. Reclaim it after ten minutes; a healthy
+            # model copy is much shorter, while the normal waiter still gets
+            # a generous 90-second deadline.
+            try:
+                stale = time.time() - lock_dir.stat().st_mtime > 10 * 60
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    shutil.rmtree(lock_dir)
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting to install bundled Argos seed {seed_id}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 def _materialize_argos_seed(seed_dir: Path, data_root: Path) -> Path:
     """Atomically install immutable bundled models into a writable user directory."""
     manifest = _read_seed_manifest(seed_dir)
@@ -205,23 +254,29 @@ def _materialize_argos_seed(seed_dir: Path, data_root: Path) -> Path:
         return target_dir
 
     seeds_root.mkdir(parents=True, exist_ok=True)
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    temporary_dir = seeds_root / f".{seed_id}.{uuid.uuid4().hex}.tmp"
-    try:
-        shutil.copytree(seed_dir, temporary_dir)
-        if not _seed_copy_is_complete(temporary_dir, manifest):
-            raise RuntimeError("Bundled Argos assets were not copied completely")
+    with _seed_install_lock(seeds_root, seed_id):
+        # Another process may have completed the copy while this process was
+        # waiting. The second check is what prevents it from deleting the live
+        # model directory selected by that process.
+        if _seed_copy_is_complete(target_dir, manifest):
+            return target_dir
+        temporary_dir = seeds_root / f".{seed_id}.{uuid.uuid4().hex}.tmp"
+        displaced_dir = seeds_root / f".{seed_id}.{uuid.uuid4().hex}.incomplete"
         try:
+            shutil.copytree(seed_dir, temporary_dir)
+            if not _seed_copy_is_complete(temporary_dir, manifest):
+                raise RuntimeError("Bundled Argos assets were not copied completely")
+            if target_dir.exists():
+                # Rename first so no observer ever sees a half-deleted target.
+                # Only incomplete targets enter this branch, and the lock
+                # ensures no other installer can replace it concurrently.
+                os.replace(target_dir, displaced_dir)
             os.replace(temporary_dir, target_dir)
-        except OSError:
-            # A concurrently starting server/translator may have installed the
-            # same seed between the initial check and the atomic rename.
-            if not _seed_copy_is_complete(target_dir, manifest):
-                raise
-    finally:
-        if temporary_dir.exists():
-            shutil.rmtree(temporary_dir, ignore_errors=True)
+        finally:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir, ignore_errors=True)
+            if displaced_dir.exists():
+                shutil.rmtree(displaced_dir, ignore_errors=True)
     return target_dir
 
 

@@ -7,5 +7,4 @@ The standalone backend contains third-party open-source runtimes and model data 
 - CTranslate2: MIT license. Source: <https://github.com/OpenNMT/CTranslate2>.
 - OPUS-MT English→Chinese and English→Traditional Chinese models packaged by Argos: the README files shipped inside each model package identify the original OPUS models as CC-BY-4.0 and credit Jörg Tiedemann and Santhosh Thottingal, “OPUS-MT — Building open translation services for the World,” EAMT 2020.
 
-The Python distribution metadata collected into the application contains the versions, authors, project URLs, and declared licenses for the remaining bundled Python packages. Review the complete dependency and model license set before redistributing a build in a new legal or commercial context.
-
+The package also carries distribution metadata for the dependencies explicitly listed by the PyInstaller specification. That metadata is useful for inventory, but it is not a generated or independently verified complete software bill of materials. Review the full resolved dependency set, model licenses, and packaged files before redistributing a build in a new legal or commercial context.

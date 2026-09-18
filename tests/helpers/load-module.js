@@ -4,8 +4,8 @@
  * Each extension module is an IIFE that registers itself onto
  * `window.Echo360Translator`. We:
  *  1. Set up the namespace with required constants/deps.
- *  2. Call `evalModule(filename)` — reads the source file from disk
- *     (so Stryker's instrumented copy is picked up in mutation runs)
+ *  2. Call `evalModule(filename)` — reads the source file from disk and
+ *     instruments it when Vitest coverage is enabled.
  *     and executes it via `new Function`, which runs in global scope
  *     where jsdom's `window` is available.
  *  3. Tests then access the registered functions from the namespace.
@@ -37,15 +37,15 @@ function getInstrumenter() {
   return instrumenter;
 }
 
-/** Instrument during vitest runs; skip Stryker workers (they have their own instrumentation). */
+/** Instrument extension IIFEs during Vitest runs. */
 function shouldInstrumentForCoverage() {
-  return process.env.VITEST === "true" && !process.env.STRYKER_MUTATOR_WORKER;
+  return process.env.VITEST === "true";
 }
 
 /**
  * Read an extension source file from disk and execute its IIFE in the
- * current global scope. Any mutations applied by Stryker to the source
- * file will be reflected here because we read at runtime.
+ * current global scope. Reading at runtime keeps tests aligned with the
+ * exact working-tree source under review.
  *
  * Under vitest, the source is istanbul-instrumented first so branch/line
  * hits are attributed back to extension/*.js (plain v8 cannot track code
@@ -88,6 +88,7 @@ export function makeFullNs(overrides = {}) {
         gemini: "Gemini",
         openai: "OpenAI",
         deepl: "DeepL",
+        azure: "Azure AI Translator F0",
       },
       TARGET_OPTIONS: ["ZH", "ZH-HK", "YUE", "EN", "JA"],
       TARGET_LABELS: {

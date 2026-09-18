@@ -12,6 +12,7 @@ Core user-facing behavior:
 - Translates subtitles with the selected provider.
 - Displays translated or bilingual subtitles in the Echo360 or Canvas embedded player.
 - Caches the latest translated subtitle locally for quicker reloads.
+- Downloads one compact full-course `.translate.json` and copies a short prompt for manual AI translation. The JSON keeps only the session, target language, and cue ID-to-text map; the extension validates the returned complete result before loading it.
 
 ## Recommended Short Description
 
@@ -20,16 +21,19 @@ Translate Echo360 lecture subtitles and display them on recorded videos.
 ## Permission Justification
 
 - `storage`: Saves extension settings, optional API key, subtitle display preferences, and local subtitle cache.
+- `clipboardRead`: Lets the user-activated manual AI import action read a returned `.translated.json` or WebVTT from the system clipboard; a separate user-activated file chooser remains available when clipboard import is unavailable.
+- `clipboardWrite`: Lets the manual AI workflow copy the generated prompt to the system clipboard, including after asynchronous subtitle preparation.
 - `https://translate.googleapis.com/*`: Google Translate provider.
 - `https://api.deepseek.com/*`: DeepSeek provider.
 - `https://api.openai.com/*`: OpenAI provider.
 - `https://generativelanguage.googleapis.com/*`: Gemini provider.
 - `https://api-free.deepl.com/*`, `https://api.deepl.com/*`: DeepL provider.
-- `http://localhost:8765/*`, `http://127.0.0.1:8765/*`: Optional connection to the separately installed, loopback-only Argos backend. It is never contacted unless the user enables the local backend option.
-- Echo360 and Instructure Media host permissions: Required to find subtitle sources, observe lecture-player state, and attach translated subtitle tracks. Canvas access is limited to the content-script match `canvas.sydney.edu.au/courses/*/pages/*`; the broad Canvas host is not present in `host_permissions`.
-- Canvas assessment safety: the Canvas page script is a data-free, isolated proof bridge limited to `/courses/*/pages/*`. Quiz, assignment, New Quizzes, taking, and ambiguous Canvas contexts fail closed before probes, UI, storage reads, or translation requests start.
+- `https://api.cognitive.microsofttranslator.com/*`, `https://*.cognitiveservices.azure.com/*`: Azure AI Translator provider, including the global endpoint and Azure custom-domain resources.
+- `http://localhost:8765/*`, `http://127.0.0.1:8765/*`, `http://[::1]:8765/*`: Connection to the separately installed, loopback-only Argos backend. It is contacted only when the user selects Argos or Google fallback needs it.
+- Echo360 and Instructure Media host permissions: Required to find subtitle sources, observe lecture-player state, and attach translated subtitle tracks. Canvas access is limited to the content-script matches `canvas.sydney.edu.au/courses/*/pages/*` and `/courses/*/external_tools/*`; the broad Canvas host is not present in `host_permissions`.
+- Canvas assessment safety: the Canvas page script is a data-free, isolated proof bridge limited to those course-page and external-tool paths. Quiz, assignment, New Quizzes, taking, and ambiguous Canvas contexts fail closed before probes, UI, storage reads, or translation requests start.
 
-Generate the Chrome Web Store package with `npm run build:store`. The store build retains the optional local backend UI and its narrowly scoped `localhost` / `127.0.0.1:8765` permissions so the same release resources also work in the Safari containing app. Direct translation remains the default.
+Generate the Chrome Web Store package with `npm run build:store`. The store build retains narrowly scoped loopback permissions for Argos so the same release resources also work in the Safari containing app. There is no general backend toggle: online providers remain direct, while selecting Argos uses the local backend automatically.
 
 ## Privacy Disclosure
 
@@ -37,7 +41,7 @@ Privacy policy file: `PRIVACY.md`
 
 Suggested disclosure:
 
-This extension stores settings and optional API keys locally in Chrome storage. Subtitle text is sent only to the translation provider selected by the user. If the user explicitly enables the separately installed Argos backend, subtitle text is sent only to that loopback-only service on the same computer. Neither the extension nor the local backend collects account data or browsing history.
+This extension stores settings and optional API keys locally in Chrome storage. Subtitle text is sent only to the translation provider selected by the user. If the user selects Argos, subtitle text is sent only to the loopback-only service on the same computer. The keyless Google web option places each submitted segment in an unofficial provider request's query string; the extension redacts those query strings locally but cannot control provider retention. Neither the extension nor the local backend collects account data or browsing history.
 
 ## Final Manual Checks
 
@@ -46,9 +50,9 @@ This extension stores settings and optional API keys locally in Chrome storage. 
 - Confirm Google Translate works without an API key and is described as quick/free trial use, not the quality-focused recommendation.
 - Confirm DeepSeek/OpenAI/Gemini/DeepL are described as better-quality AI/API options and show that an API key is required.
 - Confirm options page saves provider and target language.
-- Confirm the store build shows the local backend option but leaves it disabled by default.
-- Confirm `dist/extension-store/manifest.json` limits local backend access to `localhost:8765` and `127.0.0.1:8765`.
+- Confirm the store build has no general backend toggle and selecting Argos uses the fixed loopback endpoint automatically.
+- Confirm `dist/extension-store/manifest.json` limits local backend access to `localhost:8765`, `127.0.0.1:8765`, and `[::1]:8765`.
 - Confirm translated subtitles can be loaded, hidden, shown, resized, and reloaded from cache.
-- Confirm the manifest has no broad `canvas.sydney.edu.au` host permission and its only Canvas content-script match is `/courses/*/pages/*` with only `canvas_course_bridge.js`.
+- Confirm the manifest has no broad `canvas.sydney.edu.au` host permission and its only Canvas content-script matches are `/courses/*/pages/*` and `/courses/*/external_tools/*`, both using only `canvas_course_bridge.js`.
 - Confirm Canvas quiz/assignment and origin-only referrer fixtures leave both page probes and the controller uninitialized.
 - Confirm the Chrome Web Store listing links to a public privacy policy URL.
