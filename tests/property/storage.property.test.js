@@ -259,6 +259,13 @@ describe("getPrefs / savePrefs properties", () => {
 
 describe("getContextKey properties", () => {
   it("P9 – result always contains '::'", () => {
+    const locationState = { hostname: "", pathname: "/" };
+    Object.defineProperty(window, "location", {
+      value: locationState,
+      configurable: true,
+      writable: true,
+    });
+    const { storage } = setupStorage();
     const arbHostname = fc.constantFrom(
       "echo360.org", "echo360.net.au", "canvas.sydney.edu.au", "localhost", "example.com",
     );
@@ -267,12 +274,8 @@ describe("getContextKey properties", () => {
 
     fc.assert(
       fc.property(arbHostname, arbPathname, (hostname, pathname) => {
-        Object.defineProperty(window, "location", {
-          value: { hostname, pathname },
-          configurable: true,
-          writable: true,
-        });
-        const { storage } = setupStorage();
+        locationState.hostname = hostname;
+        locationState.pathname = pathname;
         const key = storage.getContextKey();
         return key.includes("::");
       }),
@@ -281,18 +284,20 @@ describe("getContextKey properties", () => {
   });
 
   it("P10 – /lesson/:id path uses id, not full pathname", () => {
+    const locationState = { hostname: "echo360.org", pathname: "/" };
+    Object.defineProperty(window, "location", {
+      value: locationState,
+      configurable: true,
+      writable: true,
+    });
+    const { storage } = setupStorage();
     // Generate URL-safe IDs: strip non-alphanumeric/hyphen chars, pad to min length
     const arbId = fc.string({ minLength: 4, maxLength: 36 })
       .map((s) => s.replace(/[^a-zA-Z0-9-]/g, "x").replace(/^-+/, "x").padEnd(4, "x"));
 
     fc.assert(
       fc.property(arbId, (id) => {
-        Object.defineProperty(window, "location", {
-          value: { hostname: "echo360.org", pathname: `/lesson/${id}/classroom` },
-          configurable: true,
-          writable: true,
-        });
-        const { storage } = setupStorage();
+        locationState.pathname = `/lesson/${id}/classroom`;
         const key = storage.getContextKey();
         return key === `echo360.org::${id}`;
       }),
