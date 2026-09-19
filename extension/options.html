@@ -481,7 +481,7 @@
 
               <label for="rps">RPS</label>
               <input id="rps" type="number" min="0" step="0.1" />
-              <div class="hint">每秒请求数限制；Google Translate 即使填 0 也会使用安全默认值 3 RPS，并限制为最多 3 并发。较低的显式值会被保留；遇到 HTTP 429 会遵循 Retry-After、指数退避并在短时高频失败后熔断。</div>
+              <div class="hint">每秒请求数限制；Google Translate 即使填 0 也会使用安全默认值 6 RPS，并限制为最多 3 并发。较低的显式值会被保留；遇到 HTTP 429 会遵循 Retry-After、指数退避并在短时高频失败后熔断。</div>
 
               <label for="retries">Retries</label>
               <input id="retries" type="number" min="0" step="1" />

@@ -1090,7 +1090,7 @@
       if (rateLimited) {
         title = "Google 网页翻译被限流";
         summary = `Google 网页端点拒绝了本次请求${total != null ? `（${failed ?? total}/${total} 条字幕失败）` : ""}，检测到 HTTP 429。`;
-        recommendation = "请先停止连续重试，等待几分钟解除限流；之后使用 concurrency=3、RPS=3，或切换到 DeepSeek/Gemini/OpenAI/DeepL。";
+        recommendation = "请先停止连续重试，等待几分钟解除限流；之后使用 concurrency=3、RPS=6，或切换到 DeepSeek/Gemini/OpenAI/DeepL。";
       } else {
         title = "Google 网页翻译全部失败";
         summary = `Google 网页端点没有返回可用译文${total != null ? `（${failed ?? total}/${total} 条字幕失败）` : ""}。`;
@@ -1112,7 +1112,7 @@
       if (rateLimited) {
         title = "翻译服务返回空结果，且疑似被限流";
         summary = "字幕请求没有得到目标语言译文，同时检测到 HTTP 429 或限流计数；这通常不是字幕文件本身的问题。";
-        recommendation = "请停止连续重试，等待几分钟后用 concurrency=3、RPS=3 重试，或切换到 API Provider。";
+        recommendation = "请停止连续重试，等待几分钟后用 concurrency=3、RPS=6 重试，或切换到 API Provider。";
       } else if (String(context.provider || "").toLowerCase() === "google-web") {
         title = "Google 网页翻译没有返回中文";
         summary = "字幕源有效，但 Google 网页端点没有返回可识别的中文译文；这不是 API Key 缺失。";
@@ -1171,7 +1171,7 @@
     } else if (code === "HTTP_429") {
       title = "翻译服务请求过于频繁";
       summary = "上游服务返回 HTTP 429，当前请求过于频繁，已被限流。";
-      recommendation = "等待几分钟后重试，并降低 RPS/并发；Google 网页端点建议 3/3。";
+      recommendation = "等待几分钟后重试，并降低 RPS/并发；Google 网页端点建议 6/3。";
     } else if (code === "HTTP_401" || code === "HTTP_403") {
       const httpStatus = diagnosticHttpStatus || code.slice(5);
       if (context.phase === "source") {

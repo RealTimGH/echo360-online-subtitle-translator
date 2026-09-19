@@ -435,6 +435,7 @@ describe("translateWithConfig (store build)", () => {
       );
 
       expect(backendClientMock.ensureArgosBackend).toHaveBeenCalledWith("http://127.0.0.1:8765");
+      expect(result.provider).toBe("argos");
       expect(backendClientMock.proxyRequest).toHaveBeenCalledWith(
         "http://127.0.0.1:8765",
         "/translate-async",
@@ -546,6 +547,69 @@ describe("translateWithConfig (store build)", () => {
       providerResults: 4,
     });
     expect(onPartialVtt).toHaveBeenCalled();
+  });
+
+  it("forwards a mixed child partial before the child shard completes", async () => {
+    const jobs = new Map();
+    let sequence = 0;
+    backendClientMock.createDirectTranslateJob.mockImplementation(async (childPayload) => {
+      const jobId = `mixed-partial-${++sequence}`;
+      jobs.set(jobId, childPayload);
+      return { job_id: jobId };
+    });
+    backendClientMock.waitDirectJob.mockImplementation(async (jobId, options = {}) => {
+      const childPayload = jobs.get(jobId);
+      const partial = childPayload.vtt_text.replace(/Hello (\d+)/, "预览$1");
+      options.onPartialVtt?.(partial, { completed: 1, total: 2, done: false });
+      return {
+        translated_vtt: childPayload.vtt_text.replace(/Hello (\d+)/g, "中文$1"),
+        warnings: [],
+        failed_items: [],
+        metrics: { total: 2, processed: 2, translated: 2, failed: 0, providerResults: 2, targetResults: 2 },
+      };
+    });
+
+    const source = [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "Hello 1", "",
+      "00:00:01.000 --> 00:00:02.000", "Hello 2", "",
+      "00:00:02.000 --> 00:00:03.000", "Hello 3", "",
+      "00:00:03.000 --> 00:00:04.000", "Hello 4", "",
+    ].join("\n");
+    const onPartialVtt = vi.fn();
+    const result = await svc.translateWithConfig(
+      {
+        provider: "mixed",
+        mixedProviders: [
+          { provider: "google-web", weight: 50, enabled: true },
+          { provider: "deepl", weight: 50, enabled: true },
+        ],
+      },
+      "http://127.0.0.1:8765",
+      {
+        provider: "mixed",
+        target: "ZH",
+        vtt_text: source,
+        mixed_providers: [
+          { provider: "google-web", weight: 50, enabled: true },
+          { provider: "deepl", weight: 50, enabled: true },
+        ],
+      },
+      { onPartialVtt }
+    );
+
+    expect(onPartialVtt.mock.calls[0][0]).toContain("预览");
+    expect(onPartialVtt.mock.calls[0][0]).not.toContain("中文");
+    expect(result.translated_vtt).toContain("中文1");
+    expect(result.metrics).toMatchObject({
+      totalCues: 4,
+      translatedCues: 4,
+      failedCues: 0,
+      providerBreakdown: {
+        "google-web": expect.objectContaining({ completedCues: 2 }),
+        deepl: expect.objectContaining({ completedCues: 2 }),
+      },
+    });
   });
 
   it("keeps successful cues from a partial provider result and reassigns only failed cues", async () => {

@@ -41,7 +41,10 @@
 
   const state = {
     model: null,
-    enabled: true,
+    // The controller applies the persisted opt-in after preferences load.
+    // Starting disabled avoids a flash of Transcript-panel decorations on
+    // fresh installs/upgrades before that asynchronous read completes.
+    enabled: false,
     started: false,
     documentObserver: null,
     panelObservers: new Map(),
@@ -1252,9 +1255,12 @@
   }
 
   function clear() {
+    const wasEnabled = state.enabled;
     clearDecorationsOnly();
     state.model = null;
-    state.enabled = true;
+    // Clearing a translation is a data reset, not a visibility preference
+    // reset. Preserve the explicit user choice across a retry/dismissal.
+    state.enabled = wasEnabled;
     state.diagnostics.active = false;
     state.diagnostics.modelCueCount = 0;
     state.diagnostics.modelOriginalCueCount = 0;

@@ -146,7 +146,7 @@ describe("structured error model", () => {
 
     expect(model.title).toContain("疑似被限流");
     expect(model.summary).toContain("HTTP 429");
-    expect(model.recommendation).toContain("RPS=3");
+    expect(model.recommendation).toContain("RPS=6");
   });
 
   it("explains subtitle fetch failures and unsupported resource hosts", () => {

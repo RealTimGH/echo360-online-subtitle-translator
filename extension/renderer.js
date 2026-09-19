@@ -97,6 +97,7 @@
     `;
     ns.bilingualDomRenderer?.applySize(normalizedSize);
     ns.playerCaptionRenderer?.applySize(normalizedSize);
+    ns.echoCaptionRenderer?.applySize(normalizedSize);
   }
 
   function shouldShowTranslatedTrackForVideo(video, videos = ns.video.getAllVideos()) {
@@ -145,6 +146,10 @@
       ns.bilingualDomRenderer.setVisible(enabled);
       return;
     }
+    if (ns.echoCaptionRenderer?.isMounted()) {
+      ns.echoCaptionRenderer.setVisible(enabled);
+      return;
+    }
     if (enabled) {
       ensureTrackOnPrimaryVideo();
     }
@@ -187,6 +192,10 @@
       ns.bilingualDomRenderer.ensureMounted();
       return;
     }
+    if (ns.echoCaptionRenderer?.isMounted()) {
+      ns.echoCaptionRenderer.ensureMounted();
+      return;
+    }
     if (pendingMount) {
       const target = ns.sourceFinder.pickBestMountVideoByVtt(pendingMount.originalVtt, pendingMount.sourceMeta || null);
       if (target) {
@@ -225,6 +234,7 @@
 
   function deactivateTranslatedRenderers() {
     ns.playerCaptionRenderer?.unmount();
+    ns.echoCaptionRenderer?.unmount();
     ns.bilingualDomRenderer?.unmount();
     for (const video of ns.video.getAllVideos()) {
       for (const track of video.textTracks) {
@@ -252,6 +262,7 @@
 
   function hasRenderedTranslatedTrack() {
     if (ns.playerCaptionRenderer?.isMounted()) return true;
+    if (ns.echoCaptionRenderer?.isMounted()) return true;
     if (ns.bilingualDomRenderer?.isMounted()) return true;
     return ns.video
       .querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]')
@@ -360,9 +371,11 @@
         size,
       })
       : normalizedTranslated;
-    const payload = ns.vtt.applyCueBottom(rawPayload, size);
+    const bottomAlignedPayload = ns.vtt.applyCueBottom(rawPayload, size);
+    const payload = bottomAlignedPayload;
 
     const customCaptionMode = ns.playerCaptionRenderer?.isSupportedVideo?.(video) === true;
+    const echoCaptionMode = ns.echoCaptionRenderer?.isSupportedVideo?.(video) === true;
     const nativeDomMode = bilingual && !useNativeSubtitles;
     if (!incremental) {
       deactivateTranslatedRenderers();
@@ -421,6 +434,55 @@
       // after initialization. Keep the mount pending so periodic sync can
       // retry after a SPA/player-root transition, and never report a false
       // success for subtitles that cannot be seen.
+      pendingMount = {
+        translatedVtt,
+        originalVtt,
+        bilingual: !!bilingual,
+        size: size || DEFAULT_SUBTITLE_SIZE,
+        reverseOrder: !!reverseOrder,
+        sourceMeta: resolvedSourceMeta,
+        useNativeSubtitles: !!useNativeSubtitles,
+        browserBilingual: !!fallbackBilingual,
+        browserReverseOrder: !!fallbackReverseOrder,
+      };
+      return false;
+    }
+
+    // Echo360 paints the original English subtitle as a normal DOM node in
+    // #player rather than as a second TextTrack. A browser <track> cannot
+    // share that node's geometry, which is why a line:-2 tweak leaves the two
+    // subtitles in the wrong order. Use one player-local overlay and measure
+    // the actual English node on every cue/interaction/layout change.
+    if (echoCaptionMode) {
+      if (incremental && ns.echoCaptionRenderer.isMounted()) {
+        if (ns.echoCaptionRenderer.update({
+          video,
+          originalVtt,
+          translatedVtt: normalizedTranslated,
+          size,
+          bilingual: !!fallbackBilingual,
+          reverseOrder: fallbackReverseOrder,
+        })) {
+          lastTranslatedTrack = { mode: "echo-caption" };
+          commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+          return true;
+        }
+        ns.echoCaptionRenderer.unmount();
+      }
+      removeTranslatedTrackElements();
+      const mounted = ns.echoCaptionRenderer.mount({
+        video,
+        originalVtt,
+        translatedVtt: normalizedTranslated,
+        size,
+        bilingual: !!fallbackBilingual,
+        reverseOrder: fallbackReverseOrder,
+      });
+      if (mounted) {
+        lastTranslatedTrack = { mode: "echo-caption" };
+        commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+        return true;
+      }
       pendingMount = {
         translatedVtt,
         originalVtt,

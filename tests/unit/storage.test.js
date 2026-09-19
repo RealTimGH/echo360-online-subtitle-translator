@@ -571,7 +571,7 @@ describe("getPrefs normalization", () => {
     expect(prefs.enabled).toBe(true);
     expect(prefs.useNativeSubtitles).toBe(true);
     expect(prefs.bilingual).toBe(false);
-    expect(prefs.transcriptPanelEnabled).toBe(true);
+    expect(prefs.transcriptPanelEnabled).toBe(false);
   });
 
   it("upgrades a 1.4.2 prefs record without resetting existing choices", async () => {
@@ -597,7 +597,7 @@ describe("getPrefs normalization", () => {
       bilingual: true,
       reverseOrder: true,
       useNativeSubtitles: true,
-      transcriptPanelEnabled: true,
+      transcriptPanelEnabled: false,
     });
   });
 
@@ -608,6 +608,19 @@ describe("getPrefs normalization", () => {
     expect((await storage.getPrefs()).transcriptPanelEnabled).toBe(false);
     await storage.savePrefs({ transcriptPanelEnabled: false, enabled: true, size: "medium", bilingual: false, reverseOrder: false, useNativeSubtitles: true });
     expect(localMock._store[prefsKey()].transcriptPanelEnabled).toBe(false);
+  });
+
+  it("preserves an explicit Transcript panel opt-in across upgrades", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        [prefsKey()]: {
+          transcriptPanelEnabled: true,
+          useNativeSubtitles: true,
+          renderModeVersion: 3,
+        },
+      },
+    });
+    expect((await storage.getPrefs()).transcriptPanelEnabled).toBe(true);
   });
 
   it("migrates legacy prefs without schema version to prefer the browser track", async () => {

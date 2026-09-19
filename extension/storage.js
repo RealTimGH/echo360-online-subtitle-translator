@@ -68,9 +68,10 @@
       reverseOrder: false,
       browserBilingual: false,
       browserReverseOrder: false,
-      // Transcript panel enhancement is an independent surface.  It remains
-      // enabled even when browser video subtitles are disabled.
-      transcriptPanelEnabled: true,
+      // Transcript panel enhancement is an independent surface.  Keep it
+      // opt-in on fresh installs; an explicit stored choice is preserved by
+      // the normalization below so upgrades do not overwrite user settings.
+      transcriptPanelEnabled: false,
       // Default: browser <track> renderer. Native CC injection remains
       // available as an opt-in Beta, but at high playback speed Echo360's
       // own caption DOM routinely lags and miss-injection is still common,
@@ -89,7 +90,9 @@
     }
     prefs.browserBilingual = typeof prefs.browserBilingual === "boolean" ? prefs.browserBilingual : prefs.bilingual === true;
     prefs.browserReverseOrder = typeof prefs.browserReverseOrder === "boolean" ? prefs.browserReverseOrder : prefs.reverseOrder === true;
-    prefs.transcriptPanelEnabled = prefs.transcriptPanelEnabled !== false;
+    // A missing field is the upgrade/fresh-install default: disabled.  Only a
+    // stored boolean true represents an explicit opt-in.
+    prefs.transcriptPanelEnabled = prefs.transcriptPanelEnabled === true;
     prefs.bilingual = prefs.useNativeSubtitles ? prefs.browserBilingual : true;
     prefs.reverseOrder = prefs.useNativeSubtitles ? prefs.browserReverseOrder : false;
     if (prefs.size === "tiny") prefs.size = "medium";
@@ -112,13 +115,16 @@
       : typeof prefs.browserReverseOrder === "boolean"
         ? prefs.browserReverseOrder
         : existing.browserReverseOrder === true;
+    const transcriptPanelEnabled = typeof prefs.transcriptPanelEnabled === "boolean"
+      ? prefs.transcriptPanelEnabled
+      : existing.transcriptPanelEnabled === true;
     const normalizedPrefs = {
       ...prefs,
       renderModeVersion: PREFS_SCHEMA_VERSION,
       useNativeSubtitles,
       browserBilingual,
       browserReverseOrder,
-      transcriptPanelEnabled: prefs.transcriptPanelEnabled !== false,
+      transcriptPanelEnabled,
       bilingual: useNativeSubtitles ? browserBilingual : true,
       reverseOrder: useNativeSubtitles ? browserReverseOrder : false,
     };

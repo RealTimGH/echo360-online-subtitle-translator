@@ -80,7 +80,7 @@ CORS_ORIGIN_PATTERN = (
 WEB_PROVIDER_LIMITS = {
     # The undocumented Google Web endpoint gets one shared conservative
     # profile; max_paragraphs=1 remains an incremental-display choice.
-    "google-web": {"concurrency": 3, "rps": 3.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
+    "google-web": {"concurrency": 3, "rps": 6.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
     # Argos runs in the translator subprocess and uses English as the source.
     # A single worker avoids loading/contending on the same CTranslate2 model
     # from multiple Python threads.

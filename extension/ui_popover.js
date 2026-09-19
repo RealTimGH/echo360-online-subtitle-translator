@@ -225,7 +225,7 @@
         };
         applyProviderLabel(cfg);
         refs.enabled.checked = !!prefs.enabled;
-        refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled !== false;
+        refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled === true;
         refs.bilingual.checked = !!browserModePrefs.bilingual;
         refs.reverseOrder.checked = !!browserModePrefs.reverseOrder;
         // Checked = Beta native CC injection; unchecked = default browser track.

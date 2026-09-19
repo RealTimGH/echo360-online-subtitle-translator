@@ -159,7 +159,7 @@
       // subtitle into a total render failure.
       try {
         if (ns.transcriptPanelRenderer) {
-          if (prefs.transcriptPanelEnabled === false) {
+          if (prefs.transcriptPanelEnabled !== true) {
             ns.transcriptPanelRenderer.setVisible(false);
           } else {
             const panelTranslatedVtt = options.previewPending && ns.vtt?.buildIncrementalPreviewVtt
@@ -231,6 +231,165 @@
 
   function failedCuesFromProgress(progress = {}, originalVtt = "") {
     return failedCuesFromItems(progress.failed_items, originalVtt);
+  }
+
+  function addSummaryCounts(target, source) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return target;
+    for (const [code, value] of Object.entries(source)) {
+      const count = Number(value);
+      if (!code || !Number.isFinite(count) || count <= 0) continue;
+      target[code] = (target[code] || 0) + count;
+    }
+    return target;
+  }
+
+  // error_utils.js is loaded before controller.js in the extension, but keep
+  // the result line readable for compatibility/test harnesses that load the
+  // controller with a minimal namespace.
+  const SUMMARY_PROVIDER_LABELS = {
+    mixed: "混合翻译（并行）",
+    "google-web": "Google Translate 网页端点",
+    deepseek: "DeepSeek",
+    gemini: "Gemini",
+    openai: "OpenAI",
+    deepl: "DeepL",
+    azure: "Azure AI Translator F0",
+    argos: "Argos Translate（本地）",
+    "custom-backend": "自定义后端",
+  };
+
+  function buildTranslationSummary(result, payload, originalVtt, sourceMeta, { cacheHit = false, cachedSummary = null } = {}) {
+    const cached = cachedSummary && typeof cachedSummary === "object" ? cachedSummary : {};
+    const metrics = {
+      ...cached,
+      ...(cached.metrics && typeof cached.metrics === "object" ? cached.metrics : {}),
+      ...(result?.metrics && typeof result.metrics === "object" ? result.metrics : {}),
+    };
+    const parsedStats = ns.vtt?.parseVttStats?.(originalVtt) || {};
+    const sourceStats = sourceMeta?.stats && typeof sourceMeta.stats === "object" ? sourceMeta.stats : {};
+    // Source discovery can contribute a partial stats object (for example,
+    // only maxEnd or only cueCount). Fill missing/zero fields from the actual
+    // VTT so the compact result line never says "0 cues" for a valid source.
+    const stats = {
+      ...parsedStats,
+      ...sourceStats,
+      cueCount: Number(sourceStats.cueCount) > 0
+        ? Number(sourceStats.cueCount)
+        : Number(parsedStats.cueCount) || 0,
+      textLineCount: Number(sourceStats.textLineCount) > 0
+        ? Number(sourceStats.textLineCount)
+        : Number(parsedStats.textLineCount) || 0,
+    };
+    const failedItems = Array.isArray(result?.failed_items) ? result.failed_items : [];
+    const failedCueSet = new Set([
+      ...failedCuesFromItems(failedItems, originalVtt),
+      ...(Array.isArray(result?.failed_cues) ? result.failed_cues : [])
+        .map((cue) => Number(cue))
+        .filter((cue) => Number.isInteger(cue) && cue > 0),
+    ]);
+    const totalCues = Math.max(0,
+      Number(metrics.totalCues) ||
+      Number(metrics.total_cues) ||
+      Number(stats.cueCount) ||
+      0
+    );
+    const failedCount = Math.max(0, Number(metrics.failed) || failedItems.length || 0);
+    const failedCues = Math.min(
+      totalCues,
+      Math.max(0, Number.isFinite(Number(metrics.failedCues)) ? Number(metrics.failedCues) : (failedCueSet.size || failedCount))
+    );
+    const translatedCues = Math.min(
+      totalCues,
+      Math.max(0, Number.isFinite(Number(metrics.translatedCues))
+        ? Number(metrics.translatedCues)
+        : totalCues - failedCues)
+    );
+    let rawBreakdown = metrics.providerBreakdown && typeof metrics.providerBreakdown === "object"
+      ? metrics.providerBreakdown
+      : {};
+    // New cache entries retain the provider breakdown from the completed run.
+    // This is important for a later cache hit: the cache key tells us which
+    // configuration was selected, but not whether a mixed route used a
+    // fallback provider for some cues.
+    if (Object.keys(rawBreakdown).length === 0 && Array.isArray(cached.providers)) {
+      rawBreakdown = Object.fromEntries(cached.providers
+        .filter((item) => item && typeof item === "object" && item.provider)
+        .map((item) => [String(item.provider), {
+          assignedCues: Number(item.assignedCues) || 0,
+          completedCues: Number(item.translatedCues ?? item.completedCues) || 0,
+          failedCues: Number(item.failedCues) || 0,
+          failures: Number(item.failedAttempts ?? item.failures) || 0,
+        }]));
+    }
+    const provider = String(result?.provider || payload?.provider || "google-web").trim().toLowerCase();
+    const providerEntries = Object.entries(rawBreakdown);
+    if (providerEntries.length === 0 && provider) {
+      providerEntries.push([provider, {
+        assignedCues: totalCues,
+        completedCues: translatedCues,
+        failures: failedCues,
+        failureCodes: result?.failure_codes || result?.failureCodes || metrics.failureCodes || metrics.failure_codes || {},
+      }]);
+    }
+    const providers = providerEntries.map(([code, value]) => {
+      const record = value && typeof value === "object" ? value : {};
+      return {
+        provider: code,
+        label: ns.errorUtils?.PROVIDER_LABELS?.[code] || SUMMARY_PROVIDER_LABELS[code] || code,
+        assignedCues: Number(record.assignedCues ?? record.assigned_cues) || 0,
+        translatedCues: Number(record.completedCues ?? record.completed_cues ?? record.translatedCues ?? record.translated_cues) || 0,
+        failedCues: Number(record.failedCues ?? record.failed_cues) || 0,
+        failedAttempts: Number(record.failures ?? record.failedAttempts ?? record.failed_attempts) || 0,
+      };
+    });
+    const routedCues = providers.reduce((sum, item) => sum + item.assignedCues, 0);
+    const observedFailureCodes = {};
+    addSummaryCounts(observedFailureCodes, metrics.observedFailureCodes || metrics.observed_failure_codes);
+    if (Object.keys(observedFailureCodes).length === 0) {
+      for (const [, value] of providerEntries) {
+        addSummaryCounts(observedFailureCodes, value?.observedFailureCodes || value?.observed_failure_codes);
+      }
+    }
+    const finalFailureCodes = result?.failure_codes || result?.failureCodes || metrics.failureCodes || metrics.failure_codes;
+    for (const [code, count] of Object.entries(finalFailureCodes || {})) {
+      if (!Object.prototype.hasOwnProperty.call(observedFailureCodes, code)) observedFailureCodes[code] = Number(count) || 0;
+    }
+    const providerRateLimitCount = providerEntries.reduce((sum, [, value]) => sum + (Number(value?.rateLimitCount) || 0), 0);
+    const provider429Count = providerEntries.reduce((sum, [, value]) => sum + (Number(value?.google429Responses) || 0), 0);
+    return {
+      status: failedCues > 0 || failedCount > 0 ? "partial" : "completed",
+      cacheHit,
+      totalCues,
+      translatedCues,
+      failedCues,
+      skippedCues: Math.max(0, totalCues - routedCues),
+      totalLines: Number(metrics.total) || Number(ns.errorUtils?.countTranslatableLines?.(originalVtt)) || 0,
+      rateLimitCount: Number(metrics.rateLimitCount) || providerRateLimitCount || Number(observedFailureCodes.HTTP_429) || 0,
+      google429Responses: Number(metrics.google429Responses) || provider429Count || 0,
+      elapsedMs: Number(metrics.elapsedMs) || 0,
+      observedFailureCodes,
+      providers,
+    };
+  }
+
+  function formatTranslationOverviewStatus(summary, label) {
+    const total = Math.max(0, Number(summary?.totalCues) || 0);
+    const translated = Math.max(0, Number(summary?.translatedCues) || 0);
+    const failed = Math.max(0, Number(summary?.failedCues) || 0);
+    const skipped = Math.max(0, Number(summary?.skippedCues) || 0);
+    const count = (value) => Math.round(value).toLocaleString();
+    const skippedText = skipped > 0 ? `，无需请求 ${count(skipped)} 条` : "";
+    const providerText = (Array.isArray(summary?.providers) ? summary.providers : [])
+      .filter((item) => item && (Number(item.translatedCues) > 0 || Number(item.failedCues) > 0))
+      .map((item) => {
+        const completed = Math.max(0, Number(item.translatedCues) || 0);
+        const providerFailed = Math.max(0, Number(item.failedCues) || 0);
+        const failureText = providerFailed > 0 ? `，失败 ${count(providerFailed)} 条` : "";
+        return `${String(item.label || item.provider || "未知服务")} ${count(completed)} 条${failureText}`;
+      })
+      .join("，");
+    const servicesText = providerText ? ` 翻译服务：${providerText}。` : "";
+    return `${String(label || "翻译完成")}。共 ${count(total)} 条字幕，已翻译 ${count(translated)} 条，失败 ${count(failed)} 条${skippedText}。${servicesText}`;
   }
 
   function failedCuesFromManualIssues(issues = [], session = null) {
@@ -329,7 +488,7 @@
         }
       }
       ns.renderer.applySubtitleVisibility(prefs.enabled);
-      if (ns.transcriptPanelRenderer && prefs.transcriptPanelEnabled === false) {
+      if (ns.transcriptPanelRenderer && prefs.transcriptPanelEnabled !== true) {
         ns.transcriptPanelRenderer.setVisible(false);
       }
       if (renderWarning) {
@@ -1131,6 +1290,7 @@
     }
     isTranslating = true;
     activeRunId = runId;
+    ns.ui.clearTranslationSummary?.();
 
     // Start the native launch request at the beginning of the click handler.
     // Waiting for video/source discovery first can lose the browser's user
@@ -1306,7 +1466,15 @@
       if (!forceRefresh && loadedCacheKey === cacheKey && currentSurfaceReady) {
         ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
         ns.ui.updateActionButtons("翻译字幕已加载");
-        ns.ui.setStatusText("已加载当前翻译字幕");
+        const summary = buildTranslationSummary(
+          { provider: cfg.provider },
+          { provider: cfg.provider },
+          vttText,
+          panelSourceMeta,
+          { cacheHit: true, cachedSummary: cacheEntry?.translationSummary }
+        );
+        ns.ui.showTranslationSummary?.(summary);
+        ns.ui.setStatusText(formatTranslationOverviewStatus(summary, "已加载当前翻译字幕"), "cache");
         return;
       }
 
@@ -1382,12 +1550,24 @@
         if (mounted && cacheSurfaceWarnings.length === 0) {
           ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
-          ns.ui.setStatusText("命中本地缓存", "cache");
         } else if (mounted) {
           ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
         } else {
           ns.ui.updateActionButtons("翻译已就绪");
+        }
+        if (mounted) {
+          const summary = buildTranslationSummary(
+            { provider: cfg.provider },
+            { provider: cfg.provider },
+            vttText,
+            panelSourceMeta,
+            { cacheHit: true, cachedSummary: usableCacheEntry?.translationSummary }
+          );
+          ns.ui.showTranslationSummary?.(summary);
+          if (cacheSurfaceWarnings.length === 0) {
+            ns.ui.setStatusText(formatTranslationOverviewStatus(summary, "命中本地缓存"), "cache");
+          }
         }
         return;
       }
@@ -1533,6 +1713,10 @@
       const failedItems = Array.isArray(result.failed_items) ? result.failed_items : [];
       const failedCount = Math.max(failedItems.length, Number(result.metrics?.failed) || 0);
       const finalFailedCues = failedCuesFromItems(result.failed_items, vttText);
+      const translationSummary = buildTranslationSummary(result, payload, vttText, panelSourceMeta, {
+        cacheHit: result.cache_hit === true,
+      });
+      ns.ui.showTranslationSummary?.(translationSummary);
       const mounted = renderTranslationSurfaces({
         translatedVtt: result.translated_vtt,
         originalVtt: vttText,
@@ -1559,6 +1743,7 @@
           sourceKey,
           configSig,
           translatedVtt: result.translated_vtt,
+          translationSummary,
           createdAt: Date.now(),
         });
         if (cacheResult?.ok === false) {
@@ -1651,7 +1836,7 @@
         });
         ns.ui.clearError?.();
         ns.ui.setStatusText(
-          result.cache_hit ? "缓存命中" : "翻译完成",
+          formatTranslationOverviewStatus(translationSummary, result.cache_hit ? "缓存命中" : "翻译完成"),
           result.cache_hit ? "cache" : "success"
         );
       }
@@ -1790,6 +1975,10 @@
       console.warn("[echo360-translator][controller] could not prime config for backend startup", safeErrorForLog(error, { phase: "preferences" }));
     }
     ns.renderer.applySubtitleSize(prefs.size || DEFAULT_SUBTITLE_SIZE);
+    // Apply the opt-in Transcript setting before any later translation or
+    // player mutation can schedule a renderer flush. Missing values are
+    // intentionally treated as disabled for fresh installs and upgrades.
+    ns.transcriptPanelRenderer?.setVisible?.(prefs.transcriptPanelEnabled === true);
     ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
 
     if (!trackSyncTimer) {

@@ -321,7 +321,12 @@ describe("controller track sync in Echo360 native CC mode", () => {
       "source-vtt",
       ORIG_VTT
     );
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
+      expect.stringContaining("命中本地缓存。共 1 条字幕，已翻译 1 条，失败 0 条。"),
+      "cache"
+    );
+    expect(ns.ui.setStatusText.mock.calls.at(-1)[0])
+      .toContain("翻译服务：Google Translate 网页端点 1 条。");
   });
 
   it("skips automatic AI material export when the quick-action setting is disabled, including cache hits", async () => {
@@ -346,7 +351,12 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(ns.manualTranslation.copyText).not.toHaveBeenCalled();
     expect(ns.manualTranslation.downloadText).not.toHaveBeenCalled();
     expect(ns.storage.getCacheStore).toHaveBeenCalledOnce();
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
+      expect.stringContaining("命中本地缓存。共 1 条字幕，已翻译 1 条，失败 0 条。"),
+      "cache"
+    );
+    expect(ns.ui.setStatusText.mock.calls.at(-1)[0])
+      .toContain("翻译服务：Google Translate 网页端点 1 条。");
   });
 
   it("asks before retranslation and does not export duplicate AI materials when cancelled", async () => {
@@ -506,6 +516,51 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(messages).toContain("翻译准备中 0/1");
     expect(messages).toContain("翻译中 1/1（已开始显示）");
     expect(messages.some((message) => message.includes("0/0"))).toBe(false);
+    expect(messages.some((message) => message.includes("翻译完成。共 1 条字幕，已翻译 1 条，失败 0 条。"))).toBe(true);
+  });
+
+  it("includes the actual provider cue counts in the compact completion status", async () => {
+    const { ns, callbacks } = setupManualController();
+    ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => null);
+    ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+    ns.translationService.buildCacheKey = vi.fn(async () => ({
+      sourceKey: "source",
+      configSig: "config",
+      cacheKey: "source::config",
+    }));
+    ns.translationService.buildTranslatePayload = vi.fn(() => ({
+      vtt_text: ORIG_VTT,
+      provider: "mixed",
+      target: "ZH",
+      bilingual: false,
+    }));
+    ns.translationService.translateWithConfig = vi.fn(async () => ({
+      translated_vtt: TRANS_VTT,
+      warnings: [],
+      failed_items: [],
+      failure_codes: {},
+      metrics: {
+        total: 1,
+        totalCues: 1,
+        translated: 1,
+        translatedCues: 1,
+        failed: 0,
+        providerBreakdown: {
+          "google-web": { assignedCues: 1, completedCues: 0, failures: 1 },
+          deepl: { assignedCues: 0, completedCues: 1, failures: 0 },
+        },
+      },
+    }));
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+
+    await ns.controller.init();
+    await callbacks().onTranslate();
+
+    const messages = ns.ui.setStatusText.mock.calls.map(([message]) => String(message));
+    const completed = messages.find((message) => message.startsWith("翻译完成。"));
+    expect(completed).toContain("DeepL 1 条");
+    expect(completed).not.toContain("Google Translate 网页端点 0 条");
   });
 
   it.each([

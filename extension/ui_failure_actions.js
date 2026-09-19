@@ -19,7 +19,7 @@
       kind: "ready",
       code: "READY",
       title: "运行诊断",
-      summary: "当前没有错误。扩展的运行日志会显示在下方。",
+      summary: "当前没有错误。可在下方查看字幕查找、翻译和渲染日志。",
       recommendation: "执行翻译或重试操作后，可在这里查看字幕查找、翻译和渲染过程。",
       severity: "info",
       details: [],
@@ -194,6 +194,31 @@
       <div class="echo360-error-history-feedback" role="status" aria-live="polite" aria-atomic="true"></div>
     `;
     extension.appendChild(historyPanel);
+
+    const summaryPanel = document.createElement("section");
+    summaryPanel.id = "echo360-translator-translation-summary";
+    summaryPanel.className = "echo360-translation-summary";
+    summaryPanel.setAttribute("role", "region");
+    summaryPanel.setAttribute("aria-labelledby", "echo360-translation-summary-title");
+    summaryPanel.style.display = "none";
+    summaryPanel.hidden = true;
+    summaryPanel.innerHTML = `
+      <div class="echo360-translation-summary-header">
+        <div>
+          <div id="echo360-translation-summary-title" class="echo360-translation-summary-title">本次翻译概览</div>
+          <div class="echo360-translation-summary-status" aria-live="polite"></div>
+        </div>
+        <span class="echo360-translation-summary-badge"></span>
+      </div>
+      <div class="echo360-translation-summary-lead"></div>
+      <div class="echo360-translation-summary-details"></div>
+      <ul class="echo360-translation-summary-providers" aria-label="翻译服务用量"></ul>
+    `;
+    extension.appendChild(summaryPanel);
+    // Keep the high-value result overview immediately below the current
+    // diagnosis card. Runtime logs remain available underneath it for the
+    // cases that need deeper inspection.
+    extension.insertBefore(summaryPanel, logsPanel);
     root.appendChild(extension);
 
     const refs = {
@@ -211,6 +236,13 @@
       copy: panel.querySelector('[data-action="copy"]'),
       cancel: panel.querySelector('[data-action="cancel"]'),
       close: panel.querySelector('[data-action="close"]'),
+    };
+    const summaryRefs = {
+      status: summaryPanel.querySelector(".echo360-translation-summary-status"),
+      badge: summaryPanel.querySelector(".echo360-translation-summary-badge"),
+      lead: summaryPanel.querySelector(".echo360-translation-summary-lead"),
+      details: summaryPanel.querySelector(".echo360-translation-summary-details"),
+      providers: summaryPanel.querySelector(".echo360-translation-summary-providers"),
     };
     const historyRefs = {
       list: historyPanel.querySelector(".echo360-error-history-list"),
@@ -254,6 +286,7 @@
     };
     const actionHandlers = { onRetry: null, onCancel: null };
     let currentModel = readyModel();
+    let currentTranslationSummary = null;
     let liveModel = null;
     let hasLiveModel = false;
     const history = [];
@@ -314,6 +347,105 @@
         toggleButton.textContent = label;
         toggleButton.classList.toggle("echo360-panel-btn--diagnostics-error", hasFailure && !warning);
         toggleButton.classList.toggle("echo360-panel-btn--diagnostics-warning", warning);
+      }
+    }
+
+    function formatSummaryCount(value) {
+      const count = Number(value);
+      return Number.isFinite(count) && count >= 0 ? Math.round(count).toLocaleString() : "未知";
+    }
+
+    function normalizeTranslationSummary(summary) {
+      if (!summary || typeof summary !== "object") return null;
+      const providers = Array.isArray(summary.providers)
+        ? summary.providers
+          .filter((item) => item && typeof item === "object")
+          .map((item) => ({
+            provider: String(item.provider || "unknown"),
+            label: String(item.label || item.provider || "未知服务"),
+            assignedCues: Number(item.assignedCues) || 0,
+            translatedCues: Number(item.translatedCues ?? item.completedCues) || 0,
+            failedCues: Number(item.failedCues ?? item.failures) || 0,
+            failedAttempts: Number(item.failedAttempts ?? item.failures) || 0,
+          }))
+        : [];
+      const observedFailureCodes = summary.observedFailureCodes && typeof summary.observedFailureCodes === "object"
+        ? Object.fromEntries(Object.entries(summary.observedFailureCodes)
+          .map(([code, count]) => [String(code), Number(count) || 0])
+          .filter(([, count]) => count > 0))
+        : {};
+      return {
+        status: String(summary.status || "completed"),
+        cacheHit: summary.cacheHit === true,
+        totalCues: Number(summary.totalCues) || 0,
+        translatedCues: Number(summary.translatedCues) || 0,
+        failedCues: Number(summary.failedCues) || 0,
+        skippedCues: Number(summary.skippedCues) || 0,
+        totalLines: Number(summary.totalLines) || 0,
+        rateLimitCount: Number(summary.rateLimitCount) || 0,
+        google429Responses: Number(summary.google429Responses) || 0,
+        elapsedMs: Number(summary.elapsedMs) || 0,
+        observedFailureCodes,
+        providers,
+      };
+    }
+
+    function appendSummaryDetail(label, value) {
+      const row = document.createElement("div");
+      row.className = "echo360-translation-summary-detail";
+      const labelEl = document.createElement("span");
+      labelEl.className = "echo360-translation-summary-detail-label";
+      labelEl.textContent = label;
+      const valueEl = document.createElement("span");
+      valueEl.className = "echo360-translation-summary-detail-value";
+      valueEl.textContent = value;
+      row.append(labelEl, valueEl);
+      summaryRefs.details.appendChild(row);
+    }
+
+    function renderTranslationSummary() {
+      const summary = currentTranslationSummary;
+      const visible = !!summary;
+      summaryPanel.style.display = visible ? "block" : "none";
+      summaryPanel.hidden = !visible;
+      if (!summary) {
+        summaryRefs.providers.replaceChildren();
+        summaryRefs.details.replaceChildren();
+        return;
+      }
+      const isPartial = summary.failedCues > 0 || summary.status === "partial";
+      const status = summary.cacheHit
+        ? "缓存命中"
+        : (isPartial ? "部分完成" : "翻译完成");
+      summaryRefs.status.textContent = status;
+      summaryRefs.badge.textContent = isPartial ? "有失败" : (summary.cacheHit ? "缓存" : "完成");
+      summaryRefs.badge.className = `echo360-translation-summary-badge${isPartial ? " is-warning" : ""}`;
+      const skipped = summary.skippedCues > 0 ? `，无需请求 ${formatSummaryCount(summary.skippedCues)} 条` : "";
+      summaryRefs.lead.textContent = `共 ${formatSummaryCount(summary.totalCues)} 条字幕，已翻译 ${formatSummaryCount(summary.translatedCues)} 条，失败 ${formatSummaryCount(summary.failedCues)} 条${skipped}。`;
+      summaryRefs.details.replaceChildren();
+      if (summary.totalLines > 0) appendSummaryDetail("字幕文字行", formatSummaryCount(summary.totalLines));
+      const rateLimitCount = summary.rateLimitCount || summary.google429Responses || summary.observedFailureCodes.HTTP_429 || 0;
+      appendSummaryDetail("HTTP 429", rateLimitCount > 0 ? `遇到 ${formatSummaryCount(rateLimitCount)} 次` : "未遇到");
+      const otherCodes = Object.entries(summary.observedFailureCodes)
+        .filter(([code]) => code !== "HTTP_429")
+        .map(([code, count]) => `${code} ×${formatSummaryCount(count)}`);
+      appendSummaryDetail("其他观察到的错误", otherCodes.length > 0 ? otherCodes.join("、") : "未观察到");
+      if (summary.elapsedMs > 0) appendSummaryDetail("耗时", `${(summary.elapsedMs / 1000).toFixed(1)} 秒`);
+      summaryRefs.providers.replaceChildren();
+      for (const provider of summary.providers) {
+        const row = document.createElement("li");
+        row.className = "echo360-translation-summary-provider";
+        const name = document.createElement("span");
+        name.className = "echo360-translation-summary-provider-name";
+        name.textContent = provider.label;
+        const usage = document.createElement("span");
+        usage.className = "echo360-translation-summary-provider-usage";
+        const assigned = provider.assignedCues > 0 ? `分配 ${formatSummaryCount(provider.assignedCues)} 条，` : "";
+        const failed = provider.failedCues > 0 ? `，最终失败 ${formatSummaryCount(provider.failedCues)} 条` : "";
+        const attempts = provider.failedAttempts > 0 ? `，失败尝试 ${formatSummaryCount(provider.failedAttempts)} 次` : "";
+        usage.textContent = `${assigned}完成 ${formatSummaryCount(provider.translatedCues)} 条${failed}${attempts}`;
+        row.append(name, usage);
+        summaryRefs.providers.appendChild(row);
       }
     }
 
@@ -898,6 +1030,10 @@
         ? `历史记录 · ${formatFullTimestamp(occurredAt)}${count > 1 ? ` · 重复 ${count} 次` : ""}`
         : (empty ? "运行诊断" : "当前问题");
       refs.severity.textContent = empty ? "运行正常" : warning ? "翻译警告" : "翻译错误";
+      refs.context.hidden = empty;
+      refs.title.hidden = empty;
+      refs.recommendation.hidden = empty;
+      refs.code.hidden = empty;
       refs.code.textContent = empty ? "" : `[${currentModel.code || "TRANSLATION_ERROR"}]`;
       refs.title.textContent = currentModel.title || (empty ? "运行诊断" : SUBTITLE_FAILURE_LABEL);
       refs.summary.textContent = currentModel.summary || (empty ? "当前没有错误。" : "翻译失败");
@@ -934,6 +1070,7 @@
     refs.cancel.setAttribute("aria-hidden", "true");
     renderLogs();
     renderHistory();
+    renderTranslationSummary();
     syncRootDiagnosticsState();
 
     return {
@@ -976,6 +1113,24 @@
         // new translation attempt.
         renderHistory();
         syncRootDiagnosticsState();
+      },
+      showTranslationSummary(summary) {
+        currentTranslationSummary = normalizeTranslationSummary(summary);
+        renderTranslationSummary();
+        return currentTranslationSummary;
+      },
+      clearTranslationSummary() {
+        currentTranslationSummary = null;
+        renderTranslationSummary();
+      },
+      getTranslationSummary() {
+        return currentTranslationSummary
+          ? {
+            ...currentTranslationSummary,
+            observedFailureCodes: { ...currentTranslationSummary.observedFailureCodes },
+            providers: currentTranslationSummary.providers.map((item) => ({ ...item })),
+          }
+          : null;
       },
       isVisible() {
         return isPanelVisible();

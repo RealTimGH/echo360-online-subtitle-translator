@@ -557,7 +557,7 @@ class TranslatorRuntimeTests(unittest.TestCase):
         self.assertEqual(defaults["endpoint"], "")
         self.assertEqual(defaults["model"], "")
         self.assertEqual(defaults["concurrency"], 3)
-        self.assertEqual(defaults["rps"], 3.0)
+        self.assertEqual(defaults["rps"], 6.0)
 
     def test_deepl_provider_applies_its_default_endpoint(self):
         self.assertEqual(
@@ -599,7 +599,7 @@ class TranslatorRuntimeTests(unittest.TestCase):
         defaults = translator.provider_defaults("google-web")
         self.assertEqual(defaults["concurrency"], 3)
         self.assertEqual(backend.WEB_PROVIDER_LIMITS["google-web"]["concurrency"], 3)
-        self.assertEqual(defaults["rps"], 3.0)
+        self.assertEqual(defaults["rps"], 6.0)
         self.assertEqual(defaults["max_paragraphs"], 1)
 
     def test_cli_error_code_normalization_keeps_specific_diagnostics(self):
@@ -611,6 +611,48 @@ class TranslatorRuntimeTests(unittest.TestCase):
         self.assertEqual(defaults["concurrency"], 1)
         self.assertEqual(defaults["max_retries"], 0)
         self.assertIn("argos", translator.KEYLESS_PROVIDERS)
+
+    def test_argos_resource_profile_caps_native_threads_but_keeps_an_override(self):
+        profile_keys = (
+            "ARGOS_INTRA_THREADS",
+            "ARGOS_INTER_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for key in profile_keys:
+                os.environ.pop(key, None)
+            self.assertEqual(translator.configure_argos_resource_limits(), 2)
+            self.assertEqual(os.environ["ARGOS_INTRA_THREADS"], "2")
+            self.assertEqual(os.environ["ARGOS_INTER_THREADS"], "1")
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "2")
+            self.assertEqual(os.environ["MKL_NUM_THREADS"], "2")
+
+            for key in profile_keys:
+                os.environ.pop(key, None)
+            os.environ["ARGOS_INTRA_THREADS"] = "1"
+            os.environ["ARGOS_INTER_THREADS"] = "3"
+            self.assertEqual(translator.configure_argos_resource_limits(), 1)
+            self.assertEqual(os.environ["ARGOS_INTRA_THREADS"], "1")
+            self.assertEqual(os.environ["ARGOS_INTER_THREADS"], "3")
+            self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "1")
+
+    def test_argos_sentence_detector_limits_onnx_pool_without_nesting_wrappers(self):
+        from types import SimpleNamespace
+        factory = mock.Mock()
+        sbd = SimpleNamespace(SBDetect=factory)
+        translator._configure_argos_sentence_detector(sbd, 2)
+        sbd.SBDetect("en", use_gpu=False)
+        factory.assert_called_once_with("en", use_gpu=False, max_threads=2)
+        translator._configure_argos_sentence_detector(sbd, 1)
+        sbd.SBDetect("en", use_gpu=False)
+        factory.assert_called_with("en", use_gpu=False, max_threads=1)
+        self.assertIs(sbd.SBDetect.func, factory)
+        translator._configure_argos_sentence_detector(sbd, 0)
+        sbd.SBDetect("en", use_gpu=False)
+        factory.assert_called_with("en", use_gpu=False, max_threads=None)
 
     def test_argos_target_mapping_is_explicit(self):
         self.assertEqual(translator._resolve_argos_target_lang("ZH"), "zh")

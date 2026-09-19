@@ -41,6 +41,7 @@
       errorStrong: "#fff4f4",
       errorMuted: "#ffe4e4",
       errorBorder: "rgba(255,130,130,0.72)",
+      success: "#8ee5ad",
       warning: "#ffd27d",
       warningMuted: "#ffeac0",
       warningBorder: "rgba(255,199,90,0.85)",
@@ -88,6 +89,7 @@
       errorStrong: "#6f1111",
       errorMuted: "#721c1c",
       errorBorder: "rgba(166,27,27,0.72)",
+      success: "#167847",
       warning: "#7a4a00",
       warningMuted: "#5c3900",
       warningBorder: "rgba(122,74,0,0.78)",
@@ -136,6 +138,7 @@
         --echo360-diagnostic-error-strong: ${theme.diagnostic.errorStrong};
         --echo360-diagnostic-error-muted: ${theme.diagnostic.errorMuted};
         --echo360-diagnostic-error-border: ${theme.diagnostic.errorBorder};
+        --echo360-diagnostic-success: ${theme.diagnostic.success};
         --echo360-diagnostic-warning: ${theme.diagnostic.warning};
         --echo360-diagnostic-warning-muted: ${theme.diagnostic.warningMuted};
         --echo360-diagnostic-warning-border: ${theme.diagnostic.warningBorder};

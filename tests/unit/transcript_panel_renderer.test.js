@@ -26,6 +26,9 @@ function setup({ virtualized = false } = {}) {
   const ns = window.Echo360Translator;
   const model = ns.transcriptModel.buildTranscriptModel({ originalVtt: original, translatedVtt: translated });
   ns.transcriptPanelRenderer.start();
+  // The production controller enables this only after the persisted opt-in
+  // preference has been read. Most renderer tests model that explicit choice.
+  ns.transcriptPanelRenderer.setVisible(true);
   ns.transcriptPanelRenderer.setTranslation(model);
   return { ns, model, root: document.querySelector("#transcripts-panel") };
 }
@@ -34,6 +37,26 @@ describe("transcript panel renderer", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     document.body.innerHTML = "";
+  });
+
+  it("starts hidden until the controller applies an explicit opt-in", async () => {
+    fixture();
+    window.Echo360Translator = makeFullNs();
+    evalModule("vtt.js");
+    evalModule("transcript_model.js");
+    evalModule("transcript_panel_adapter.js");
+    evalModule("transcript_search_bridge.js");
+    evalModule("transcript_panel_renderer.js");
+    const ns = window.Echo360Translator;
+    const model = ns.transcriptModel.buildTranscriptModel({ originalVtt: original, translatedVtt: translated });
+    ns.transcriptPanelRenderer.start();
+    ns.transcriptPanelRenderer.setTranslation(model);
+    await ns.transcriptPanelRenderer.flush();
+    expect(document.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(0);
+
+    ns.transcriptPanelRenderer.setVisible(true);
+    await ns.transcriptPanelRenderer.flush();
+    expect(document.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
   });
 
   it("injects one safe translation node per mapped cue and is idempotent", async () => {

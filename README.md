@@ -15,6 +15,7 @@
 5. **边翻译边显示**（1.3.0）：点击翻译后立即挂载字幕，未完成的 cue 显示 `正在翻译中...`，随批次完成逐步替换为译文。
 6. **按 provider 分别保存 API Key**；popup 与 options 页实时同步，切换 provider 时自动带出对应 Key。
 7. **AI 手动翻译往返**：点击 `AI 手动翻译` 即下载一个包含全课 cue 的精简 `.translate.json` 并复制简短提示词；支持文件的 AI 可一次翻译后返回完整 `.translated.json`。扩展通过会话绑定校验课程 SHA-256 与目标语言，再检查完整 ID 集合、WebVTT 标签、代码、URL、路径、邮箱和数字，最后以原始 VTT 为不可变骨架在本地重建播放字幕。
+8. **Transcript 面板双语增强**是独立的可选表面；新安装和升级默认关闭，用户在字幕设置中明确开启后才会向原生 Transcript cue 添加译文，并保留该选择。
 
 
 
@@ -303,7 +304,7 @@ npm run test:python
 - max_paragraphs: `6`（Google 网页端点会按单条字幕刷新进度）
 - max_chars: `1200`
 - concurrency: 通用设置默认 `96`；Google Translate 的实际并发上限为 `3`，Azure AI Translator 为 `8`，其他 provider 不变
-- rps: 通用配置默认保存为 `0`；Google Translate 会把它解释为安全基线 `3 RPS`，其他 provider 仍按各自适配器处理
+- rps: 通用配置默认保存为 `0`；Google Translate 会把它解释为安全基线 `6 RPS`，其他 provider 仍按各自适配器处理
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: 默认空
@@ -347,11 +348,11 @@ Google Translate provider：
 
 - `google-web` 使用非官方网页端接口，不需要 API key，适合首次安装后快速试用；Google 官方社区明确说明该端点不受维护，不建议用于生产
 - 所有构建都由扩展前端直接请求，不受 Argos 或自定义后端配置影响
-- 后端/脚本路径和扩展直连路径都把 Google 限制为共享 `3 RPS / 3 并发`，仍保持 `max_chars=1200, max_paragraphs=1`
+- 后端/脚本路径和扩展直连路径都把 Google 限制为共享 `6 RPS / 3 并发`，仍保持 `max_chars=1200, max_paragraphs=1`
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量和接口稳定性，建议改用官方 API provider（如 `azure`/`deepl`）或 AI provider，并填写自己的 API Key
 
-`google-web` 的直接扩展和 Python 路径默认使用共享 `3 RPS / 3 并发`；即使旧配置为 `rps=0`，也会应用这一安全基线，较低的显式 RPS 值仍会保留。每条字幕独立处理；零星 `HTTP 429` 会遵循 `Retry-After` 或带抖动的指数退避，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试，并自动拉起本地后端改用 Argos；在混合模式中则把失败分片转交给其余健康 provider。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。调研依据：[Google 开发者社区关于该非官方端点的说明](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639)、[Google Cloud Translation 官方配额（仅作正式 API 对照）](https://docs.cloud.google.com/translate/quotas)。
+`google-web` 的直接扩展和 Python 路径默认使用共享 `6 RPS / 3 并发`；即使旧配置为 `rps=0`，也会应用这一安全基线，较低的显式 RPS 值仍会保留。每条字幕独立处理；零星 `HTTP 429` 会遵循 `Retry-After` 或带抖动的指数退避，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试，并自动拉起本地后端改用 Argos；在混合模式中则把失败分片转交给其余健康 provider。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。调研依据：[Google 开发者社区关于该非官方端点的说明](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639)、[Google Cloud Translation 官方配额（仅作正式 API 对照）](https://docs.cloud.google.com/translate/quotas)。
 
 混合路由的设计参考了成熟网关的加权分流、重试/故障转移和异常实例摘除模式，而不是把同一字幕重复发送给所有服务：[Envoy Gateway 负载均衡](https://gateway.envoyproxy.io/docs/concepts/load-balancing/)、[Envoy 异常检测](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier)、[Azure Circuit Breaker pattern](https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker)、[Azure Bulkhead pattern](https://learn.microsoft.com/azure/architecture/patterns/bulkhead)。
 
@@ -371,6 +372,8 @@ python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["
 ```
 
 最后一条命令会显式预下载英语 MiniSBD 断句模型。然后在完整设置中选择 `Argos Translate（本地）`；保存或开始翻译时会自动检查并拉起 `127.0.0.1:8765`，无需另设开关。翻译过程中不会静默联网或下载模型：缺少依赖、语言包或断句模型时，界面会分别显示 `ARGOS_DEPENDENCY_MISSING` 或 `ARGOS_MODEL_MISSING` 及安装提示。
+
+为降低本地翻译时的 CPU 争抢，默认将 CTranslate2 翻译线程和 MiniSBD/ONNX 断句线程分别限制为 2，并保持单批次翻译。断句器的线程池独立于翻译引擎，因此两者都会显式限制；模型仍由 Argos 自身缓存复用。源码启动时可设置 `ARGOS_INTRA_THREADS=1` 进一步降低占用，或设置其他正整数调整线程数；显式设为 `0` 恢复自动线程选择。修改环境变量后需重启后端。此设置优先保证电脑响应，长字幕的完成时间可能增加。
 
 本地翻译替代方案的质量、速度、体积、许可证和迁移建议见 [本地机器翻译调研](docs/local-translation-research.md)。
 
@@ -430,4 +433,4 @@ export TRANSLATOR_TASK_TIMEOUT_SECONDS=480
 - 探针默认不抓取详细网络请求 body。
 - 如果录播存在独立开场片段，扩展会优先使用强 media-id 映射，其次使用 timeline/state 兜底匹配。
 - 仅 Transcript 面板、无播放器 CC 的课时依赖 `transcript-file` API（1.2.2）；这类页面没有 Echo360 原生 CC DOM 可注入，会被 `hasNativeCaptionCapability()` 判定为无能力并直接使用浏览器字幕轨。
-- 增量预览的 partial VTT 由 `direct_translator.js` 或 FastAPI 异步任务按批次产出，经 job 轮询交给 `buildIncrementalPreviewVtt()` 把未译 cue 替换为占位文案；旧版同步自定义后端没有这一能力。
+- 增量预览的 partial VTT 由 `direct_translator.js` 或 FastAPI 异步任务按批次产出，经 job 轮询交给 `buildIncrementalPreviewVtt()` 把未译 cue 替换为占位文案；混合翻译会按原始 cue 位置安全合并各子 provider 的 partial，不再等待整个 provider 分片；旧版同步自定义后端没有这一能力。

@@ -15,7 +15,7 @@ const TRANS_VTT = `WEBVTT
 
 `;
 
-function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaptionRenderer } = {}) {
+function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaptionRenderer, echoCaptionRenderer, hostSupport } = {}) {
   document.body.innerHTML = "";
   document.head.innerHTML = "";
   let objectUrlId = 0;
@@ -79,6 +79,8 @@ function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaption
       applySize: vi.fn(),
     },
     playerCaptionRenderer,
+    echoCaptionRenderer,
+    hostSupport,
     storage: {
       getPrefs: vi.fn(async () => ({ enabled: true, useNativeSubtitles: false })),
     },
@@ -299,6 +301,72 @@ describe("renderer Canvas Instructure Media mode", () => {
   });
 });
 
+describe("renderer Echo360 DOM caption mode", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("uses a player-local caption overlay instead of a browser track", () => {
+    let mounted = false;
+    const echoCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => mounted),
+      mount: vi.fn(() => {
+        mounted = true;
+        return true;
+      }),
+      update: vi.fn(() => true),
+      unmount: vi.fn(() => {
+        mounted = false;
+      }),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({
+      echoCaptionRenderer,
+      hostSupport: { isEcho360Document: () => true },
+    });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+    expect(echoCaptionRenderer.mount).toHaveBeenCalledWith(expect.objectContaining({
+      video,
+      originalVtt: ORIG_VTT,
+      translatedVtt: TRANS_VTT,
+      size: "medium",
+    }));
+    expect(video.querySelectorAll("track").length).toBe(0);
+  });
+
+  it("updates the Echo360 overlay in place during incremental refreshes", () => {
+    let mounted = false;
+    const echoCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => mounted),
+      mount: vi.fn(() => {
+        mounted = true;
+        return true;
+      }),
+      update: vi.fn(() => true),
+      unmount: vi.fn(() => {
+        mounted = false;
+      }),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({
+      echoCaptionRenderer,
+      hostSupport: { isEcho360Document: () => true },
+    });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true, { incremental: true })).toBe(true);
+    expect(echoCaptionRenderer.update).toHaveBeenCalledWith(expect.objectContaining({ video }));
+    expect(echoCaptionRenderer.mount).toHaveBeenCalledOnce();
+  });
+});
+
 describe("renderer browser track mode", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -355,5 +423,31 @@ Partial
     expect(secondTrack).toBe(firstTrack);
     expect(secondSrc).not.toBe(firstSrc);
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
+  });
+
+  it("does not inject a guessed WebVTT line coordinate into browser fallback cues", () => {
+    const OriginalBlob = globalThis.Blob;
+    let serializedPayload = "";
+    Object.defineProperty(globalThis, "Blob", {
+      configurable: true,
+      value: class extends OriginalBlob {
+        constructor(parts, options) {
+          super(parts, options);
+          serializedPayload = parts.map((part) => String(part)).join("");
+        }
+      },
+    });
+
+    try {
+      const { renderer } = setupRenderer();
+      expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+      expect(serializedPayload).toContain("00:00:00.000 --> 00:00:02.000");
+      expect(serializedPayload).not.toContain("line:-2");
+    } finally {
+      Object.defineProperty(globalThis, "Blob", {
+        configurable: true,
+        value: OriginalBlob,
+      });
+    }
   });
 });

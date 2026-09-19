@@ -43,6 +43,18 @@
     const controls = ns.uiPanel.create(root, {}, {});
     const diagnostics = ns.uiFailureActions.create(controls.el);
     controls.show();
+    const params = new URLSearchParams(location.search);
+    if (params.has("hostile")) {
+      const hostStyles = document.createElement("style");
+      hostStyles.textContent = `
+        input[type="search"] { width: 440px; min-width: 400px; height: 60px; padding: 24px; border-radius: 50px; }
+        label { display: inline-block; width: 440px; margin: 12px; }
+      `;
+      document.head.appendChild(hostStyles);
+    }
+    const panelWidth = Number(params.get("width"));
+    if (panelWidth >= 240 && panelWidth <= 380) controls.el.style.width = `${panelWidth}px`;
+    diagnostics.appendLog("info", "Long URL: https://example.test/" + "abcdefgh12345678".repeat(160));
     diagnostics.appendLog("info", "[echo360-translator][preview] diagnostics panel ready", {
       runId: "preview-run",
       source: "browser track",
@@ -68,6 +80,15 @@
     ];
     for (const [error, options] of records) diagnostics.show({ error, ...options, context: options });
     diagnostics.show({ error: records.at(-1)[0], ...records.at(-1)[1], context: records.at(-1)[1] });
+    diagnostics.showTranslationSummary({
+      status: "completed", totalCues: 433, translatedCues: 433, failedCues: 0, totalLines: 433,
+      providers: [
+        { provider: "google-web", label: "Google Translate 网页端点", assignedCues: 216, translatedCues: 216 },
+        { provider: "argos", label: "Argos Translate（本地）", assignedCues: 217, translatedCues: 217 },
+      ],
+    });
+    if (params.has("ready")) diagnostics.hide();
+    diagnostics.toggle();
   </script>
 </body>
 </html>

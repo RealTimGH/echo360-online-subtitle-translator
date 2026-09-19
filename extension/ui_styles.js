@@ -15,6 +15,16 @@
       /* #echo360-ui-root is pointer-events:none so it never intercepts clicks;
          interactive children re-enable pointer-events individually. */
       #echo360-ui-root {
+        /* Use one viewport-sized overlay root. The media document itself can
+           have an inner scrolling <html>; keeping the root out of document
+           flow prevents that scroll container from becoming the coordinate
+           system for the floating controls. */
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        overflow: visible;
+        z-index: 2147483646;
         pointer-events: none;
         --echo360-ball-bottom: 120px;
         --echo360-surface-bottom: 80px;
@@ -28,6 +38,30 @@
       #echo360-ui-root[data-echo360-host="instructure-media"] {
         --echo360-ball-bottom: 200px;
         --echo360-surface-bottom: 160px;
+      }
+      /* Instructure Media embeds can have a transformed or independently
+         scrolling player shell.  Keep the UI root in that media document,
+         but use a measured viewport anchor for each player instead of a
+         Canvas-level proxy.  The positioner supplies these four variables
+         from the real player controls rectangle. */
+      #echo360-ui-root.echo360-media-anchored {
+        --echo360-ball-bottom: auto;
+        --echo360-surface-bottom: auto;
+      }
+      #echo360-ui-root.echo360-media-anchored #echo360-translator-ball-group {
+        position: absolute;
+        left: var(--echo360-floating-left);
+        top: var(--echo360-floating-top);
+        right: auto;
+        bottom: auto;
+      }
+      #echo360-ui-root.echo360-media-anchored #echo360-translator-panel,
+      #echo360-ui-root.echo360-media-anchored #echo360-translator-popover,
+      #echo360-ui-root.echo360-media-anchored #echo360-onboarding-bubble {
+        position: absolute;
+        right: var(--echo360-surface-right);
+        bottom: var(--echo360-surface-bottom);
+        top: auto;
       }
       .echo360-sr-only {
         position: absolute !important;
@@ -167,8 +201,8 @@
         animation: echo360-ball-busy-spin 1.1s linear infinite;
       }
       #echo360-translator-ball-group[data-kind="success"] #echo360-translator-ball {
-        --echo360-result-ring: #25b36a;
-        box-shadow: 0 0 0 2px #25b36a, -3px 2px 14px var(--echo360-ball-shadow);
+        --echo360-result-ring: var(--echo360-diagnostic-success);
+        box-shadow: 0 0 0 2px var(--echo360-diagnostic-success), -3px 2px 14px var(--echo360-ball-shadow);
       }
       #echo360-translator-ball-group[data-kind="cache"] #echo360-translator-ball {
         --echo360-result-ring: #258bd6;
@@ -317,7 +351,12 @@
       }
       #echo360-translator-panel.echo360-panel-has-diagnostics {
         width: min(380px, calc(100vw - 24px));
-        max-height: calc(100vh - 96px);
+        /* The panel is bottom-docked above the floating controls.  Its
+           previous viewport-sized limit could put its top outside the
+           viewport when the Instructure frame uses a larger bottom offset,
+           making the first rows permanently unreachable in the panel's own
+           scrollbar. */
+        max-height: calc(100vh - var(--echo360-surface-bottom) - 16px);
         overflow-y: auto;
       }
       #echo360-translator-panel.echo360-panel-has-diagnostics .echo360-panel-controls {
@@ -588,7 +627,8 @@
         font-weight: 700;
       }
       .echo360-status-text.echo360-status-success {
-        color: #9ce6b0;
+        color: var(--echo360-diagnostic-success);
+        font-weight: 700;
       }
       .echo360-status-text.echo360-status-cache {
         color: var(--echo360-diagnostic-accent);
@@ -634,6 +674,54 @@
       }
       .echo360-diagnostics-extension[hidden] {
         display: none;
+      }
+
+      /* These controls live in the host document, not a shadow root. Keep
+         host search-input rules and intrinsic grid widths out of this panel. */
+      #echo360-translator-diagnostics-extension,
+      #echo360-translator-diagnostics-extension * {
+        box-sizing: border-box;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      #echo360-translator-diagnostics-extension [hidden] {
+        display: none !important;
+      }
+      #echo360-translator-diagnostics-extension input[type="search"] {
+        appearance: none;
+        -webkit-appearance: none;
+        display: block;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        height: auto;
+        min-height: 0;
+        margin: 0;
+        padding: 7px 9px;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-radius: 7px;
+        background: var(--echo360-diagnostic-subtle);
+        color: var(--echo360-popover-fg);
+        font: 11px/1.25 ui-sans-serif, "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+        box-shadow: none;
+      }
+      #echo360-translator-diagnostics-extension input[type="search"]:focus {
+        border-color: var(--echo360-diagnostic-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+      }
+      #echo360-translator-diagnostics-extension label {
+        width: auto;
+        margin: 0;
+        padding: 0;
+      }
+      .echo360-error-announcement {
+        flex: 1 1 0%;
+      }
+      #echo360-translator-failure-actions.echo360-error-empty {
+        border-top-color: var(--echo360-divider-color);
+      }
+      .echo360-error-empty .echo360-error-severity {
+        font-size: 13px;
       }
 
       /* ===== Structured translation error panel ===== */
@@ -823,6 +911,7 @@
       }
       .echo360-runtime-logs-header {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
@@ -901,6 +990,7 @@
       }
       .echo360-runtime-logs-tools {
         display: grid;
+        grid-template-columns: minmax(0, 1fr);
         gap: 6px;
         margin-top: 7px;
       }
@@ -1038,6 +1128,7 @@
       }
       .echo360-error-history-header {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
@@ -1122,6 +1213,7 @@
       }
       .echo360-error-history-tools {
         display: grid;
+        grid-template-columns: minmax(0, 1fr);
         gap: 6px;
         margin-top: 7px;
       }
@@ -1300,6 +1392,101 @@
         color: var(--echo360-diagnostic-secondary-text);
         font-size: 10px;
       }
+      /* ===== Translation completion summary (above runtime diagnostics) ===== */
+      .echo360-translation-summary {
+        margin-top: 0;
+        padding: 9px 0 2px;
+        border-top: 1px solid var(--echo360-divider-color);
+        color: var(--echo360-popover-fg);
+      }
+      .echo360-translation-summary-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .echo360-translation-summary-title {
+        font-size: 12px;
+        font-weight: 850;
+      }
+      .echo360-translation-summary-status {
+        margin-top: 2px;
+        color: var(--echo360-diagnostic-muted-text);
+        font-size: 10px;
+      }
+      .echo360-translation-summary-badge {
+        flex: 0 0 auto;
+        padding: 2px 6px;
+        border-radius: 999px;
+        background: var(--echo360-diagnostic-raised);
+        color: var(--echo360-diagnostic-accent);
+        font-size: 9px;
+        font-weight: 800;
+      }
+      .echo360-translation-summary-badge.is-warning {
+        color: var(--echo360-diagnostic-warning);
+      }
+      .echo360-translation-summary-lead {
+        margin-top: 7px;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .echo360-translation-summary-details {
+        display: grid;
+        gap: 3px;
+        margin-top: 7px;
+      }
+      .echo360-translation-summary-detail {
+        display: grid;
+        grid-template-columns: minmax(98px, 132px) minmax(0, 1fr);
+        gap: 7px;
+        padding: 4px 6px;
+        border-radius: 5px;
+        background: var(--echo360-diagnostic-subtle);
+        font-size: 10px;
+        line-height: 1.3;
+      }
+      .echo360-translation-summary-detail-label {
+        color: var(--echo360-diagnostic-muted-text);
+      }
+      .echo360-translation-summary-detail-value {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        color: var(--echo360-popover-fg);
+        font-variant-numeric: tabular-nums;
+      }
+      .echo360-translation-summary-providers {
+        display: grid;
+        gap: 4px;
+        margin: 7px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+      .echo360-translation-summary-provider {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 6px;
+        border: 1px solid var(--echo360-diagnostic-border);
+        border-radius: 5px;
+        background: var(--echo360-diagnostic-raised);
+        font-size: 10px;
+      }
+      .echo360-translation-summary-provider-name {
+        min-width: 0;
+        overflow: hidden;
+        font-weight: 750;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .echo360-translation-summary-provider-usage {
+        flex: 0 0 auto;
+        color: var(--echo360-diagnostic-secondary-text);
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
       #echo360-translator-failure-actions button:focus-visible,
       .echo360-runtime-logs button:focus-visible,
       .echo360-runtime-logs input:focus-visible,
@@ -1312,7 +1499,7 @@
         #echo360-translator-panel.echo360-panel-has-diagnostics {
           right: 8px;
           width: calc(100vw - 16px);
-          max-height: calc(100vh - 88px);
+          max-height: calc(100vh - var(--echo360-surface-bottom) - 12px);
         }
       }
     `;

@@ -87,7 +87,7 @@ Third line
     const adapter = translator.getProviderAdapter("google-web");
 
     expect(adapter.concurrencyCap).toBe(3);
-    expect(adapter.defaultRps).toBe(3);
+    expect(adapter.defaultRps).toBe(6);
   });
 
   it("stops before the provider request when the whole-task deadline has expired", async () => {
@@ -303,12 +303,12 @@ Third line
         effectiveConcurrency: 2,
         requestedRps: 96,
         batches: 2,
-        effectiveRps: 3,
+        effectiveRps: 6,
         failed: 1,
         translated: 1,
         rateLimitCount: 1,
       });
-      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 3 }));
+      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 6 }));
       expect(progress).toHaveBeenLastCalledWith(2, 2, "[2/2] Translating...", expect.objectContaining({ failed: 1 }));
       expect(partial).toHaveBeenLastCalledWith(
         expect.stringContaining("第二条"),
@@ -397,7 +397,7 @@ Third line
         code: "GOOGLE_WEB_ALL_REQUESTS_FAILED",
         metrics: expect.objectContaining({
           effectiveConcurrency: 2,
-          effectiveRps: 3,
+          effectiveRps: 6,
           failed: 2,
         }),
         failure_codes: { HTTP_429: 2 },
@@ -510,7 +510,7 @@ Third line
         effectiveRps: 1,
         initialProfile: {
           effectiveConcurrency: 2,
-          effectiveRps: 3,
+          effectiveRps: 6,
           failed: 2,
           failureCodes: { HTTP_429: 2 },
         },

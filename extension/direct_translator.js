@@ -23,12 +23,12 @@ globalThis.Echo360DirectTranslator = (() => {
   const SUPPORTED_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU", "AR", "HI"]);
   // The `gtx` web endpoint is undocumented and publishes no stable quota.
   // Keep a modest amount of in-flight work for latency hiding, while pacing
-  // starts at three requests/second instead of the previous 48-request burst.
+  // starts at six requests/second instead of the previous 48-request burst.
   // Explicit tuning remains possible, but is capped to avoid recreating the
   // burst pattern that commonly triggered HTTP 429 responses.
   const GOOGLE_WEB_CONCURRENCY_CAP = 3;
-  const GOOGLE_WEB_DEFAULT_RPS = 3;
-  const GOOGLE_WEB_MAX_RPS = 3;
+  const GOOGLE_WEB_DEFAULT_RPS = 6;
+  const GOOGLE_WEB_MAX_RPS = 6;
   const GOOGLE_WEB_MAX_RETRIES = 2;
   const GOOGLE_WEB_RETRY_BASE_MS = 2000;
   const GOOGLE_WEB_RETRY_MAX_MS = 30000;
@@ -583,6 +583,18 @@ globalThis.Echo360DirectTranslator = (() => {
       const code = raw && !ns.errorUtils?.isGenericCode?.(raw) ? raw : "FAILURE_DETAIL_MISSING";
       counts[code] = (counts[code] || 0) + 1;
       return counts;
+    }, {});
+  }
+
+  function mergeFailureCodeCounts(...maps) {
+    return maps.reduce((merged, source) => {
+      if (!source || typeof source !== "object" || Array.isArray(source)) return merged;
+      for (const [code, value] of Object.entries(source)) {
+        const count = Number(value);
+        if (!code || !Number.isFinite(count) || count <= 0) continue;
+        merged[code] = (merged[code] || 0) + count;
+      }
+      return merged;
     }, {});
   }
 
@@ -1297,6 +1309,14 @@ globalThis.Echo360DirectTranslator = (() => {
       items.push({ index, text: body, cueIndex: currentCueIndex });
     });
     if (items.length === 0) throw makeTranslationError("EMPTY_TRANSLATABLE_VTT", "VTT 中没有可翻译文本");
+    const translatableCueCount = new Set(items
+      .map((item) => item.cueIndex)
+      .filter((cueIndex) => Number.isInteger(cueIndex) && cueIndex >= 0)
+    ).size;
+    const totalCueCount = Math.max(
+      translatableCueCount,
+      lines.reduce((count, line) => count + (isTimecode(line) ? 1 : 0), 0)
+    );
 
     // Google web accepts one text per request.  Keeping six cues in one
     // internal batch used to hide progress until all six sequential requests
@@ -1316,7 +1336,11 @@ globalThis.Echo360DirectTranslator = (() => {
     const warnings = [];
     const failedItems = [];
     const failedItemKeys = new Set();
+    const observedFailureCodes = {};
     const deferredFailures = [];
+    const processedCueIndexes = new Set();
+    const translatedCueIndexes = new Set();
+    const failedCueIndexes = new Set();
     let completed = 0;
     let translatedCount = 0;
     let nextBatch = 0;
@@ -1346,6 +1370,11 @@ globalThis.Echo360DirectTranslator = (() => {
       elapsedMs: 0,
       google429Responses: 0,
       googleCircuitTripped: false,
+      totalCues: totalCueCount,
+      translatableCues: translatableCueCount,
+      processedCues: 0,
+      translatedCues: 0,
+      failedCues: 0,
     };
 
     function addWarning(message) {
@@ -1355,15 +1384,31 @@ globalThis.Echo360DirectTranslator = (() => {
 
     function progressDetails() {
       const circuit = cfg.googleRateLimitCircuit?.snapshot?.() || {};
+      const failedCueCount = failedCueIndexes.size;
+      const processedCueCount = processedCueIndexes.size;
+      const translatedCueCount = [...translatedCueIndexes]
+        .filter((cueIndex) => !failedCueIndexes.has(cueIndex))
+        .length;
       return {
         ...metrics,
         ...circuit,
         processed: completed,
         translated: translatedCount,
         failed: failedItems.length,
+        processedCues: Math.min(translatableCueCount, processedCueCount),
+        translatedCues: Math.min(translatableCueCount, Math.max(0, translatedCueCount)),
+        failedCues: failedCueCount,
+        observedFailureCodes: { ...observedFailureCodes },
+        observed_failure_codes: { ...observedFailureCodes },
         failureCodes: summarizeFailureCodes(failedItems),
         elapsedMs: Math.round(performance.now() - startedAt),
       };
+    }
+
+    function observeFailureCode(code, count = 1) {
+      const normalized = ns.errorUtils?.normalizeCode?.(code) || String(code || "").trim().toUpperCase();
+      if (!normalized || ["ERROR", "UNKNOWN", "UNKNOWN_ERROR", "TRANSLATION_ERROR"].includes(normalized)) return;
+      observedFailureCodes[normalized] = (observedFailureCodes[normalized] || 0) + Math.max(1, Number(count) || 1);
     }
 
     function recordFailure(batchNo, item, itemIndex, error) {
@@ -1371,6 +1416,8 @@ globalThis.Echo360DirectTranslator = (() => {
       if (failedItemKeys.has(key)) return;
       failedItemKeys.add(key);
       const summary = summarizeError(error);
+      observeFailureCode(summary.code);
+      if (Number.isInteger(item?.cueIndex) && item.cueIndex >= 0) failedCueIndexes.add(item.cueIndex);
       failedItems.push({
         batch: batchNo + 1,
         item: itemIndex + 1,
@@ -1398,7 +1445,12 @@ globalThis.Echo360DirectTranslator = (() => {
     cfg.onProviderEvent = (event) => {
       if (event.type === "retry") {
         metrics.retryCount += 1;
-        if (event.status === 429) metrics.rateLimitCount += 1;
+        if (event.status === 429) {
+          metrics.rateLimitCount += 1;
+          observeFailureCode("HTTP_429");
+        } else if (event.status) {
+          observeFailureCode(`HTTP_${event.status}`);
+        }
         directLog("warn", "retry scheduled", {
           batch: event.batchLabel,
           item: Number(event.itemIndex) + 1,
@@ -1431,7 +1483,12 @@ globalThis.Echo360DirectTranslator = (() => {
 
     function onRetry(info, label) {
       metrics.retryCount += 1;
-      if (info.status === 429) metrics.rateLimitCount += 1;
+      if (info.status === 429) {
+        metrics.rateLimitCount += 1;
+        observeFailureCode("HTTP_429");
+      } else if (info.status) {
+        observeFailureCode(`HTTP_${info.status}`);
+      }
       directLog("warn", "retry scheduled", {
         batch: label,
         attempt: info.attempt,
@@ -1581,6 +1638,15 @@ globalThis.Echo360DirectTranslator = (() => {
         });
       }
       metrics.unchangedResults += stagedUnchangedCount;
+      for (const item of batch) {
+        if (Number.isInteger(item?.cueIndex) && item.cueIndex >= 0) processedCueIndexes.add(item.cueIndex);
+      }
+      for (let i = 0; i < batch.length; i += 1) {
+        if (!failedIndexes.has(i)) {
+          const cueIndex = batch[i]?.cueIndex;
+          if (Number.isInteger(cueIndex) && cueIndex >= 0) translatedCueIndexes.add(cueIndex);
+        }
+      }
       for (let i = 0; i < batch.length; i += 1) {
         if (failedIndexes.has(i)) continue;
         const normalizedText = translated[i].trim();
@@ -1613,6 +1679,9 @@ globalThis.Echo360DirectTranslator = (() => {
 
     function keepOriginalBatch(batch, batchNo, error) {
       batch.forEach((item, itemIndex) => recordFailure(batchNo, item, itemIndex, error));
+      for (const item of batch) {
+        if (Number.isInteger(item?.cueIndex) && item.cueIndex >= 0) processedCueIndexes.add(item.cueIndex);
+      }
       batch.forEach((item) => {
         translatedLines[item.index] = lines[item.index];
       });
@@ -1806,6 +1875,7 @@ globalThis.Echo360DirectTranslator = (() => {
             targetResults: metrics.targetResults,
             unchangedResults: metrics.unchangedResults,
             failureCodes,
+            observedFailureCodes: { ...observedFailureCodes },
           },
           recovery: recoverySettings,
         });
@@ -1836,14 +1906,27 @@ globalThis.Echo360DirectTranslator = (() => {
             },
             recoveryHandlers
           );
+          const recoveredMetrics = recovered.metrics && typeof recovered.metrics === "object"
+            ? recovered.metrics
+            : {};
+          const mergedObservedFailureCodes = mergeFailureCodeCounts(
+            observedFailureCodes,
+            recoveredMetrics.observedFailureCodes || recoveredMetrics.observed_failure_codes
+          );
           const recoveryWarning = `Google Web 首轮配置（concurrency=${workers}, rps=${effectiveRps}）未获得可用中文结果，已自动切换到 concurrency=${recoverySettings.concurrency}, rps=${recoverySettings.rps} 进行一次串行探测。`;
           return {
             ...recovered,
             translated_vtt: mergePartialVtt(recovered.translated_vtt, firstAttemptVtt, payload.vtt_text),
             warnings: [recoveryWarning, ...(Array.isArray(recovered.warnings) ? recovered.warnings : [])],
             metrics: {
-              ...(recovered.metrics || {}),
+              ...recoveredMetrics,
               recoveryAttempted: true,
+              retryCount: (Number(metrics.retryCount) || 0) + (Number(recoveredMetrics.retryCount) || 0),
+              rateLimitCount: (Number(metrics.rateLimitCount) || 0) + (Number(recoveredMetrics.rateLimitCount) || 0),
+              google429Responses: (Number(metrics.google429Responses) || 0) + (Number(recoveredMetrics.google429Responses) || 0),
+              googleCircuitTripped: metrics.googleCircuitTripped === true || recoveredMetrics.googleCircuitTripped === true,
+              observedFailureCodes: mergedObservedFailureCodes,
+              observed_failure_codes: { ...mergedObservedFailureCodes },
               initialProfile: {
                 effectiveConcurrency: workers,
                 effectiveRps,
@@ -1852,14 +1935,29 @@ globalThis.Echo360DirectTranslator = (() => {
                 targetResults: metrics.targetResults,
                 unchangedResults: metrics.unchangedResults,
                 failureCodes,
+                observedFailureCodes: { ...observedFailureCodes },
               },
               recoveryProfile: recoverySettings,
             },
           };
         } catch (recoveryError) {
+          const recoveryMetrics = recoveryError.metrics && typeof recoveryError.metrics === "object"
+            ? recoveryError.metrics
+            : {};
+          const mergedRecoveryObserved = mergeFailureCodeCounts(
+            observedFailureCodes,
+            recoveryMetrics.observedFailureCodes || recoveryMetrics.observed_failure_codes,
+            failureCodes
+          );
           recoveryError.metrics = {
-            ...(recoveryError.metrics || {}),
+            ...recoveryMetrics,
             recoveryAttempted: true,
+            retryCount: (Number(metrics.retryCount) || 0) + (Number(recoveryMetrics.retryCount) || 0),
+            rateLimitCount: (Number(metrics.rateLimitCount) || 0) + (Number(recoveryMetrics.rateLimitCount) || 0),
+            google429Responses: (Number(metrics.google429Responses) || 0) + (Number(recoveryMetrics.google429Responses) || 0),
+            googleCircuitTripped: metrics.googleCircuitTripped === true || recoveryMetrics.googleCircuitTripped === true,
+            observedFailureCodes: mergedRecoveryObserved,
+            observed_failure_codes: { ...mergedRecoveryObserved },
             initialProfile: {
               effectiveConcurrency: workers,
               effectiveRps,
@@ -1868,6 +1966,7 @@ globalThis.Echo360DirectTranslator = (() => {
               targetResults: metrics.targetResults,
               unchangedResults: metrics.unchangedResults,
               failureCodes,
+              observedFailureCodes: { ...observedFailureCodes },
             },
             recoveryProfile: recoverySettings,
           };
@@ -1924,12 +2023,37 @@ globalThis.Echo360DirectTranslator = (() => {
       throw error;
     }
     const finalFailureCodes = summarizeFailureCodes(failedItems);
+    const finalFailedCueSet = new Set(failedItems
+      .map((item) => Number(item?.cue))
+      .filter((cue) => Number.isInteger(cue) && cue > 0)
+    );
     // Keep the complete aggregate failure map alongside the capped
     // failed_items sample. Without this, a legitimate partial result with
     // more than 50 failed cues is rejected at the client boundary because
     // the sample cannot add up to metrics.failed.
     metrics.failureCodes = finalFailureCodes;
     metrics.failure_codes = finalFailureCodes;
+    metrics.totalCues = totalCueCount;
+    metrics.processedCues = translatableCueCount;
+    metrics.translatableCues = translatableCueCount;
+    metrics.translatedCues = Math.max(0, translatableCueCount - finalFailedCueSet.size);
+    metrics.failedCues = finalFailedCueSet.size;
+    metrics.observedFailureCodes = { ...observedFailureCodes };
+    metrics.observed_failure_codes = { ...observedFailureCodes };
+    metrics.providerBreakdown = {
+      [provider]: {
+        assignedCues: translatableCueCount,
+        completedCues: metrics.translatedCues,
+        failedCues: finalFailedCueSet.size,
+        failures: finalFailedCueSet.size,
+        retryCount: metrics.retryCount,
+        rateLimitCount: metrics.rateLimitCount,
+        google429Responses: metrics.google429Responses,
+        googleCircuitTripped: metrics.googleCircuitTripped,
+        failureCodes: { ...finalFailureCodes },
+        observedFailureCodes: { ...observedFailureCodes },
+      },
+    };
     emitPartialVtt(true);
     const result = {
       translated_vtt: translatedVtt,

@@ -71,7 +71,7 @@ describe("friendlyErrorMessage", () => {
       "[GOOGLE_WEB_ALL_REQUESTS_FAILED] Google Web 全部请求失败；failureCodes={HTTP_429:304}"
     );
     expect(result).toContain("[GOOGLE_WEB_ALL_REQUESTS_FAILED]");
-    expect(result).toContain("concurrency=3、RPS=3");
+    expect(result).toContain("concurrency=3、RPS=6");
   });
 
   it("handles HTTP_403 underscore format", () => {

@@ -15,6 +15,7 @@ Current extension version: **1.6.0**
 5. **Incremental display while translating** (1.3.0): subtitles mount immediately on click; pending cues show `正在翻译中...` until each batch completes.
 6. **Per-provider API keys** with real-time sync between the popup and options page; switching providers loads the matching key automatically.
 7. **Manual AI round trip**: click `AI 手动翻译` to download one compact `.translate.json` containing the full course cue map and copy a short prompt. A file-capable AI translates the complete map and returns one import-ready `.translated.json`; the extension uses the bound session to verify source SHA-256 and target, then checks the complete ID set, WebVTT tags, code/URL/path/email literals, and numbers before rebuilding playback VTT locally from the immutable source.
+8. **Transcript-panel bilingual enhancement** is an independent opt-in surface; it is disabled by default on fresh installs and upgrades, and is enabled only after the user explicitly turns it on in subtitle settings. That choice is preserved.
 
 ## Subtitle Source Discovery
 
@@ -294,7 +295,7 @@ npm run test:python
 - max_paragraphs: `6` (the Google web endpoint refreshes progress per cue)
 - max_chars: `1200`
 - concurrency: the shared setting defaults to `96`; Google Translate is capped at `3`, Azure AI Translator at `8`, with other providers unchanged
-- rps: the shared setting is stored as `0`; Google Translate interprets it as the safe `3 RPS` baseline, while other adapters retain their own behavior
+- rps: the shared setting is stored as `0`; Google Translate interprets it as the safe `6 RPS` baseline, while other adapters retain their own behavior
 - retries: `1`
 - timeout: `10`
 - reasoning_effort: empty by default
@@ -336,11 +337,11 @@ Azure AI Translator provider:
 Google Translate provider:
 - `google-web` uses an unofficial web endpoint and does not require an API key, so it is useful for quick first-run testing; Google's developer community states that this endpoint is unmaintained and not recommended for production
 - Every build calls it directly from the extension frontend; Argos/custom-backend settings cannot reroute it
-- Both the backend/script and direct extension paths use a shared `3 RPS / 3 concurrent` Google profile while retaining `max_chars=1200, max_paragraphs=1`
+- Both the backend/script and direct extension paths use a shared `6 RPS / 3 concurrent` Google profile while retaining `max_chars=1200, max_paragraphs=1`
 - This endpoint is unofficial, so stability, availability, and translation quality are not guaranteed
 - For better subtitle quality and API stability, use an official API provider such as `azure`/`deepl`, or an AI provider, with your own API key
 
-Both direct extension and Python `google-web` paths default to a shared `3 RPS / 3 concurrent` profile. Even an older stored `rps=0` receives this safe baseline, while a lower explicit RPS value is preserved. Each cue is handled independently. Isolated `HTTP 429` responses honor `Retry-After` or use jittered exponential backoff, but five 429 responses within ten seconds open a circuit breaker: new Google requests and retries stop, and the local backend is launched so Argos can take over; Mixed Translation instead reassigns the failed shard to another healthy provider. The Python backend uses the same threshold and preserves Google cues that already succeeded while Argos fills the unfinished cues. Any cues that still fail keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports effective concurrency/RPS, progress, circuit breaker, fallback, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly. Research references: [Google developer-community note on the unofficial endpoint](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639) and [official Google Cloud Translation quotas (formal API comparison only)](https://docs.cloud.google.com/translate/quotas).
+Both direct extension and Python `google-web` paths default to a shared `6 RPS / 3 concurrent` profile. Even an older stored `rps=0` receives this safe baseline, while a lower explicit RPS value is preserved. Each cue is handled independently. Isolated `HTTP 429` responses honor `Retry-After` or use jittered exponential backoff, but five 429 responses within ten seconds open a circuit breaker: new Google requests and retries stop, and the local backend is launched so Argos can take over; Mixed Translation instead reassigns the failed shard to another healthy provider. The Python backend uses the same threshold and preserves Google cues that already succeeded while Argos fills the unfinished cues. Any cues that still fail keep their original text and appear in `failed_items`, and partial results are not cached. The extension Console reports effective concurrency/RPS, progress, circuit breaker, fallback, and final failure summaries. The endpoint has no public, stable official QPS guarantee, so formal Google Cloud Translation quotas should not be applied to it directly. Research references: [Google developer-community note on the unofficial endpoint](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639) and [official Google Cloud Translation quotas (formal API comparison only)](https://docs.cloud.google.com/translate/quotas).
 
 The mixed router follows mature gateway patterns for weighted traffic distribution, failover, and unhealthy-upstream ejection instead of sending each cue redundantly to every service: [Envoy Gateway load balancing](https://gateway.envoyproxy.io/docs/concepts/load-balancing/), [Envoy outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier), [Azure Circuit Breaker pattern](https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker), and [Azure Bulkhead pattern](https://learn.microsoft.com/azure/architecture/patterns/bulkhead).
 
@@ -360,6 +361,8 @@ python -c 'from argostranslate import sbd; sbd.minisbd_models.download_models(["
 ```
 
 The last command explicitly preloads MiniSBD's English sentence-boundary model. Select `Argos Translate (local)` in full settings; saving or starting translation automatically checks and launches `127.0.0.1:8765`, with no separate toggle. Translation never downloads models silently: missing runtime dependencies, language packages, and sentence-boundary models are reported as `ARGOS_DEPENDENCY_MISSING` or `ARGOS_MODEL_MISSING`, with actionable guidance.
+
+To reduce CPU contention during local translation, CTranslate2 inference and MiniSBD/ONNX sentence detection each default to 2 threads, with one translation batch at a time. The sentence detector has an independent thread pool, so both pools are explicitly bounded; Argos continues to manage its own model cache. When launching from source, set `ARGOS_INTRA_THREADS=1` to further reduce CPU use or another positive integer to adjust the budget; an explicit `0` restores automatic thread selection. Restart the backend after changing environment variables. This prioritizes desktop responsiveness and may increase completion time for long subtitles.
 
 See the [local machine-translation research](docs/local-translation-research.md) for quality, speed, footprint, licensing, and migration recommendations.
 
@@ -417,5 +420,5 @@ The extension keeps one local translated VTT cache entry. Bilingual display is r
 - Detailed network body capture in the probe is disabled by default.
 - If a separated intro clip exists, the extension prefers strong media-id mapping first and timeline/state matching as fallback.
 - Transcript-panel-only lessons without player CC rely on the `transcript-file` API (1.2.2); those pages have no native CC DOM to inject into, so `hasNativeCaptionCapability()` detects that and uses the browser track directly.
-- Incremental preview partial VTT is emitted per batch by `direct_translator.js` or FastAPI async jobs and polled into `buildIncrementalPreviewVtt()`, which replaces untranslated cues with placeholder text. Legacy synchronous custom backends do not provide this capability.
+- Incremental preview partial VTT is emitted per batch by `direct_translator.js` or FastAPI async jobs and polled into `buildIncrementalPreviewVtt()`, which replaces untranslated cues with placeholder text. Mixed Translation now safely merges each child provider's partial by original cue position instead of waiting for the whole provider shard; legacy synchronous custom backends do not provide this capability.
 Beta-first rendering, capability detection, and perf/UI polish

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 from collections import deque
+from functools import partial
 import json
 import os
 import re
@@ -63,10 +64,10 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE = 1
 # The undocumented Google Web endpoint has no stable published quota. Pace it
-# at a conservative three requests/second with at most three in-flight calls.
+# at a conservative six requests/second with at most three in-flight calls.
 GOOGLE_WEB_DEFAULT_CONCURRENCY = 3
-GOOGLE_WEB_DEFAULT_RPS = 3.0
-GOOGLE_WEB_MAX_RPS = 3.0
+GOOGLE_WEB_DEFAULT_RPS = 6.0
+GOOGLE_WEB_MAX_RPS = 6.0
 GOOGLE_WEB_MAX_RETRIES = 2
 GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5
 GOOGLE_WEB_429_WINDOW_SECONDS = 10.0
@@ -78,6 +79,12 @@ ARGOS_DEFAULT_CONCURRENCY = 1
 ARGOS_DEFAULT_MAX_CHARS = 1200
 ARGOS_DEFAULT_MAX_PARAGRAPHS = 6
 ARGOS_DEFAULT_MAX_RETRIES = 0
+# Argos/CTranslate2 uses ``0`` for auto-detected intra-op threads. That is a
+# good throughput default for a dedicated translation machine, but it can make
+# a laptop unresponsive while the local model is decoding. Keep one translator
+# worker and a small, overridable CPU budget for the desktop app.
+ARGOS_DEFAULT_INTER_THREADS = 1
+ARGOS_DEFAULT_INTRA_THREADS = 2
 ARGOS_SOURCE_CODE = "en"
 ARGOS_TARGET_MAP = {
     "ZH": "zh",
@@ -730,10 +737,65 @@ def _resolve_argos_target_lang(target_lang: str) -> str:
         ) from exc
 
 
+def configure_argos_resource_limits() -> int:
+    """Set a laptop-friendly Argos CPU profile before importing Argos.
+
+    Argos reads its CTranslate2 settings during module import.  In particular,
+    ``ARGOS_INTRA_THREADS=0`` delegates the CPU budget to auto-detection, which
+    can occupy most physical cores during local inference.  Keep the official
+    Argos setting user-overridable, and mirror a positive explicit value to the
+    common native math runtimes used by MiniSBD and CTranslate2.
+
+    Returns the effective positive intra-op thread count, or ``0`` when the
+    caller explicitly requested Argos' auto-detected setting.
+    """
+    configured = os.getenv("ARGOS_INTRA_THREADS")
+    if configured is None or not configured.strip():
+        configured = str(ARGOS_DEFAULT_INTRA_THREADS)
+        os.environ["ARGOS_INTRA_THREADS"] = configured
+    try:
+        intra_threads = int(configured)
+    except (TypeError, ValueError):
+        intra_threads = ARGOS_DEFAULT_INTRA_THREADS
+        os.environ["ARGOS_INTRA_THREADS"] = str(intra_threads)
+    if intra_threads < 0:
+        intra_threads = ARGOS_DEFAULT_INTRA_THREADS
+        os.environ["ARGOS_INTRA_THREADS"] = str(intra_threads)
+
+    # Argos already defaults to one translator worker. Set it explicitly so a
+    # user settings file cannot silently reintroduce data-parallel workers for
+    # the same model unless they intentionally override this environment value.
+    os.environ.setdefault("ARGOS_INTER_THREADS", str(ARGOS_DEFAULT_INTER_THREADS))
+
+    if intra_threads > 0:
+        for variable in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            os.environ.setdefault(variable, str(intra_threads))
+        return intra_threads
+    return 0
+
+
+def _configure_argos_sentence_detector(argos_sbd: object, intra_threads: int) -> None:
+    # Argos 1.11 omits MiniSBD's max_threads argument. Its ONNX pool is
+    # independent of CTranslate2 and ignores the OMP limit, so constrain the
+    # factory before any cached language/translation objects create a detector.
+    # Retain the original factory to avoid nesting wrappers on later batches.
+    original = getattr(argos_sbd, "_echo360_sbdetect_factory", None)
+    if original is None:
+        original = argos_sbd.SBDetect
+        argos_sbd._echo360_sbdetect_factory = original
+    argos_sbd.SBDetect = partial(original, max_threads=intra_threads or None)
+
+
 def _load_argos_translate_module():
     # Argos 1.11 installs Stanza, whose default sentencizer may fetch its
     # resource index on first use. MiniSBD ships with Argos and keeps this
     # provider offline; an explicit environment setting remains authoritative.
+    intra_threads = configure_argos_resource_limits()
     os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
     try:
         from argostranslate import translate as argos_translate
@@ -744,6 +806,7 @@ def _load_argos_translate_module():
             "'python -m pip install --upgrade pip' then "
             "'python -m pip install -r backend/requirements-argos.txt'"
         ) from exc
+    _configure_argos_sentence_detector(argos_sbd, intra_threads)
     sentence_model = Path(argos_sbd.minisbd_models.cache_dir) / "en.onnx"
     if not sentence_model.is_file():
         raise RuntimeError(
