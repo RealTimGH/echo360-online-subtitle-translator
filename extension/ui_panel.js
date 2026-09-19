@@ -42,7 +42,10 @@
 
     const manualBtn = document.createElement("button");
     manualBtn.id = "echo360-translator-manual-btn";
-    manualBtn.className = "echo360-panel-btn echo360-panel-btn--secondary";
+    // This is a primary panel action, so keep it on the same button surface
+    // as load/retranslate. The secondary modifier is reserved for actions
+    // inside the manual workflow itself (for example clipboard import).
+    manualBtn.className = "echo360-panel-btn";
     manualBtn.textContent = "AI 手动翻译";
     manualBtn.title = "下载完整字幕 JSON 和说明，让 AI 一次翻译并返回完整结果";
     manualBtn.setAttribute("aria-label", "打开 AI 手动翻译工作流");
@@ -235,6 +238,7 @@
       const opening = manual.hidden;
       manual.hidden = false;
       manualBtn.setAttribute("aria-expanded", "true");
+      if (opening) panel.scrollTop = 0;
       if (!opening || !prepare) return;
       // Preparation and the automatic export start from this user gesture.
       // The controller still leaves the manual download/copy controls enabled

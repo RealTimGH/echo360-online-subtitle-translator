@@ -54,6 +54,18 @@
         top: var(--echo360-floating-top);
         right: auto;
         bottom: auto;
+        /* The Canvas embed has room beside the player. Keep both the
+           collapsed and hovered states at the same coordinates; only the
+           secondary controls become available through the existing hover /
+           focus-within interaction. Legacy Echo360 pages keep the generic
+           half-hidden slide-out behavior below. */
+        transform: translateX(0);
+      }
+      #echo360-ui-root.echo360-media-anchored #echo360-translator-ball-group.echo360-ball-hidden {
+        /* Opening the panel is a separate state from hover. Keep the ball
+           genuinely out of the way even though the anchored hover state is
+           intentionally stationary. */
+        transform: translateX(70px);
       }
       #echo360-ui-root.echo360-media-anchored #echo360-translator-panel,
       #echo360-ui-root.echo360-media-anchored #echo360-translator-popover,
@@ -334,6 +346,14 @@
         display: flex;
         flex-direction: column;
         gap: 5px;
+        /* Manual translation adds a long, wrapped workflow below the
+           toolbar. Keep the bottom-docked panel entirely inside the viewport
+           and let the panel itself scroll instead of pushing its first rows
+           above the top edge on short or embedded player pages. */
+        max-height: calc(100vh - var(--echo360-surface-bottom) - 16px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
         background: var(--echo360-panel-bg);
         backdrop-filter: var(--echo360-panel-backdrop);
         -webkit-backdrop-filter: var(--echo360-panel-backdrop);
@@ -365,6 +385,21 @@
       }
       #echo360-translator-panel.echo360-panel-has-diagnostics .echo360-panel-btn--collapse {
         grid-column: 1 / -1;
+      }
+
+      /* Host pages may apply a thick magenta focus border to every button.
+         Use one restrained blue focus treatment for mouse and keyboard focus
+         across the complete extension surface. !important is intentional:
+         this root is injected into third-party pages whose global button
+         rules otherwise win over the extension's component styles. */
+      #echo360-ui-root button:focus,
+      #echo360-ui-root input:focus,
+      #echo360-ui-root select:focus,
+      #echo360-ui-root textarea:focus,
+      #echo360-ui-root [tabindex]:focus,
+      #echo360-ui-root summary:focus {
+        outline: 2px solid var(--echo360-focus-ring) !important;
+        outline-offset: 2px !important;
       }
 
       .echo360-panel-controls {
@@ -611,10 +646,16 @@
         border-top: 1px solid var(--echo360-divider-color);
       }
       .echo360-status-text {
+        /* This is a flex item in the diagnostics-enabled panel. Without an
+           explicit non-shrinking basis, a long completion/cache line is
+           forced down to min-height:18px while its wrapped second line
+           overflows into the diagnostics divider. */
+        flex: 0 0 auto;
         font-size: 12px;
         opacity: .9;
         margin-top: 8px;
         min-height: 18px;
+        line-height: 1.4;
         white-space: pre-wrap;
         overflow-wrap: anywhere;
       }
@@ -707,7 +748,7 @@
       }
       #echo360-translator-diagnostics-extension input[type="search"]:focus {
         border-color: var(--echo360-diagnostic-accent);
-        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+        box-shadow: 0 0 0 2px var(--echo360-focus-ring-soft);
       }
       #echo360-translator-diagnostics-extension label {
         width: auto;
@@ -1013,7 +1054,7 @@
       }
       .echo360-runtime-logs-search:focus {
         border-color: var(--echo360-diagnostic-accent);
-        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+        box-shadow: 0 0 0 2px var(--echo360-focus-ring-soft);
       }
       .echo360-runtime-logs-filters {
         display: grid;
@@ -1236,7 +1277,7 @@
       }
       .echo360-error-history-search:focus {
         border-color: var(--echo360-diagnostic-accent);
-        box-shadow: 0 0 0 2px color-mix(in srgb, var(--echo360-diagnostic-accent) 22%, transparent);
+        box-shadow: 0 0 0 2px var(--echo360-focus-ring-soft);
       }
       .echo360-error-history-filters {
         display: grid;

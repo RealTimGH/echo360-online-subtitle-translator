@@ -53,6 +53,10 @@
       secondaryText: "rgba(255,255,255,0.76)",
       border: "rgba(255,255,255,0.16)",
     },
+    focus: {
+      ring: "#9ed0ff",
+      soft: "rgba(158,208,255,0.22)",
+    },
   };
 
   const LIGHT = {
@@ -100,6 +104,10 @@
       mutedText: "rgba(0,0,0,0.62)",
       secondaryText: "rgba(0,0,0,0.76)",
       border: "rgba(0,0,0,0.14)",
+    },
+    focus: {
+      ring: "#075fa8",
+      soft: "rgba(7,95,168,0.18)",
     },
   };
 
@@ -149,6 +157,8 @@
         --echo360-diagnostic-muted-text: ${theme.diagnostic.mutedText};
         --echo360-diagnostic-secondary-text: ${theme.diagnostic.secondaryText};
         --echo360-diagnostic-border: ${theme.diagnostic.border};
+        --echo360-focus-ring: ${theme.focus.ring};
+        --echo360-focus-ring-soft: ${theme.focus.soft};
     `;
   }
 

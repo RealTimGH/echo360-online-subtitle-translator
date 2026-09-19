@@ -1267,9 +1267,13 @@
     const video = ns.video.getPrimaryVideo?.();
     if (hasExistingTranslation(video)) {
       if (!confirmRetranslation({ autoExport })) {
-        ns.ui.setStatusText(autoExport
-          ? "当前翻译字幕已保留，未重新翻译，也未重复下载材料。"
-          : "当前翻译字幕已保留，未重新翻译。", "info");
+        // Cancelling the confirmation must be a true no-op. The existing
+        // status line may contain the completed/cache overview, and the
+        // diagnostics surface may contain the corresponding summary. Replacing
+        // that text here made a cancelled retranslation look as if the
+        // successful result had been cleared, even though the track/cache was
+        // still intact. Only the confirmed path below starts a new workflow
+        // and reaches onClickTranslate(), where the old result is cleared.
         return false;
       }
       return runQuickWorkflow(true, { autoExport });

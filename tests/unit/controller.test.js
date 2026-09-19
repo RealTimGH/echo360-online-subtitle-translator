@@ -360,10 +360,14 @@ describe("controller track sync in Echo360 native CC mode", () => {
   });
 
   it("asks before retranslation and does not export duplicate AI materials when cancelled", async () => {
-    const { ns, callbacks } = setupManualController();
+    const { ns, video, callbacks } = setupManualController();
     await ns.controller.init();
     ns.renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    ns.ui.clearTranslationSummary = vi.fn();
+    const previousOverview = "翻译完成。共 1 条字幕，已翻译 1 条，失败 0 条。 翻译服务：Argos Translate（本地） 1 条。";
+    ns.ui.setStatusText(previousOverview, "success");
+    ns.ui.setStatusText.mockClear();
     ns.manualTranslation.copyText.mockClear();
     ns.manualTranslation.downloadText.mockClear();
 
@@ -373,10 +377,9 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("是否清除当前结果并重新翻译"));
     expect(ns.manualTranslation.copyText).not.toHaveBeenCalled();
     expect(ns.manualTranslation.downloadText).not.toHaveBeenCalled();
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
-      "当前翻译字幕已保留，未重新翻译，也未重复下载材料。",
-      "info"
-    );
+    expect(ns.ui.setStatusText).not.toHaveBeenCalled();
+    expect(ns.ui.clearTranslationSummary).not.toHaveBeenCalled();
+    expect(video.querySelector('track[data-echo360-translated="1"]')).not.toBeNull();
   });
 
   it("does not promise AI material regeneration in the retranslation confirmation when disabled", async () => {

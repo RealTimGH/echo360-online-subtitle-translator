@@ -225,11 +225,13 @@
       const groupWidth = 84;
       const groupHeight = 52;
       const margin = 8;
-      // The compact group is visually docked with translateX(28px) until
-      // hovered. Reserve that dock offset while calculating the player-local
-      // right edge; otherwise the primary circle protrudes into the lesson
-      // shell and looks like a page-level control.
-      const dockOffset = 28;
+      // Instructure Media embeds have their own player-local controls and the
+      // surrounding Canvas page remains unobstructed. Keep the compact group
+      // at its final player-local position and let hover/focus reveal the
+      // secondary actions in place. The legacy Echo360 page still uses the
+      // generic fixed, half-hidden group CSS because this anchor is installed
+      // only for Instructure Media.
+      const dockOffset = 0;
       // The player rectangle is the ownership boundary.  Instructure wraps
       // each media player in a much larger lesson/scroll shell; using the
       // iframe's right edge here makes the button look like a Canvas-level
