@@ -945,3 +945,140 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(finalOptions.failedCues.at(-1)).toBe(60);
   });
 });
+
+describe("sentence merging integration", () => {
+  const source = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nThis is\n\n2\n00:00:01.000 --> 00:00:02.000\na sentence.\n\n3\n00:00:02.000 --> 00:00:03.000\nNext.\n";
+  const translation = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\n这是一个句子。\n\n2\n00:00:02.000 --> 00:00:03.000\n下一句。\n";
+  beforeEach(() => { vi.useFakeTimers(); vi.restoreAllMocks(); });
+  afterEach(() => {
+    window.Echo360Translator?.controller?.destroy?.();
+    vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks();
+  });
+
+  function setup(enabled = true) {
+    const state = setupManualController({ quickTranslateAutoExport: false });
+    const { ns } = state;
+    evalModule("sentence_merge.js");
+    let prefs = { enabled: true, size: "medium", bilingual: true, browserBilingual: true,
+      useNativeSubtitles: true, sentenceMergeEnabled: enabled, sentenceMergeEnglish: false };
+    ns.storage.getPrefs.mockImplementation(async () => ({ ...prefs }));
+    ns.storage.savePrefs = vi.fn(async value => { prefs = { ...value }; });
+    ns.storage.askApiKeyIfNeeded = vi.fn(async cfg => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => null);
+    ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+    ns.translationService.resolveSourceVtt.mockResolvedValue({ vttText: source, sourceId: "sentence-source", sourceMeta: { stats: { cueCount: 3 } } });
+    ns.translationService.buildCacheKey = vi.fn(async (_cfg, _id, _vtt, options) => ({ sourceKey: "source", configSig: "config", cacheKey: `source:${options?.sentenceMergeEnabled}` }));
+    ns.translationService.buildTranslatePayload = vi.fn((_cfg, vtt) => ({ vtt_text: vtt, provider: "google-web", target: "ZH", bilingual: false }));
+    ns.translationService.translateWithConfig = vi.fn(async (_cfg, _url, payload, options) => {
+      const out = prefs.sentenceMergeEnabled ? translation : source.replace("This is", "这是").replace("a sentence.", "一个句子。").replace("Next.", "下一句。");
+      options.onPartialVtt(out, { current: 2, total: 2, translated: 2 });
+      return { translated_vtt: out, warnings: [], failed_items: [], metrics: { total: 2, translated: 2, failed: 0 } };
+    });
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+    return { ...state, prefs: () => prefs };
+  }
+
+  it("sends grouped sentences through the selected service and stores grouped results while rendering original timings", async () => {
+    const { ns, callbacks } = setup();
+    await ns.controller.init();
+    await callbacks().onTranslate();
+    const payload = ns.translationService.translateWithConfig.mock.calls[0][2];
+    expect(ns.vtt.parseVttCues(payload.vtt_text).map(c => c.text)).toEqual(["This is a sentence.", "Next."]);
+    expect(ns.translationService.buildCacheKey.mock.calls[0][3]).toEqual({ sentenceMergeEnabled: true });
+    const rendered = ns.renderer.getRenderState();
+    expect(ns.vtt.parseVttCues(rendered.lastRenderedVtt).map(c => c.text)).toEqual(["这是一个句子。", "这是一个句子。", "下一句。"]);
+    expect(rendered.lastOriginalVtt).toBe(source);
+    expect(ns.storage.setCacheStore.mock.calls[0][0].translatedVtt).toBe(translation);
+    expect(ns.ui.showError).not.toHaveBeenCalled();
+  });
+
+  it("keeps disabled translation input and cache invocation unchanged", async () => {
+    const { ns, callbacks } = setup(false);
+    await ns.controller.init();
+    await callbacks().onTranslate();
+    expect(ns.translationService.translateWithConfig.mock.calls[0][2].vtt_text).toBe(source);
+    expect(ns.translationService.buildCacheKey.mock.calls[0]).toHaveLength(3);
+    expect(ns.renderer.getRenderState().lastOriginalVtt).toBe(source);
+  });
+
+  it("changes merged English without another service call, then retranslates when merging is disabled", async () => {
+    const { ns, callbacks, prefs } = setup();
+    await ns.controller.init();
+    await callbacks().onTranslate();
+    ns.ui.readPanelPrefs = vi.fn(() => ({ ...prefs(), sentenceMergeEnglish: true }));
+    await callbacks().onPrefsChanged();
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledTimes(1);
+    expect(ns.vtt.parseVttCues(ns.renderer.getRenderState().lastOriginalVtt).map(c => c.text)).toEqual(["This is a sentence.", "This is a sentence.", "Next."]);
+    ns.ui.readPanelPrefs.mockImplementation(() => ({ ...prefs(), sentenceMergeEnabled: false }));
+    await callbacks().onPrefsChanged();
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledTimes(2);
+    expect(ns.translationService.translateWithConfig.mock.calls[1][2].vtt_text).toBe(source);
+  });
+
+  it("defers a merge-mode change during an active request, then starts one replacement run", async () => {
+    const { ns, callbacks, prefs } = setup();
+    await ns.controller.init();
+    const translate = ns.translationService.translateWithConfig.getMockImplementation();
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    ns.translationService.translateWithConfig.mockImplementationOnce(async () => pending);
+    const first = callbacks().onTranslate();
+    await vi.waitFor(() => expect(ns.translationService.translateWithConfig).toHaveBeenCalledOnce());
+    ns.ui.readPanelPrefs = vi.fn(() => ({ ...prefs(), sentenceMergeEnabled: false }));
+    await callbacks().onPrefsChanged();
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledOnce();
+    ns.translationService.translateWithConfig.mockImplementation(translate);
+    release({ translated_vtt: translation, warnings: [], failed_items: [], metrics: { translated: 2, failed: 0 } });
+    await first;
+    await vi.waitFor(() => expect(ns.translationService.translateWithConfig).toHaveBeenCalledTimes(2));
+    expect(ns.translationService.translateWithConfig.mock.calls[1][2].vtt_text).toBe(source);
+  });
+
+  it.each([
+    [true, true, true], [false, true, false], [true, false, false],
+  ])("gates merged English by plugin ownership and bilingual display (%s, %s)", (useNativeSubtitles, bilingual, merged) => {
+    const { ns } = setup();
+    ns.transcriptPanelRenderer = { setVisible: vi.fn(), setTranslation: vi.fn() };
+    const plan = ns.sentenceMerge.build(source);
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+    ns.controller.renderTranslationSurfaces({ translatedVtt: translation, originalVtt: plan.vtt,
+      prefs: { sentenceMergeEnabled: true, sentenceMergeEnglish: true, useNativeSubtitles, bilingual, browserBilingual: bilingual, transcriptPanelEnabled: true },
+      sourceMeta: { sentenceMerge: { originalVtt: source, plan } } });
+    expect(ns.vtt.parseVttCues(render.mock.calls[0][1])[0].text).toBe(merged ? "This is a sentence." : "This is");
+    expect(ns.transcriptPanelRenderer.setTranslation.mock.calls[0][0].originalVtt).toBe(source);
+  });
+
+  it("translates sentence fragments separately and projects a straddling source cue without retiming", async () => {
+    const { ns, callbacks } = setup();
+    const original = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\n<v Speaker 1>This is\n\n2\n00:00:01.000 --> 00:00:02.000\n<v Speaker 1>a sentence. The next\n\n3\n00:00:02.000 --> 00:00:03.000\n<v Speaker 1>one continues.\n";
+    ns.translationService.resolveSourceVtt.mockResolvedValue({ vttText: original, sourceId: "split-source" });
+    ns.translationService.translateWithConfig.mockImplementation(async (_cfg, _url, payload, options) => {
+      expect(ns.vtt.parseVttCues(payload.vtt_text).map(c => c.text)).toEqual(["This is a sentence.", "The next one continues."]);
+      const out = payload.vtt_text.replace("This is a sentence.", "这是一个句子。").replace("The next one continues.", "下一句继续。");
+      options.onPartialVtt(out, { current: 2, total: 2, translated: 2 });
+      return { translated_vtt: out, warnings: [], failed_items: [], metrics: { total: 2, translated: 2, failed: 0 } };
+    });
+    await ns.controller.init();
+    await callbacks().onTranslate();
+    const rendered = ns.renderer.getRenderState();
+    expect(rendered.lastOriginalVtt).toBe(original);
+    const cues = ns.vtt.parseVttCues(rendered.lastRenderedVtt);
+    expect(cues.map(c => c.text)).toEqual(["这是一个句子。", "这是一个句子。\n下一句继续。", "下一句继续。"]);
+    expect(cues.map(c => [c.startMs, c.endMs])).toEqual([[0, 1000], [1000, 2000], [2000, 3000]]);
+    expect(ns.ui.showError).not.toHaveBeenCalled();
+  });
+
+  it("maps sparse preview and group failure labels to every original cue without shifting", () => {
+    const { ns } = setup();
+    const plan = ns.sentenceMerge.build(source);
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+    ns.controller.renderTranslationSurfaces({
+      translatedVtt: "WEBVTT\n\n2\n00:00:02.000 --> 00:00:03.000\n下一句。\n", originalVtt: plan.vtt,
+      prefs: { sentenceMergeEnabled: true, useNativeSubtitles: true },
+      sourceMeta: { sentenceMerge: { originalVtt: source, plan } },
+      options: { previewPending: true, failedCues: [1] },
+    });
+    expect(ns.vtt.parseVttCues(render.mock.calls[0][0]).map(c => c.text)).toEqual(["[翻译失败]", "[翻译失败]", "下一句。"]);
+    expect(render.mock.calls[0][7].failedCues).toEqual([1, 2]);
+  });
+});

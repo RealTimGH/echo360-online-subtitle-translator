@@ -95,6 +95,12 @@
       reverseOrder: false,
       browserBilingual: false,
       browserReverseOrder: false,
+      // Sentence merging changes the source cue grouping used for a
+      // translation request. Keep both sentence options opt-in on fresh
+      // installs; sentenceMergeEnglish is intentionally stored independently
+      // so a user's display choice survives while its prerequisites are off.
+      sentenceMergeEnabled: false,
+      sentenceMergeEnglish: false,
       // Transcript panel enhancement is an independent surface.  Keep it
       // opt-in on fresh installs; an explicit stored choice is preserved by
       // the normalization below so upgrades do not overwrite user settings.
@@ -117,6 +123,12 @@
     }
     prefs.browserBilingual = typeof prefs.browserBilingual === "boolean" ? prefs.browserBilingual : prefs.bilingual === true;
     prefs.browserReverseOrder = typeof prefs.browserReverseOrder === "boolean" ? prefs.browserReverseOrder : prefs.reverseOrder === true;
+    prefs.sentenceMergeEnabled = prefs.sentenceMergeEnabled === true;
+    // This is a stored preference rather than an effective render mode. The
+    // popover disables it when sentence merging, browser subtitles, or
+    // browser bilingual output is unavailable, but must retain the user's
+    // choice for when those prerequisites are restored.
+    prefs.sentenceMergeEnglish = prefs.sentenceMergeEnglish === true;
     // A missing field is the upgrade/fresh-install default: disabled.  Only a
     // stored boolean true represents an explicit opt-in.
     prefs.transcriptPanelEnabled = prefs.transcriptPanelEnabled === true;
@@ -145,6 +157,15 @@
     const transcriptPanelEnabled = typeof prefs.transcriptPanelEnabled === "boolean"
       ? prefs.transcriptPanelEnabled
       : existing.transcriptPanelEnabled === true;
+    const sentenceMergeEnabled = typeof prefs.sentenceMergeEnabled === "boolean"
+      ? prefs.sentenceMergeEnabled
+      : existing.sentenceMergeEnabled === true;
+    // Keep the display-only English preference independent of its current
+    // prerequisites. UI callers may omit it while handling another setting;
+    // in that case preserve the stored choice instead of silently clearing it.
+    const sentenceMergeEnglish = typeof prefs.sentenceMergeEnglish === "boolean"
+      ? prefs.sentenceMergeEnglish
+      : existing.sentenceMergeEnglish === true;
     const normalizedPrefs = {
       ...prefs,
       renderModeVersion: PREFS_SCHEMA_VERSION,
@@ -152,6 +173,8 @@
       browserBilingual,
       browserReverseOrder,
       transcriptPanelEnabled,
+      sentenceMergeEnabled,
+      sentenceMergeEnglish,
       bilingual: useNativeSubtitles ? browserBilingual : true,
       reverseOrder: useNativeSubtitles ? browserReverseOrder : false,
     };

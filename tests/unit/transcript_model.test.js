@@ -126,3 +126,14 @@ describe("transcript model", () => {
     expect(built.cues.every((cue) => cue.status === "unmapped")).toBe(true);
   });
 });
+
+it("keeps a successful sentence visible when another sentence in the same source cue failed", () => {
+  const model = setup();
+  const built = model.buildTranscriptModel({
+    originalVtt: original,
+    translatedVtt: translated(["成功的一句。\n[翻译失败]", "好的", "这是测试"]),
+    failedCues: [1],
+    sourceMeta: { sentenceMerge: { plan: { groups: [] } } },
+  });
+  expect(built.cues[0]).toMatchObject({ status: "failed", translatedText: "成功的一句。\n[翻译失败]" });
+});

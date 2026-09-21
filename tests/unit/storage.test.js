@@ -970,3 +970,16 @@ describe("sha256Text", () => {
     expect(h1).not.toBe(h2);
   });
 });
+
+describe("sentence merging preferences", () => {
+  it("defaults off, persists both choices, and preserves them when unrelated fields are saved", async () => {
+    const { storage } = setupStorage();
+    expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: false, sentenceMergeEnglish: false });
+    await storage.savePrefs({ useNativeSubtitles: true, browserBilingual: true, sentenceMergeEnabled: true, sentenceMergeEnglish: true });
+    expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: true, sentenceMergeEnglish: true });
+    await storage.savePrefs({ useNativeSubtitles: false, size: "small" });
+    expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: true, sentenceMergeEnglish: true });
+    await storage.savePrefs({ sentenceMergeEnabled: false });
+    expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: false, sentenceMergeEnglish: true });
+  });
+});

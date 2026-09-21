@@ -113,6 +113,7 @@
         "manual_translation.js",
         "host_support.js",
         "vtt.js",
+        "sentence_merge.js",
         "transcript_model.js",
         "transcript_panel_adapter.js",
         "transcript_search_bridge.js",

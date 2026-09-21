@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Echo caption bounded-work probe</title>
+<style>
+#player {position:relative;width:640px;height:360px} video{width:100%;height:100%}
+.native-caption {position:absolute;left:100px;top:280px;width:440px;font:24px sans-serif}
+</style>
+<div id="player"><video></video><div class="native-caption">Hello world</div><div id="progress"></div></div>
+<pre id="result">RUNNING</pre>
+<script>window.Echo360Translator = {constants:{},hostSupport:{isEcho360Document:()=>true}};</script>
+<script src="../../extension/vtt.js"></script>
+<script src="../../extension/echo_caption_renderer.js"></script>
+<script>
+(async () => {
+  const result = document.querySelector('#result');
+  const renderer = window.Echo360Translator.echoCaptionRenderer;
+  const player = document.querySelector('#player');
+  const video = player.querySelector('video');
+  const native = player.querySelector('.native-caption');
+  let callback, now = 0, handle = 0, scans = 0, reads = 0, observerCallbacks = 0;
+  const realNow = performance.now.bind(performance);
+  Object.defineProperty(performance, 'now', {value:()=>now, configurable:true});
+  video.requestVideoFrameCallback = fn => {callback = fn; return ++handle;};
+  video.cancelVideoFrameCallback = () => {};
+  Object.defineProperty(video, 'currentTime', {value:1});
+  const NativeObserver = window.MutationObserver;
+  window.MutationObserver = class extends NativeObserver {
+    constructor(fn) {super((...args) => { observerCallbacks++; fn(...args); });}
+  };
+  const query = player.querySelectorAll.bind(player);
+  player.querySelectorAll = selector => {if (selector === '*') scans++; return query(selector);};
+  for (const element of [player, video, native]) {
+    const rect = element.getBoundingClientRect.bind(element);
+    element.getBoundingClientRect = () => {reads++; return rect();};
+  }
+  const vtt = text => `WEBVTT\n\n00:00:00.000 --> 00:00:20.000\n${text}\n`;
+  try {
+    renderer.mount({video, originalVtt:vtt('Hello world'), translatedVtt:vtt('你好世界')});
+    await Promise.resolve();
+    scans = reads = 0;
+    const started = realNow();
+    for (let frame = 1; frame <= 600; frame++) { now = frame * 1000 / 60; callback(); }
+    const stable = {simulatedFrames:600, simulatedSeconds:10, playerSubtreeScans:scans, geometryReads:reads,
+      synchronousMs:Number((realNow()-started).toFixed(2))};
+    renderer.setVisible(false);
+    await Promise.resolve();
+    observerCallbacks = 0;
+    for (let i = 0; i < 100; i++) {
+      document.querySelector('#progress').style.width = `${i}%`;
+      await Promise.resolve();
+    }
+    result.textContent = JSON.stringify({stable, hiddenObserverCallbacks:observerCallbacks,
+      limitation:'Synthetic stable-frame workload and API-call counts, not real playback CPU/RSS/disk measurements'}, null, 2);
+  } catch (error) { result.textContent = 'FAIL ' + error.stack; }
+  finally {renderer.unmount();}
+})();
+</script>

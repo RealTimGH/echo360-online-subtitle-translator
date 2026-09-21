@@ -5,6 +5,7 @@
 
   let activeRunId = null;
   let isTranslating = false;
+  let sentenceMergeRestartRequested = false;
   let loadedCacheKey = "";
   let trackSyncTimer = null;
   let trackSyncTimerDueAt = 0;
@@ -180,8 +181,28 @@
   }) {
     let resolvedSourceMeta;
     try {
+      const merge = sourceMeta?.sentenceMerge;
+      const groupedRender = merge ? { translatedVtt, originalVtt, options } : null;
+      let panelOriginalVtt = originalVtt;
+      if (merge) {
+        // Resolve pending/failure labels against the actual translation input
+        // before projecting groups back to the untouched source cue timeline.
+        const groupedTranslation = options.previewPending
+          ? ns.sentenceMerge.preview(translatedVtt, merge.plan, options)
+          : translatedVtt;
+        const displayPrefs = trackSyncPrefs || prefs;
+        const projection = ns.sentenceMerge.project(merge.originalVtt, groupedTranslation, merge.plan,
+          displayPrefs.sentenceMergeEnabled === true && displayPrefs.sentenceMergeEnglish === true && displayPrefs.useNativeSubtitles === true &&
+          (displayPrefs.browserBilingual ?? displayPrefs.bilingual) === true);
+        translatedVtt = projection.translatedVtt;
+        originalVtt = projection.originalVtt;
+        panelOriginalVtt = merge.originalVtt;
+        options = { ...options, previewPending: false,
+          failedCues: ns.sentenceMerge.remapFailedCues(options.failedCues || [], merge.plan) };
+      }
       resolvedSourceMeta = {
         ...(sourceMeta || {}),
+        ...(groupedRender ? { sentenceMergeRender: groupedRender } : {}),
         target: String(prefs.target || sourceMeta?.target || "ZH").toUpperCase(),
       };
       const mounted = ns.renderer.renderTranslatedTrack(
@@ -217,7 +238,7 @@
             ns.transcriptPanelRenderer.setVisible(true);
             ns.transcriptPanelRenderer.setTranslation({
               translatedVtt: panelTranslatedVtt,
-              originalVtt,
+              originalVtt: panelOriginalVtt,
               sourceMeta: resolvedSourceMeta,
               target: resolvedSourceMeta.target,
               sessionKey: resolvedSourceMeta.sessionKey,
@@ -310,7 +331,8 @@
       ...(result?.metrics && typeof result.metrics === "object" ? result.metrics : {}),
     };
     const parsedStats = ns.vtt?.parseVttStats?.(originalVtt) || {};
-    const sourceStats = sourceMeta?.stats && typeof sourceMeta.stats === "object" ? sourceMeta.stats : {};
+    const sourceStats = sourceMeta?.sentenceMerge ? parsedStats
+      : sourceMeta?.stats && typeof sourceMeta.stats === "object" ? sourceMeta.stats : {};
     // Source discovery can contribute a partial stats object (for example,
     // only maxEnd or only cueCount). Fill missing/zero fields from the actual
     // VTT so the compact result line never says "0 cues" for a valid source.
@@ -504,6 +526,16 @@
       ns.renderer.applySubtitleSize(prefs.size);
 
       const renderState = ns.renderer.getRenderState();
+      if (oldPrefs.sentenceMergeEnabled !== prefs.sentenceMergeEnabled) {
+        loadedCacheKey = "";
+        if (isTranslating) {
+          sentenceMergeRestartRequested = true;
+          ns.ui.setStatusText("整句翻译设置已保存，当前任务结束后将按新设置重新翻译。");
+        } else if (renderState.lastRenderedVtt) {
+          await onClickTranslate();
+          return;
+        }
+      }
       if (
         renderState.lastRenderedVtt &&
         (
@@ -511,12 +543,14 @@
           oldPrefs.reverseOrder !== prefs.reverseOrder ||
           oldPrefs.useNativeSubtitles !== prefs.useNativeSubtitles ||
           oldPrefs.size !== prefs.size ||
-          oldPrefs.transcriptPanelEnabled !== prefs.transcriptPanelEnabled
+          oldPrefs.transcriptPanelEnabled !== prefs.transcriptPanelEnabled ||
+          oldPrefs.sentenceMergeEnglish !== prefs.sentenceMergeEnglish
         )
       ) {
         const mounted = renderTranslationSurfaces({
-          translatedVtt: renderState.lastRenderedVtt,
-          originalVtt: renderState.lastOriginalVtt,
+          translatedVtt: renderState.lastRenderSourceMeta?.sentenceMergeRender?.translatedVtt || renderState.lastRenderedVtt,
+          originalVtt: renderState.lastRenderSourceMeta?.sentenceMergeRender?.originalVtt || renderState.lastOriginalVtt,
+          options: renderState.lastRenderSourceMeta?.sentenceMergeRender?.options || {},
           prefs,
           sourceMeta: renderState.lastRenderSourceMeta,
           onSurfaceWarning: (warning) => { renderWarning = warning; },
@@ -1466,7 +1500,7 @@
       diagnosticContext.phase = "source";
       const prepared = forceRefresh ? null : await preparedManualSource(video);
       const resolvedSource = prepared || await ns.translationService.resolveSourceVtt(video);
-      const vttText = resolvedSource?.vttText;
+      let vttText = resolvedSource?.vttText;
       const sourceId = resolvedSource?.sourceId || "";
       const sourceMeta = resolvedSource?.sourceMeta || null;
       diagnosticContext.sourceMeta = sourceMeta || null;
@@ -1494,9 +1528,16 @@
       prefs.target = String(cfg.target || "ZH").toUpperCase();
       ns.renderer.applySubtitleSize(prefs.size);
 
-      const { sourceKey, configSig, cacheKey } = await ns.translationService.buildCacheKey(cfg, sourceId, vttText);
+      const sentenceMerge = prefs.sentenceMergeEnabled === true
+        ? { originalVtt: vttText, plan: ns.sentenceMerge.build(vttText, { maxChars: Number(cfg.maxChars) || 1200 }) }
+        : null;
+      if (sentenceMerge) vttText = sentenceMerge.plan.vtt;
+      const { sourceKey, configSig, cacheKey } = sentenceMerge
+        ? await ns.translationService.buildCacheKey(cfg, sourceId, vttText, { sentenceMergeEnabled: true })
+        : await ns.translationService.buildCacheKey(cfg, sourceId, vttText);
       diagnosticContext.phase = "cache";
-      const panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig, sessionKey: cacheKey };
+      const panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig, sessionKey: cacheKey,
+        ...(sentenceMerge ? { sentenceMerge } : {}) };
       let cacheEntry = null;
       try {
         cacheEntry = await ns.storage.getCacheStore();
@@ -1962,6 +2003,10 @@
       } else {
         ns.ui.updateActionButtons(btn?.textContent || "翻译字幕已加载", false);
       }
+      if (sentenceMergeRestartRequested && !isTranslating) {
+        sentenceMergeRestartRequested = false;
+        void onClickTranslate();
+      }
     }
   }
 
@@ -2068,6 +2113,7 @@
   }
 
   function destroy() {
+    sentenceMergeRestartRequested = false;
     trackSyncInstalled = false;
     if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
     trackSyncTimer = null;

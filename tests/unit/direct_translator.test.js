@@ -742,3 +742,22 @@ Third line
     }
   });
 });
+
+it("preserves sentence group IDs and overlapping source ranges through provider translation", async () => {
+  const input = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nFirst sentence.\n\n2\n00:00:01.000 --> 00:00:03.000\nSecond sentence.\n\n3\n00:00:01.000 --> 00:00:03.000\nThird sentence.\n";
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const texts = JSON.parse(init.body).map(item => item.Text);
+    expect(texts).toEqual(["First sentence.", "Second sentence.", "Third sentence."]);
+    return new Response(JSON.stringify(texts.map((_, index) => ({ translations: [{ text: `译文${index + 1}`, to: "zh-Hans" }] }))),
+      { status: 200, headers: { "content-type": "application/json" } });
+  });
+  try {
+    const result = await translator.translateVtt({
+      provider: "azure", api_key: "test-key", target: "ZH", concurrency: 1, retries: 0,
+      max_paragraphs: 6, max_chars: 1200, vtt_text: input,
+    });
+    expect(result.translated_vtt).toBe(input.replace("First sentence.", "译文1").replace("Second sentence.", "译文2").replace("Third sentence.", "译文3"));
+  } finally {
+    fetchMock.mockRestore();
+  }
+});

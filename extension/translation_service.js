@@ -1337,13 +1337,16 @@
     }
   }
 
-  async function buildCacheKey(cfg, sourceId, vttText) {
+  async function buildCacheKey(cfg, sourceId, vttText, options = {}) {
     const stableSourceId = String(ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId || "").trim();
     // A canonical source URL already identifies the subtitle bytes for cache
     // purposes. Avoid hashing the full VTT (which can be several megabytes)
     // unless the source adapter could not provide a stable identifier.
     const sourceKey = stableSourceId || `${location.href}#${await ns.storage.sha256Text(vttText)}`;
-    const configSig = ns.storage.buildConfigSignature(cfg);
+    const baseConfigSig = ns.storage.buildConfigSignature(cfg);
+    const configSig = options.sentenceMergeEnabled === true
+      ? `${baseConfigSig}::sentence-merge-v2:${await ns.storage.sha256Text(vttText)}`
+      : baseConfigSig;
     return {
       sourceKey,
       configSig,

@@ -96,6 +96,12 @@ This protection minimizes interaction with an assessment page, but no extension 
 
 Display preferences (bilingual, order, size) do not require retranslation. The extension caches one translated VTT and renders client-side.
 
+### Optional sentence merging
+
+The player's subtitle settings have two switches, both off by default: the translation switch sits near the target language, and the English display switch sits directly below bilingual display. **Sentence merging** combines consecutive English cues before sending them to the selected translation service, including mixed providers and local backends. Changing it reloads or retranslates existing subtitles; a running translation finishes before restarting with the new setting. **Show merged English** only applies when merging is enabled and the extension displays both languages. It changes display without requesting another translation and is unavailable when the player owns the English captions/native CC injection is selected.
+
+Each original cue in a group displays the group's complete translation. English keeps its original cue text unless the second switch is enabled. Original timing and silent gaps are retained, and the Transcript panel stays aligned with original rows. Only separating whitespace is added; words and punctuation are never rewritten. Sentence boundaries inside cues are now recognized, and long spoken sentences prefer grammatical clause boundaries. A cue straddling two groups displays both complete translations during its original time range; word timings are never guessed. Speaker changes, long pauses, sound cues, abnormal timing, and size limits constrain merging. Missing words and unpunctuated speech cannot always be resolved by rules. Manual AI import/export remains unchanged. See the [design and research notes](docs/sentence-merge-translation.md).
+
 ## Directory Layout
 
 ```text

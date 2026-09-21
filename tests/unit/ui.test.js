@@ -1211,3 +1211,45 @@ describe("translation failure actions", () => {
     expect(history.querySelector(".echo360-error-history-feedback").textContent).toContain("已复制 1 条");
   });
 });
+
+describe("sentence merging settings", () => {
+  it("enables merged English only for merged plugin bilingual output and retains its saved choice", async () => {
+    setupUi({ enabled: true, size: "medium", useNativeSubtitles: true, bilingual: true, browserBilingual: true,
+      sentenceMergeEnabled: false, sentenceMergeEnglish: true });
+    await openSettings();
+    const bilingualLabel = document.getElementById("echo360-pref-bilingual-label");
+    const englishLabel = document.getElementById("echo360-pref-sentence-merge-english-label");
+    const mergeLabel = document.getElementById("echo360-pref-sentence-merge-label");
+    const english = document.getElementById("echo360-pref-sentence-merge-english");
+    expect(englishLabel.previousElementSibling).toBe(bilingualLabel);
+    expect(englishLabel.parentElement.getAttribute("role")).toBe("group");
+    expect(englishLabel.parentElement.getAttribute("aria-label")).toBe("字幕显示选项");
+    expect(englishLabel.style.marginLeft).toBe("12px");
+    expect(english.getAttribute("aria-describedby")).toBe("echo360-pref-sentence-merge-english-help");
+    expect(document.getElementById("echo360-pref-sentence-merge-english-help").textContent)
+      .toContain("整句合并翻译");
+    expect(document.getElementById("echo360-pref-sentence-merge-english-help").textContent)
+      .toContain("插件双语显示");
+    expect(mergeLabel.previousElementSibling.querySelector("#echo360-pref-target")).not.toBeNull();
+    expect(mergeLabel.parentElement.getAttribute("role")).toBe("group");
+    expect(mergeLabel.parentElement.getAttribute("aria-label")).toBe("翻译行为");
+    expect(mergeLabel.textContent).toContain("优先按一句合并，切换后重新翻译");
+    expect(english.checked).toBe(true);
+    expect(english.disabled).toBe(true);
+    changeCheckbox("echo360-pref-sentence-merge", true);
+    expect(english.disabled).toBe(false);
+    changeCheckbox("echo360-pref-bilingual", false);
+    expect(english.disabled).toBe(true);
+    expect(english.checked).toBe(true);
+    changeCheckbox("echo360-pref-bilingual", true);
+    expect(english.disabled).toBe(false);
+    changeCheckbox("echo360-pref-echo360-native-cc", true);
+    expect(english.disabled).toBe(true);
+    expect(window.Echo360Translator.ui.readPanelPrefs()).toMatchObject({ sentenceMergeEnabled: true, sentenceMergeEnglish: true });
+    changeCheckbox("echo360-pref-echo360-native-cc", false);
+    expect(english.disabled).toBe(false);
+    changeCheckbox("echo360-pref-sentence-merge", false);
+    expect(english.disabled).toBe(true);
+    expect(english.checked).toBe(true);
+  });
+});

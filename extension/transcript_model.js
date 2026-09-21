@@ -243,8 +243,15 @@
             ? (failurePreview ? "failed" : "pending")
             : "ready";
       }
+      // A source cue can straddle two sentence groups. Keep the successful
+      // sentence visible when its neighbour failed; the row still carries
+      // the failure status so the error is discoverable.
+      const partialSentenceFailure = !!options.sourceMeta?.sentenceMerge && status === "failed" &&
+        translatedText.split("\n").some((line) => isFailureText(line, failureLabel)) &&
+        translatedText.split("\n").some((line) => line.trim() &&
+          !isFailureText(line, failureLabel) && !isPendingText(line, "", pendingLabel));
       const displayText = status === "failed"
-        ? failureLabel
+        ? (partialSentenceFailure ? translatedText : failureLabel)
         : status === "pending"
           ? pendingLabel
           : translatedText;

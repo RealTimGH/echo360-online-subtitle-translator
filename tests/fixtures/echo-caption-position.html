@@ -1,0 +1,83 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Echo caption positioning regression</title>
+<style>
+  body { margin: 60px; }
+  #player { position: relative; width: 640px; height: 360px; border: 4px solid black; transform: scale(.8); transform-origin: top left; }
+  video { width: 100%; height: 100%; }
+</style>
+<div id="player"><video></video><div id="caption-host"></div><button hidden aria-label="Captions" aria-pressed="true">CC</button></div>
+<pre id="result">RUNNING</pre>
+<script>window.Echo360Translator = { constants: {}, hostSupport: { isEcho360Document: () => true } };</script>
+<script src="../../extension/vtt.js"></script>
+<script src="../../extension/echo_caption_renderer.js"></script>
+<script>
+(async () => {
+  const result = document.querySelector('#result');
+  const player = document.querySelector('#player');
+  const video = player.querySelector('video');
+  Object.defineProperty(video, 'currentTime', { value: 1, writable: true });
+  const root = document.querySelector('#caption-host').attachShadow({ mode: 'open' });
+  root.innerHTML = '<style>.caption { position:absolute; top:280px; left:100px; width:180px; font:24px sans-serif; }</style><div class="caption">Hello world</div>';
+  const native = root.querySelector('.caption');
+  const renderer = window.Echo360Translator.echoCaptionRenderer;
+  const vtt = (text, next) => `WEBVTT\n\n00:00:00.000 --> 00:00:02.000\n${text}\n\n00:00:02.000 --> 00:00:10.000\n${next}\n`;
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const checks = [];
+  const assert = (condition, label) => { if (!condition) throw new Error(label); checks.push(label); };
+  const above = () => {
+    const stack = player.querySelector('[data-echo360-echo-caption-stack]');
+    const gap = native.getBoundingClientRect().top - stack.getBoundingClientRect().bottom;
+    assert(Math.abs(gap - 4.8) < .2, 'scaled/bordered player: native gap = ' + gap.toFixed(2));
+  };
+  try {
+    renderer.mount({ video, originalVtt: vtt('Hello world', 'Second line'), translatedVtt: vtt('这是需要自动换行的长字幕，用来检查初次显示和字体变化后仍然在英文上方。', '第二句翻译') });
+    above();
+    const initialLine = player.querySelector('[data-echo360-echo-caption-line]');
+    initialLine.textContent = '这是一条应该从首次显示就排成一行的中文字幕';
+    assert(initialLine.getBoundingClientRect().height < 35, 'long Chinese uses available player width immediately');
+    native.style.width = '100px';
+    native.style.fontSize = '18px';
+    await wait(0);
+    const acquiredLine = player.querySelector('[data-echo360-echo-caption-line]');
+    assert(acquiredLine.style.fontSize === '24px', 'native width/font changes do not change Chinese typography');
+    const before = player.getBoundingClientRect().height;
+    const stack = player.querySelector('[data-echo360-echo-caption-stack]');
+    stack.style.width = '120px';
+    stack.firstChild.style.fontSize = '32px';
+    above();
+    assert(player.getBoundingClientRect().height === before, 'overlay does not resize player');
+    renderer.applySize('large');
+    const confirmedTop = stack.style.top;
+    const confirmedFont = stack.firstChild.style.fontSize;
+    native.remove();
+    await wait(1200);
+    renderer.ensureMounted();
+    assert(!player.querySelector('[data-echo360-echo-caption]').hidden, 'missing native remains visible after 1200ms');
+    assert(stack.style.top === confirmedTop, 'missing native retains confirmed anchor');
+    assert(stack.firstChild.style.fontSize === confirmedFont, 'missing native retains caption font');
+    document.body.style.marginTop = '180px';
+    renderer.ensureMounted();
+    assert(stack.style.top === confirmedTop, 'page movement preserves player-local anchor');
+    player.style.height = '180px';
+    renderer.ensureMounted();
+    assert(Math.abs(parseFloat(stack.style.top) - 134) < .01, 'resize projects normalized native anchor');
+    player.style.height = '360px';
+    video.currentTime = 3;
+    renderer.ensureMounted();
+    const nextStack = player.querySelector('[data-echo360-echo-caption-stack]');
+    assert(nextStack.textContent === '第二句翻译', 'cue changes update translation during native absence');
+    assert(nextStack.style.top === confirmedTop, 'new cue retains confirmed anchor');
+    native.textContent = 'Second line';
+    root.append(native);
+    await wait(0);
+    assert(!player.querySelector('[data-echo360-echo-caption]').hidden, 'shadow cue insertion resumes immediately');
+    above();
+    renderer.unmount();
+    assert(!player.querySelector('[data-echo360-echo-caption]'), 'unmount removes overlay');
+    result.textContent = 'PASS\n' + checks.join('\n');
+  } catch (error) {
+    result.textContent = 'FAIL\n' + error.stack;
+  } finally { renderer.unmount(); }
+})();
+</script>

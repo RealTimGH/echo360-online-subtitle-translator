@@ -983,3 +983,17 @@ describe("buildCacheKey", () => {
     expect(key.cacheKey).toContain("::google-web|");
   });
 });
+
+describe("sentence merging cache identity", () => {
+  it("separates merged sources by mode/version/content but ignores English display", async () => {
+    const cfg = { provider: "google-web", model: "" };
+    const raw = await svc.buildCacheKey(cfg, "same-url", "original");
+    const merged = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true });
+    const changed = await svc.buildCacheKey(cfg, "same-url", "changed content", { sentenceMergeEnabled: true });
+    const english = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true, sentenceMergeEnglish: true });
+    expect(merged.cacheKey).not.toBe(raw.cacheKey);
+    expect(merged.configSig).toContain("sentence-merge-v2:");
+    expect(changed.cacheKey).not.toBe(merged.cacheKey);
+    expect(english.cacheKey).toBe(merged.cacheKey);
+  });
+});
