@@ -28,6 +28,7 @@
  *   P10 native CC injector does not expose fallback debug state
  *   P11 native CC injector stays quiet when injection fails
  *   P12 setVisible(false) prevents native injection
+ *   P12b setVisible(false) cancels requestVideoFrameCallback until shown again
  *   P17 updateTranslatedVtt refreshes cue translations without remounting
  *   P19 mount refuses immediately with no native caption capability
  *   P20 onNoCaptionCapability fires once capability is confirmed absent
@@ -112,10 +113,13 @@ function makeVideo(currentTime = 0) {
   // manually fire successive "video frames" to simulate a high-refresh-rate
   // display without waiting on a real render loop.
   el.requestVideoFrameCallback = vi.fn((cb) => {
+    el._frameHandle = (el._frameHandle || 0) + 1;
     el._lastFrameCallback = cb;
-    return 1;
+    return el._frameHandle;
   });
-  el.cancelVideoFrameCallback = vi.fn();
+  el.cancelVideoFrameCallback = vi.fn((id) => {
+    if (id === el._frameHandle) el._lastFrameCallback = null;
+  });
   stubRect(el);
   return el;
 }
@@ -472,10 +476,42 @@ describe("DOM injection via native caption double", () => {
     }
 
     const fullScanCalls = scanSpy.mock.calls.filter((args) => args[0] === "*").length;
-    // A 33ms throttle floor over 100ms allows at most ~4 real scan attempts,
-    // versus the 14 an unthrottled loop would have made.
-    expect(fullScanCalls).toBeGreaterThan(0);
-    expect(fullScanCalls).toBeLessThanOrEqual(4);
+    // The initial empty candidate result is reused until text/tree changes.
+    expect(fullScanCalls).toBe(0);
+  });
+
+  it("reuses hidden text candidates when CSS makes a caption visible", () => {
+    const video = makeVideo(1.0);
+    const player = setupPlayer(video);
+    const span = addCaptionSpan(player, "Hello world");
+    span.style.visibility = "hidden";
+    renderer.mount({ video, originalVtt: ORIG_VTT, translatedVtt: TRANS_VTT });
+    const scans = renderer.getDebugState().scanCount;
+    expect(span.hasAttribute("data-echo360-translation")).toBe(false);
+    span.style.visibility = "visible";
+    mockNow = 100;
+    fireVideoFrame(video);
+    expect(span.getAttribute("data-echo360-translation")).toBe("你好世界");
+    expect(renderer.getDebugState().scanCount).toBe(scans);
+  });
+
+  it("invalidates a cached miss for synchronous DOM changes before observer delivery", () => {
+    const video = makeVideo(1.0);
+    const player = setupPlayer(video);
+    renderer.mount({ video, originalVtt: ORIG_VTT, translatedVtt: TRANS_VTT });
+    const scans = renderer.getDebugState().scanCount;
+    const geometry = vi.spyOn(player, "getBoundingClientRect");
+    geometry.mockClear();
+    for (let i = 0; i < 20; i += 1) {
+      mockNow += 30;
+      video.dispatchEvent(new Event("timeupdate"));
+    }
+    expect(renderer.getDebugState().scanCount).toBe(scans);
+    expect(geometry).not.toHaveBeenCalled();
+    const span = addCaptionSpan(player, "Hello world");
+    video.dispatchEvent(new Event("timeupdate"));
+    expect(span.getAttribute("data-echo360-translation")).toBe("你好世界");
+    expect(renderer.getDebugState().scanCount).toBe(scans + 1);
   });
 
   it("P25: does not throttle timeupdate-driven re-renders (only the requestVideoFrameCallback loop is capped)", () => {
@@ -923,5 +959,30 @@ describe("setVisible()", () => {
     video.dispatchEvent(new Event("timeupdate"));
 
     expect(renderer.getDebugState().injectedLineCount).toBe(0);
+  });
+
+  it("does not scan the player on time updates while hidden", () => {
+    const video = makeVideo(1.0);
+    const player = setupPlayer(video);
+    renderer.mount({ video, originalVtt: ORIG_VTT, translatedVtt: TRANS_VTT });
+    renderer.setVisible(false);
+    const scan = vi.spyOn(player, "querySelectorAll");
+    for (let i = 0; i < 20; i += 1) video.dispatchEvent(new Event("timeupdate"));
+    expect(scan).not.toHaveBeenCalled();
+    renderer.setVisible(true);
+    expect(scan).toHaveBeenCalled();
+  });
+
+  it("cancels video-frame callbacks while captions are hidden and resumes them when shown", () => {
+    const video = makeVideo(1.0);
+    setupPlayer(video);
+    renderer.mount({ video, originalVtt: ORIG_VTT, translatedVtt: TRANS_VTT, size: "medium" });
+    const requestsAfterMount = video.requestVideoFrameCallback.mock.calls.length;
+    renderer.setVisible(false);
+    expect(video.cancelVideoFrameCallback).toHaveBeenCalled();
+    fireVideoFrame(video);
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requestsAfterMount);
+    renderer.setVisible(true);
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requestsAfterMount + 1);
   });
 });

@@ -571,7 +571,15 @@ describe("getPrefs normalization", () => {
     expect(prefs.enabled).toBe(true);
     expect(prefs.useNativeSubtitles).toBe(true);
     expect(prefs.bilingual).toBe(false);
-    expect(prefs.transcriptPanelEnabled).toBe(true);
+    expect(prefs.transcriptPanelEnabled).toBe(false);
+  });
+
+  it("persists an empty migration marker so fresh installs do not rescan storage", async () => {
+    const { storage, localMock } = setupStorage({ storageData: {} });
+    await storage.getPrefs();
+    await storage.getPrefs();
+    expect(localMock.get.mock.calls.filter(([key]) => key === null)).toHaveLength(1);
+    expect(localMock._store["echo360TranslatorPrefs::legacy-migration-v1"]).toBe(true);
   });
 
   it("upgrades a 1.4.2 prefs record without resetting existing choices", async () => {
@@ -597,7 +605,7 @@ describe("getPrefs normalization", () => {
       bilingual: true,
       reverseOrder: true,
       useNativeSubtitles: true,
-      transcriptPanelEnabled: true,
+      transcriptPanelEnabled: false,
     });
   });
 
@@ -608,6 +616,19 @@ describe("getPrefs normalization", () => {
     expect((await storage.getPrefs()).transcriptPanelEnabled).toBe(false);
     await storage.savePrefs({ transcriptPanelEnabled: false, enabled: true, size: "medium", bilingual: false, reverseOrder: false, useNativeSubtitles: true });
     expect(localMock._store[prefsKey()].transcriptPanelEnabled).toBe(false);
+  });
+
+  it("preserves an explicit Transcript panel opt-in across upgrades", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        [prefsKey()]: {
+          transcriptPanelEnabled: true,
+          useNativeSubtitles: true,
+          renderModeVersion: 3,
+        },
+      },
+    });
+    expect((await storage.getPrefs()).transcriptPanelEnabled).toBe(true);
   });
 
   it("migrates legacy prefs without schema version to prefer the browser track", async () => {
@@ -862,6 +883,14 @@ describe("savePrefs", () => {
     expect(loaded.size).toBe("small");
     expect(loaded.bilingual).toBe(true);
     expect(loaded.useNativeSubtitles).toBe(true);
+  });
+
+  it("skips a redundant storage write for unchanged normalized prefs", async () => {
+    const { storage, localMock } = setupStorage();
+    const prefs = { enabled: true, size: "large", bilingual: true, reverseOrder: false, useNativeSubtitles: true };
+    await storage.savePrefs(prefs);
+    await storage.savePrefs(prefs);
+    expect(localMock.set).toHaveBeenCalledOnce();
   });
 });
 

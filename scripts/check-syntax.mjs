@@ -5,12 +5,24 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
+const ignoredDirectories = new Set([
+  "node_modules",
+  "dist",
+  "coverage",
+  ".git",
+  ".venv",
+  ".backend-build-venv",
+  "venv",
+  "__pycache__",
+  ".cache",
+  ".pytest_cache",
+]);
 
 async function filesUnder(directory, extensions) {
   const files = [];
   const entries = await fs.readdir(directory, { withFileTypes: true });
   for (const entry of entries) {
-    if (["node_modules", "dist", "coverage", ".git"].includes(entry.name)) continue;
+    if (ignoredDirectories.has(entry.name)) continue;
     const fullPath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
       files.push(...await filesUnder(fullPath, extensions));

@@ -26,7 +26,10 @@
   let lastRenderSourceMeta = null;
   let pendingMount = null;
   let fullscreenListenerInstalled = false;
+  let nativeVisibilitySyncTimer = null;
+  const pendingObjectUrlRevocations = new Map();
   const nativeTrackStates = new Map();
+  const TRANSLATED_TRACK_SELECTOR = 'track[data-echo360-translated="1"], track[label*="翻译字幕"]';
 
   function isSafari() {
     return /^((?!chrome|android).)*safari/i.test(navigator.userAgent || "");
@@ -69,7 +72,7 @@
       styleEl.id = "echo360-translator-style";
       document.head.appendChild(styleEl);
     }
-    styleEl.textContent = `
+    const styleText = `
       video::cue {
         font-size: ${pct} !important;
         line-height: ${lineHeight} !important;
@@ -95,8 +98,10 @@
         line-height: ${lineHeight} !important;
       }
     `;
+    if (styleEl.textContent !== styleText) styleEl.textContent = styleText;
     ns.bilingualDomRenderer?.applySize(normalizedSize);
     ns.playerCaptionRenderer?.applySize(normalizedSize);
+    ns.echoCaptionRenderer?.applySize(normalizedSize);
   }
 
   function shouldShowTranslatedTrackForVideo(video, videos = ns.video.getAllVideos()) {
@@ -114,17 +119,17 @@
     });
   }
 
-  function pickActiveTranslatedTrack() {
-    const trackEls = ns.video.querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]');
-    if (trackEls.length === 0) return null;
-    const videos = ns.video.getAllVideos();
+  function pickActiveTranslatedTrack(trackEls = null, videos = null) {
+    const tracks = trackEls || ns.video.querySelectorAllDeep(TRANSLATED_TRACK_SELECTOR);
+    if (tracks.length === 0) return null;
+    const allVideos = videos || ns.video.getAllVideos();
     let best = null;
-    for (const el of trackEls) {
+    for (const el of tracks) {
       const t = el.track;
       if (!t) continue;
-      const v = videos.find((x) => x.contains(el));
+      const v = allVideos.find((x) => x.contains(el));
       if (!v) continue;
-      if (!shouldShowTranslatedTrackForVideo(v, videos)) continue;
+      if (!shouldShowTranslatedTrackForVideo(v, allVideos)) continue;
       const rect = v.getBoundingClientRect();
       const area = Math.max(0, rect.width) * Math.max(0, rect.height);
       const visible = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0;
@@ -136,6 +141,16 @@
     return best?.track || null;
   }
 
+  function pruneNativeTrackStates(videos) {
+    if (!Array.isArray(videos)) return;
+    const liveVideos = new Set(videos);
+    for (const [video, state] of nativeTrackStates) {
+      if (liveVideos.has(video)) continue;
+      if (state.objectUrl) revokeObjectUrl(state.objectUrl);
+      nativeTrackStates.delete(video);
+    }
+  }
+
   function applySubtitleVisibility(enabled) {
     if (ns.playerCaptionRenderer?.isMounted()) {
       ns.playerCaptionRenderer.setVisible(enabled);
@@ -145,14 +160,23 @@
       ns.bilingualDomRenderer.setVisible(enabled);
       return;
     }
+    if (ns.echoCaptionRenderer?.isMounted()) {
+      ns.echoCaptionRenderer.setVisible(enabled);
+      return;
+    }
+    // The controller may keep a maintenance tick alive before translation is
+    // loaded.  There is no work to do until a render succeeds or a mount is
+    // pending, so avoid a deep video/track walk on every idle tick.
+    if (!lastTranslatedTrack && !pendingMount && !lastRenderedVtt && nativeTrackStates.size === 0) return;
     if (enabled) {
       ensureTrackOnPrimaryVideo();
     }
     const videos = ns.video.getAllVideos();
+    pruneNativeTrackStates(videos);
     if (videos.length === 0) return;
-    let activeTextTrack = pickActiveTranslatedTrack() || lastTranslatedTrack?.track || null;
+    const translatedEls = ns.video.querySelectorAllDeep(TRANSLATED_TRACK_SELECTOR);
+    let activeTextTrack = pickActiveTranslatedTrack(translatedEls, videos) || lastTranslatedTrack?.track || null;
     if (!activeTextTrack) {
-      const translatedEls = ns.video.querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]');
       const latest = translatedEls[translatedEls.length - 1];
       const latestVideo = latest ? videos.find((x) => x.contains(latest)) : null;
       activeTextTrack = latest && shouldShowTranslatedTrackForVideo(latestVideo, videos) ? latest.track : null;
@@ -164,17 +188,18 @@
         const isTranslatedTrack = (t.label || "").includes("翻译");
         if (enabled) {
           if (isTranslatedTrack) {
-            t.mode = activeTextTrack && t === activeTextTrack ? "showing" : "disabled";
+            const nextMode = activeTextTrack && t === activeTextTrack ? "showing" : "disabled";
+            if (t.mode !== nextMode) t.mode = nextMode;
           }
         } else if (isTranslatedTrack) {
-          t.mode = "disabled";
+          if (t.mode !== "disabled") t.mode = "disabled";
         } else {
           if (t.mode === "showing") hasNonTranslatedShowing = true;
           nonTranslatedCandidates.push(t);
         }
       }
       if (!enabled && !hasNonTranslatedShowing && nonTranslatedCandidates.length > 0) {
-        nonTranslatedCandidates[0].mode = "showing";
+        if (nonTranslatedCandidates[0].mode !== "showing") nonTranslatedCandidates[0].mode = "showing";
       }
     }
   }
@@ -185,6 +210,10 @@
     }
     if (ns.bilingualDomRenderer?.isMounted()) {
       ns.bilingualDomRenderer.ensureMounted();
+      return;
+    }
+    if (ns.echoCaptionRenderer?.isMounted()) {
+      ns.echoCaptionRenderer.ensureMounted();
       return;
     }
     if (pendingMount) {
@@ -224,9 +253,16 @@
   }
 
   function deactivateTranslatedRenderers() {
+    if (nativeVisibilitySyncTimer != null) {
+      clearTimeout(nativeVisibilitySyncTimer);
+      nativeVisibilitySyncTimer = null;
+    }
     ns.playerCaptionRenderer?.unmount();
+    ns.echoCaptionRenderer?.unmount();
     ns.bilingualDomRenderer?.unmount();
-    for (const video of ns.video.getAllVideos()) {
+    const videos = ns.video.getAllVideos();
+    pruneNativeTrackStates(videos);
+    for (const video of videos) {
       for (const track of video.textTracks) {
         if ((track.label || "").includes("翻译")) track.mode = "disabled";
       }
@@ -237,44 +273,67 @@
 
   function cleanupTranslatedTracks() {
     pendingMount = null;
+    if (nativeVisibilitySyncTimer != null) {
+      clearTimeout(nativeVisibilitySyncTimer);
+      nativeVisibilitySyncTimer = null;
+    }
     deactivateTranslatedRenderers();
     removeTranslatedTrackElements();
   }
 
   function removeTranslatedTrackElements() {
-    const tracks = ns.video.querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]');
+    const tracks = ns.video.querySelectorAllDeep(TRANSLATED_TRACK_SELECTOR);
     tracks.forEach((track) => track.remove());
     for (const state of nativeTrackStates.values()) {
-      if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
+      if (state.objectUrl) revokeObjectUrl(state.objectUrl);
     }
+    for (const pending of [...pendingObjectUrlRevocations.values()]) pending.revoke();
     nativeTrackStates.clear();
   }
 
   function hasRenderedTranslatedTrack() {
     if (ns.playerCaptionRenderer?.isMounted()) return true;
+    if (ns.echoCaptionRenderer?.isMounted()) return true;
     if (ns.bilingualDomRenderer?.isMounted()) return true;
-    return ns.video
-      .querySelectorAllDeep('track[data-echo360-translated="1"], track[label*="翻译字幕"]')
-      .some((track) => track.track?.mode === "showing");
+    if (lastTranslatedTrack?.track?.mode === "showing" && lastTranslatedTrack.isConnected !== false) return true;
+    for (const state of nativeTrackStates.values()) {
+      if (state.track?.isConnected && state.track.track?.mode === "showing") return true;
+    }
+    return ns.video.querySelectorAllDeep(TRANSLATED_TRACK_SELECTOR).some((track) => track.track?.mode === "showing");
   }
 
   function revokeWhenUnused(track, objectUrl) {
     if (!objectUrl) return;
     let revoked = false;
+    let timer = null;
     const revoke = () => {
       if (revoked) return;
       revoked = true;
+      if (timer != null) clearTimeout(timer);
+      track.removeEventListener("load", revoke);
+      pendingObjectUrlRevocations.delete(objectUrl);
       URL.revokeObjectURL(objectUrl);
     };
     track.addEventListener("load", revoke, { once: true });
-    setTimeout(revoke, 10_000);
+    timer = setTimeout(revoke, 10_000);
+    pendingObjectUrlRevocations.set(objectUrl, { revoke, timer });
+  }
+
+  function revokeObjectUrl(objectUrl) {
+    const pending = pendingObjectUrlRevocations.get(objectUrl);
+    if (pending) {
+      pending.revoke();
+      return;
+    }
+    URL.revokeObjectURL(objectUrl);
   }
 
   function getOrCreateNativeTrack(video) {
     let state = nativeTrackStates.get(video);
     if (state?.track?.isConnected && video.contains(state.track)) return state;
+    if (state?.objectUrl) revokeObjectUrl(state.objectUrl);
 
-    const existing = video.querySelector('track[data-echo360-translated="1"], track[label*="翻译字幕"]');
+    const existing = video.querySelector(TRANSLATED_TRACK_SELECTOR);
     const track = existing || document.createElement("track");
     state = { track, payload: "", objectUrl: "" };
     nativeTrackStates.set(video, state);
@@ -297,6 +356,22 @@
     };
     lastRenderSourceMeta = sourceMeta;
     lastRenderedVideo = video;
+  }
+
+  function scheduleNativeVisibilitySync(track) {
+    if (nativeVisibilitySyncTimer != null) clearTimeout(nativeVisibilitySyncTimer);
+    nativeVisibilitySyncTimer = setTimeout(() => {
+      nativeVisibilitySyncTimer = null;
+      if (lastTranslatedTrack !== track || ns.bilingualDomRenderer?.isMounted()) return;
+      ns.storage.getPrefs().then((prefs) => {
+        if (lastTranslatedTrack !== track || !prefs.useNativeSubtitles) return;
+        if (track.track) {
+          const nextMode = prefs.enabled === false ? "disabled" : "showing";
+          if (track.track.mode !== nextMode) track.track.mode = nextMode;
+        }
+        applySubtitleVisibility(prefs.enabled !== false);
+      });
+    }, 0);
   }
 
   function renderTranslatedTrack(
@@ -360,9 +435,11 @@
         size,
       })
       : normalizedTranslated;
-    const payload = ns.vtt.applyCueBottom(rawPayload, size);
+    const bottomAlignedPayload = ns.vtt.applyCueBottom(rawPayload, size);
+    const payload = bottomAlignedPayload;
 
     const customCaptionMode = ns.playerCaptionRenderer?.isSupportedVideo?.(video) === true;
+    const echoCaptionMode = ns.echoCaptionRenderer?.isSupportedVideo?.(video) === true;
     const nativeDomMode = bilingual && !useNativeSubtitles;
     if (!incremental) {
       deactivateTranslatedRenderers();
@@ -421,6 +498,55 @@
       // after initialization. Keep the mount pending so periodic sync can
       // retry after a SPA/player-root transition, and never report a false
       // success for subtitles that cannot be seen.
+      pendingMount = {
+        translatedVtt,
+        originalVtt,
+        bilingual: !!bilingual,
+        size: size || DEFAULT_SUBTITLE_SIZE,
+        reverseOrder: !!reverseOrder,
+        sourceMeta: resolvedSourceMeta,
+        useNativeSubtitles: !!useNativeSubtitles,
+        browserBilingual: !!fallbackBilingual,
+        browserReverseOrder: !!fallbackReverseOrder,
+      };
+      return false;
+    }
+
+    // Echo360 paints the original English subtitle as a normal DOM node in
+    // #player rather than as a second TextTrack. A browser <track> cannot
+    // share that node's geometry, which is why a line:-2 tweak leaves the two
+    // subtitles in the wrong order. Use one player-local overlay and measure
+    // the actual English node on every cue/interaction/layout change.
+    if (echoCaptionMode) {
+      if (incremental && ns.echoCaptionRenderer.isMounted()) {
+        if (ns.echoCaptionRenderer.update({
+          video,
+          originalVtt,
+          translatedVtt: normalizedTranslated,
+          size,
+          bilingual: !!fallbackBilingual,
+          reverseOrder: fallbackReverseOrder,
+        })) {
+          lastTranslatedTrack = { mode: "echo-caption" };
+          commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+          return true;
+        }
+        ns.echoCaptionRenderer.unmount();
+      }
+      removeTranslatedTrackElements();
+      const mounted = ns.echoCaptionRenderer.mount({
+        video,
+        originalVtt,
+        translatedVtt: normalizedTranslated,
+        size,
+        bilingual: !!fallbackBilingual,
+        reverseOrder: fallbackReverseOrder,
+      });
+      if (mounted) {
+        lastTranslatedTrack = { mode: "echo-caption" };
+        commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
+        return true;
+      }
       pendingMount = {
         translatedVtt,
         originalVtt,
@@ -527,14 +653,7 @@
     lastTranslatedTrack = track;
     if (track.track) track.track.mode = "showing";
     commitRenderState({ translatedVtt: normalizedTranslated, originalVtt, bilingual, size, reverseOrder, useNativeSubtitles, browserBilingual: fallbackBilingual, browserReverseOrder: fallbackReverseOrder, sourceMeta: resolvedSourceMeta, video });
-    setTimeout(() => {
-      if (lastTranslatedTrack !== track || ns.bilingualDomRenderer?.isMounted()) return;
-      ns.storage.getPrefs().then((prefs) => {
-        if (lastTranslatedTrack !== track || !prefs.useNativeSubtitles) return;
-        if (track.track) track.track.mode = prefs.enabled === false ? "disabled" : "showing";
-        applySubtitleVisibility(prefs.enabled !== false);
-      });
-    }, 0);
+    scheduleNativeVisibilitySync(track);
     return true;
   }
 

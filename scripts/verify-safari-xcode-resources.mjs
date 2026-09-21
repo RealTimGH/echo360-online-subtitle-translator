@@ -76,11 +76,16 @@ function verifyStoreBuild() {
 
   const sourceFiles = relativeFiles(sourceExtensionRoot);
   const builtFiles = relativeFiles(storeExtensionRoot);
-  const missing = sourceFiles.filter((name) => !builtFiles.includes(name));
-  const extra = builtFiles.filter((name) => !sourceFiles.includes(name));
+  // Resource trees can grow well beyond the current extension size. Use sets
+  // for membership checks so validation remains linear in the number of files
+  // instead of rescanning the opposing sorted list for every entry.
+  const sourceFileSet = new Set(sourceFiles);
+  const builtFileSet = new Set(builtFiles);
+  const missing = sourceFiles.filter((name) => !builtFileSet.has(name));
+  const extra = builtFiles.filter((name) => !sourceFileSet.has(name));
   const stale = sourceFiles.filter((name) => {
     const builtPath = path.join(storeExtensionRoot, name);
-    return fs.existsSync(builtPath) && !expectedStoreContent(name).equals(fs.readFileSync(builtPath));
+    return builtFileSet.has(name) && !expectedStoreContent(name).equals(fs.readFileSync(builtPath));
   });
 
   if (missing.length || extra.length || stale.length) {

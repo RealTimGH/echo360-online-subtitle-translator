@@ -50,6 +50,8 @@ describe("fetchTranscriptFileVtt", () => {
     const result = await sourceFinder.fetchTranscriptFileVtt(null);
     expect(result.text).toBe("");
     expect(result.strongMapped).toBe(false);
+    expect(videoMock.getAllVideos).not.toHaveBeenCalled();
+    expect(videoMock.collectInteractiveMediaIdsFromResources).not.toHaveBeenCalled();
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
@@ -80,6 +82,50 @@ describe("fetchTranscriptFileVtt", () => {
     );
     expect(result).toMatchObject({ ok: false, code: "SOURCE_RESOLUTION_TIMEOUT" });
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("coalesces repeated candidate reads within a resolution but refreshes the next resolution", async () => {
+    setLocation("/lesson/abc/classroom");
+    global.fetch.mockResolvedValue({ ok: true, text: async () => VTT });
+    const options = { resourceRequests: new Map() };
+    const url = "https://echo360.net.au/captions/source.vtt";
+    const results = await Promise.all([
+      sourceFinder.fetchTextResource(url, options),
+      sourceFinder.fetchTextResource(url, options),
+    ]);
+    expect(results.every((result) => result.ok && result.text === VTT)).toBe(true);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    await sourceFinder.fetchTextResource(url, { resourceRequests: new Map() });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("briefly backs off missing resources while allowing newly available captions to be retried", async () => {
+    setLocation("/lesson/abc/classroom");
+    global.fetch.mockResolvedValue({ ok: false, status: 404 });
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    try {
+      const options = { resourceRequests: new Map() };
+      const url = "https://echo360.net.au/captions/source.vtt";
+      await sourceFinder.fetchTextResource(url, options);
+      await sourceFinder.fetchTextResource(url, options);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      now.mockReturnValue(3001);
+      global.fetch.mockResolvedValue({ ok: true, text: async () => VTT });
+      expect((await sourceFinder.fetchTextResource(url, options)).text).toBe(VTT);
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    } finally { now.mockRestore(); }
+  });
+
+  it("bounds discovery cache entries and retained response text", async () => {
+    setLocation("/lesson/abc/classroom");
+    global.fetch.mockResolvedValue({ ok: true, text: async () => "x".repeat(1024 * 1024) });
+    const options = { resourceRequests: new Map() };
+    for (let i = 0; i < 40; i += 1) {
+      await sourceFinder.fetchTextResource(`https://echo360.net.au/captions/${i}.vtt`, options);
+    }
+    expect(options.resourceRequests.size).toBeLessThanOrEqual(32);
+    const chars = [...options.resourceRequests.values()].reduce((sum, entry) => sum + entry.chars, 0);
+    expect(chars).toBeLessThanOrEqual(8 * 1024 * 1024);
   });
 
   it("returns empty (and never fetches) when no media id can be discovered", async () => {
@@ -186,6 +232,8 @@ describe("fetchTranscriptFileVtt", () => {
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(global.fetch.mock.calls[0][0]).toContain("/medias/good-id/");
+    expect(videoMock.getVideoHintMediaIds).not.toHaveBeenCalled();
+    expect(videoMock.getAllVideos).not.toHaveBeenCalled();
   });
 
   it("drops video-hint ids that are just fragments of the lesson id", async () => {

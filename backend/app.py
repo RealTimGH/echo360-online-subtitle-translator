@@ -29,10 +29,20 @@ from pydantic import BaseModel, Field
 
 CACHE_DIR = Path(os.getenv("ECHO360_CACHE_DIR", str(Path(__file__).resolve().parent / ".cache")))
 CACHE_SCHEMA_VERSION = 2
+# A translation cache is an optimization and must not become an unbounded
+# local data store.  Keep the defaults conservative for a desktop app while
+# allowing packagers/tests to tune them without changing the cache format.
+CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+CACHE_MAX_FILES = 256
+CACHE_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_TRANSLATOR_SCRIPT = Path(__file__).resolve().parent.parent / "translator" / "translate_vtt_zh_deepl_native.py"
 TRANSLATOR_SCRIPT = Path(os.getenv("TRANSLATOR_SCRIPT", str(DEFAULT_TRANSLATOR_SCRIPT)))
 JOB_TTL_SECONDS = 60 * 60
 JOB_MAX_COUNT = 100
+# Completed async jobs retain their result until the client observes it or the
+# normal TTL expires. Bound aggregate retained string memory as well so many
+# 64 MiB results cannot accumulate into gigabytes between polls.
+JOB_MAX_RESULT_BYTES = 256 * 1024 * 1024
 JOB_MAX_ACTIVE_COUNT = 4
 MAX_VTT_CHARS = 5_000_000
 MAX_TRANSLATOR_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -80,7 +90,7 @@ CORS_ORIGIN_PATTERN = (
 WEB_PROVIDER_LIMITS = {
     # The undocumented Google Web endpoint gets one shared conservative
     # profile; max_paragraphs=1 remains an incremental-display choice.
-    "google-web": {"concurrency": 3, "rps": 3.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
+    "google-web": {"concurrency": 3, "rps": 6.0, "max_chars": 1200, "max_paragraphs": 1, "timeout": 15.0},
     # Argos runs in the translator subprocess and uses English as the source.
     # A single worker avoids loading/contending on the same CTranslate2 model
     # from multiple Python threads.
@@ -827,6 +837,49 @@ def build_cache_key(vtt_text: str, req: TranslateRequest) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def cleanup_translation_cache(now: float | None = None) -> None:
+    """Prune stale/old translation artifacts so the cache has a disk budget."""
+    try:
+        entries = []
+        for path in CACHE_DIR.iterdir():
+            if not path.is_file() or path.suffix.lower() != ".vtt" or path.name.startswith("."):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((path, int(stat.st_size), float(stat.st_mtime)))
+    except OSError:
+        return
+
+    if not entries:
+        return
+    current_time = time.time() if now is None else float(now)
+    retained: list[tuple[Path, int, float]] = []
+    for path, size, mtime in entries:
+        if current_time - mtime > CACHE_TTL_SECONDS:
+            try:
+                path.unlink()
+            except OSError:
+                retained.append((path, size, mtime))
+        else:
+            retained.append((path, size, mtime))
+
+    total_bytes = sum(size for _, size, _ in retained)
+    overflow = max(0, len(retained) - CACHE_MAX_FILES)
+    # mtime is refreshed on successful cache hits, making it a practical LRU
+    # approximation even on systems where atime updates are disabled.
+    for path, size, _mtime in sorted(retained, key=lambda item: item[2]):
+        if overflow <= 0 and total_bytes <= CACHE_MAX_BYTES:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        overflow = max(0, overflow - 1)
+        total_bytes -= size
+
+
 TIMING_LINE_RE = re.compile(
     r"^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*"
     r"((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$"
@@ -860,11 +913,7 @@ def parse_vtt_timing_line(line: str) -> tuple[int, int] | None:
 
 
 def timed_cue_count(text: str) -> int:
-    return sum(
-        1
-        for line in str(text or "").replace("\r", "").split("\n")
-        if parse_vtt_timing_line(line) is not None
-    )
+    return _scan_timed_cues(text)[1]
 
 
 def timed_cue_ranges(text: str) -> list[tuple[int, int]]:
@@ -889,7 +938,7 @@ def translatable_line_count(text: str) -> int:
     # line would include cue identifiers and header metadata, which makes the
     # subprocess, backend and extension disagree about `total` and can create
     # a false INCOMPLETE_TRANSLATED_VTT error.
-    return len(timed_cue_text_entries(text))
+    return _scan_timed_cues(text)[2]
 
 
 def is_translatable_vtt_line(raw_line: str) -> bool:
@@ -912,20 +961,66 @@ def timed_cue_text_entries(text: str) -> list[dict]:
     an entire multi-line cue and accidentally accepting an untranslated
     sibling line.
     """
+    return _scan_timed_cues(text, collect_entries=True)[0]
+
+
+def _scan_timed_cues(
+    text: object,
+    *,
+    collect_entries: bool = False,
+) -> tuple[list[dict], int, int, int]:
+    """Scan cue boundaries once without allocating suffix slices per cue.
+
+    The previous implementation walked ``lines[index + 1:]`` for each cue in
+    ``has_timed_cue_text`` and ``timed_cue_text_entries``.  A large track with
+    missing blank separators could therefore create O(n²) temporary lists and
+    repeated timestamp parses.  This state machine preserves the existing VTT
+    rules while keeping the scan O(n) in both CPU and temporary memory.
+
+    Returns ``(entries, cue_count, text_line_count, cues_with_text)``.  The
+    entry list is only populated for callers that need physical line mapping.
+    """
     lines = str(text or "").replace("\r", "").split("\n")
     entries: list[dict] = []
+    cue_count = 0
+    text_line_count = 0
+    cues_with_text = 0
     cue = 0
+    in_cue = False
+    cue_has_text = False
+
+    def finish_cue() -> None:
+        nonlocal cues_with_text, cue_has_text
+        if in_cue and cue_has_text:
+            cues_with_text += 1
+
     for index, raw_line in enumerate(lines):
-        if parse_vtt_timing_line(raw_line) is None:
+        timing = parse_vtt_timing_line(raw_line)
+        if timing is not None:
+            # A new timing line also terminates a malformed cue that omitted a
+            # blank separator, matching the old inner-loop break behavior.
+            finish_cue()
+            cue_count += 1
+            cue += 1
+            in_cue = True
+            cue_has_text = False
             continue
-        cue += 1
-        for next_index in range(index + 1, len(lines)):
-            cue_line = lines[next_index]
-            if not cue_line.strip() or parse_vtt_timing_line(cue_line) is not None:
-                break
-            if is_translatable_vtt_line(cue_line):
-                entries.append({"cue": cue, "line": next_index + 1, "text": cue_line})
-    return entries
+        if not in_cue:
+            continue
+        if not raw_line.strip():
+            finish_cue()
+            in_cue = False
+            cue_has_text = False
+            continue
+        # Timing lines have already been handled above.  Every other nonblank
+        # line after a timing line is caption text, including words such as
+        # NOTE/STYLE/REGION that are spoken inside a cue.
+        cue_has_text = True
+        text_line_count += 1
+        if collect_entries:
+            entries.append({"cue": cue, "line": index + 1, "text": raw_line})
+    finish_cue()
+    return entries, cue_count, text_line_count, cues_with_text
 
 
 def inspect_probable_bilingual_source(text: str, minimum_cues: int = 3, minimum_ratio: float = 0.6) -> dict:
@@ -937,52 +1032,65 @@ def inspect_probable_bilingual_source(text: str, minimum_cues: int = 3, minimum_
     own bilingual renderer. Ordinary single-language cues and isolated
     multilingual phrases remain valid.
     """
-    entries = timed_cue_text_entries(text)
-    by_cue: dict[int, list[str]] = {}
-    for entry in entries:
-        by_cue.setdefault(entry["cue"], []).append(str(entry.get("text") or ""))
+    lines = str(text or "").replace("\r", "").split("\n")
     mixed_cues = 0
-    for lines in by_cue.values():
-        non_empty = [line.strip() for line in lines if line.strip()]
-        has_cjk_line = any(has_cjk_text(line) for line in non_empty)
-        has_non_cjk_line = any(not has_cjk_text(line) for line in non_empty)
-        if len(non_empty) >= 2 and has_cjk_line and has_non_cjk_line:
+    multiline_cues = 0
+    cue_count = 0
+    text_line_count = 0
+    in_cue = False
+    cue_line_count = 0
+    cue_has_cjk = False
+    cue_has_non_cjk = False
+
+    def finish_cue() -> None:
+        nonlocal mixed_cues, multiline_cues, cue_line_count
+        if not in_cue:
+            return
+        if cue_line_count > 1:
+            multiline_cues += 1
+        if cue_line_count >= 2 and cue_has_cjk and cue_has_non_cjk:
             mixed_cues += 1
-    cue_count = timed_cue_count(text)
-    multiline_cues = sum(
-        1 for lines in by_cue.values()
-        if len([line for line in lines if line.strip()]) > 1
-    )
+
+    for raw_line in lines:
+        timing = parse_vtt_timing_line(raw_line)
+        if timing is not None:
+            finish_cue()
+            cue_count += 1
+            in_cue = True
+            cue_line_count = 0
+            cue_has_cjk = False
+            cue_has_non_cjk = False
+            continue
+        if not in_cue:
+            continue
+        if not raw_line.strip():
+            finish_cue()
+            in_cue = False
+            cue_line_count = 0
+            cue_has_cjk = False
+            cue_has_non_cjk = False
+            continue
+        cue_line_count += 1
+        text_line_count += 1
+        if has_cjk_text(raw_line):
+            cue_has_cjk = True
+        else:
+            cue_has_non_cjk = True
+    finish_cue()
     ratio = mixed_cues / cue_count if cue_count else 0.0
     return {
         "probable": cue_count >= minimum_cues and mixed_cues >= minimum_cues and ratio >= minimum_ratio,
         "cueCount": cue_count,
         "mixedCueCount": mixed_cues,
         "multilineCueCount": multiline_cues,
-        "textLineCount": len(entries),
+        "textLineCount": text_line_count,
         "ratio": ratio,
     }
 
 
 def has_timed_cue_text(text: str) -> bool:
     """Return whether every timed cue contains actual caption text."""
-    lines = str(text or "").replace("\r", "").split("\n")
-    cue_count = 0
-    cue_with_text = 0
-    for index, raw_line in enumerate(lines):
-        if not parse_vtt_timing_line(raw_line):
-            continue
-        cue_count += 1
-        has_text = False
-        for cue_line in lines[index + 1 :]:
-            if not cue_line.strip():
-                break
-            if parse_vtt_timing_line(cue_line):
-                break
-            has_text = True
-            break
-        if has_text:
-            cue_with_text += 1
+    _, cue_count, _, cue_with_text = _scan_timed_cues(text)
     return cue_count > 0 and cue_with_text == cue_count
 
 
@@ -1632,13 +1740,27 @@ def run_translation(
     except OSError as exc:
         logger.exception("could not create translation cache directory=%s", CACHE_DIR)
         raise_problem(500, "CACHE_WRITE_FAILED", "无法创建翻译缓存目录；翻译尚未开始", phase="cache")
+    cleanup_translation_cache()
     cache_file = CACHE_DIR / f"{cache_key}.vtt"
     if cache_file.exists() and not force_refresh:
         try:
-            cached_text = cache_file.read_text(encoding="utf-8")
+            # A stale or externally-created cache artifact must not bypass the
+            # same output bound enforced for translator results. Check the
+            # metadata before allocating a potentially huge decoded string.
+            if cache_file.stat().st_size > MAX_TRANSLATOR_OUTPUT_BYTES:
+                warnings.append("CACHE_INVALID_IGNORED: 本地缓存超过大小上限，已忽略并重新翻译")
+                logger.warning("ignoring oversized translation cache file=%s", cache_file)
+                cached_text = None
+            else:
+                cached_text = cache_file.read_text(encoding="utf-8")
             source_line_count = translatable_line_count(vtt_text)
-            cached_line_count = translatable_line_count(cached_text)
+            cached_line_count = (
+                translatable_line_count(cached_text)
+                if cached_text is not None
+                else 0
+            )
             if (
+                cached_text is not None and
                 is_valid_timed_vtt(cached_text) and
                 has_timed_cue_text(cached_text) and
                 timed_cue_ranges(cached_text) == timed_cue_ranges(vtt_text) and
@@ -1667,8 +1789,13 @@ def run_translation(
                     "targetResults": total_lines if target_code in CJK_TARGET_CODES else None,
                     "provider": provider_name,
                 }
+                try:
+                    os.utime(cache_file, None)
+                except OSError:
+                    pass
                 return cached_text, warnings, True, metrics
-            warnings.append("CACHE_INVALID_IGNORED: 本地缓存与当前字幕/目标语言不匹配，或不是有效的带时间轴 WebVTT，已忽略并重新翻译")
+            if cached_text is not None:
+                warnings.append("CACHE_INVALID_IGNORED: 本地缓存与当前字幕/目标语言不匹配，或不是有效的带时间轴 WebVTT，已忽略并重新翻译")
             logger.warning("ignoring invalid translation cache file=%s", cache_file)
         except OSError as exc:
             warnings.append("CACHE_READ_FAILED: 无法读取本地缓存，已忽略并重新翻译")
@@ -2072,6 +2199,7 @@ def run_translation(
             "target_results": target_results,
             "targetResults": target_results,
             "failed_items": failed_items,
+            "failed_cues": metrics.get("failed_cues") if isinstance(metrics.get("failed_cues"), list) else [],
             "failure_codes": failure_codes,
             "failureCodes": failure_codes,
         })
@@ -2185,6 +2313,7 @@ def run_translation(
                         temporary_cache.unlink()
                     except OSError:
                         pass
+                cleanup_translation_cache()
             except OSError as exc:
                 warnings.append("CACHE_WRITE_FAILED: 翻译结果有效，但本地缓存保存失败")
                 logger.warning("translation succeeded but cache write failed file=%s: %s", cache_file, exc)
@@ -2210,6 +2339,42 @@ def cleanup_jobs_locked(now: int | None = None) -> None:
         )
     )
     for _, job_id in completed[:overflow]:
+        _jobs.pop(job_id, None)
+
+
+def _job_result_memory(job: dict) -> int:
+    """Approximate retained string memory for one terminal async job."""
+    total = 0
+    partial_vtt = job.get("partial_vtt")
+    if isinstance(partial_vtt, str):
+        total += sys.getsizeof(partial_vtt)
+    result = job.get("result")
+    if isinstance(result, dict):
+        translated_vtt = result.get("translated_vtt")
+        if isinstance(translated_vtt, str):
+            total += sys.getsizeof(translated_vtt)
+    return total
+
+
+def trim_completed_job_memory_locked(protected_job_id: str | None = None) -> None:
+    """Evict oldest terminal jobs once retained result strings exceed budget."""
+    terminal = [
+        (job_id, job)
+        for job_id, job in _jobs.items()
+        if job.get("status") in {"completed", "failed"}
+    ]
+    total = sum(_job_result_memory(job) for _, job in terminal)
+    if total <= JOB_MAX_RESULT_BYTES:
+        return
+    for job_id, job in sorted(
+        terminal,
+        key=lambda item: int(item[1].get("updated_at", 0)),
+    ):
+        if total <= JOB_MAX_RESULT_BYTES:
+            break
+        if job_id == protected_job_id:
+            continue
+        total -= _job_result_memory(job)
         _jobs.pop(job_id, None)
 
 
@@ -2256,7 +2421,9 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             job["status"] = "running"
             job["progress"] = {"current": current, "total": total, "line": line}
             if partial_vtt:
-                job["partial_vtt"] = partial_vtt
+                if partial_vtt != job.get("partial_vtt"):
+                    job["partial_vtt"] = partial_vtt
+                    job["partial_revision"] = int(job.get("partial_revision", 0)) + 1
             job["updated_at"] = int(time.time())
         logger.info("[job %s] progress current=%s total=%s", job_id, current, total)
 
@@ -2281,17 +2448,25 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             if not job:
                 return
             job["status"] = "completed"
+            # The final result supersedes the last progress snapshot. Release
+            # that duplicate string before enforcing the terminal-job budget.
+            job["partial_vtt"] = ""
             job["result"] = {
                 "translated_vtt": translated_vtt,
                 "warnings": warnings,
                 "metrics": metrics,
                 "cache_hit": cache_hit,
+                "failed_items": metrics.get("failed_items") or [],
+                "failed_cues": metrics.get("failed_cues") or [],
+                "failure_codes": metrics.get("failureCodes") or metrics.get("failure_codes") or {},
             }
             job["metrics"] = metrics
             job["warnings"] = warnings
             job["failed_items"] = metrics.get("failed_items") or []
+            job["failed_cues"] = metrics.get("failed_cues") or []
             job["failure_codes"] = metrics.get("failureCodes") or {}
             job["updated_at"] = int(time.time())
+            trim_completed_job_memory_locked(protected_job_id=job_id)
         logger.info(
             "[job %s] completed cache_hit=%s warnings=%s",
             job_id,
@@ -2321,6 +2496,7 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             job["failed_items"] = problem.get("failed_items") or job.get("failed_items", [])
             job["warnings"] = problem.get("warnings") or job.get("warnings", [])
             job["updated_at"] = int(time.time())
+            trim_completed_job_memory_locked(protected_job_id=job_id)
         logger.error(
             "[job %s] failed code=%s status=%s message=%s",
             job_id,
@@ -2367,6 +2543,7 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
                 "stage": "preparing",
             },
             "partial_vtt": "",
+            "partial_revision": 0,
             "result": None,
             "error": "",
             "error_code": "",
@@ -2412,7 +2589,7 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
 
 
 @app.get("/translate-async/{job_id}")
-def translate_async_status(job_id: str) -> dict:
+def translate_async_status(job_id: str, since_partial_revision: Optional[int] = None) -> dict:
     with _jobs_lock:
         cleanup_jobs_locked()
         job = _jobs.get(job_id)
@@ -2420,5 +2597,13 @@ def translate_async_status(job_id: str) -> dict:
             raise_problem(404, "JOB_NOT_FOUND", "后台翻译任务不存在或已被清理", phase="backend", retryable=False)
         # FastAPI serializes after this function returns. Return an isolated
         # snapshot so the worker cannot mutate nested progress/result objects
-        # while the response encoder is iterating over them.
+        # while the response encoder is iterating over them. A polling client
+        # may pass the last partial revision; omit an unchanged multi-megabyte
+        # progress VTT from that response while retaining the legacy shape for
+        # callers that do not send the optional query parameter.
+        current_partial_revision = int(job.get("partial_revision", 0))
+        if since_partial_revision is not None and since_partial_revision == current_partial_revision:
+            snapshot = dict(job)
+            snapshot.pop("partial_vtt", None)
+            return copy.deepcopy(snapshot)
         return copy.deepcopy(job)

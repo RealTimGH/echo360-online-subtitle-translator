@@ -22,6 +22,8 @@
   const PACKAGE_TYPE = "echo360_manual_translation";
   const RESULT_TYPE = "echo360_manual_translation_result";
   const BUNDLE_PACKAGE_TYPE = "echo360_manual_translation_bundle";
+  const recordIndexMaps = new WeakMap();
+  const progressWriteStates = new WeakMap();
   const ENTITY_RE = /&(?:[a-z][a-z0-9]+|#\d+|#x[a-f0-9]+);/giu;
   const LITERAL_RE = /https?:\/\/[^\s<]+|www\.[^\s<]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|`[^`\n]+`|[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]+|(^|[\s([{"'])((?:(?:\.\.?\/)|\/)[\w.@~+%-]*[\w@~+%-](?:\/[\w.@~+%-]*[\w@~+%-])+|--?[a-z][\w-]*\b)/gimu;
   const VTT_TIMING_LINE = /^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$/;
@@ -343,13 +345,14 @@
       chunkFiles.length,
       Math.max(1, Number(requestedWorkerCount) || 1),
     );
+    const chunkIndexByPath = new Map(chunkFiles.map((path, index) => [path, index]));
     return Array.from({ length: workerCount }, (_, index) => {
       const start = Math.floor(index * chunkFiles.length / workerCount);
       const end = Math.floor((index + 1) * chunkFiles.length / workerCount);
       const chunkPaths = chunkFiles.slice(start, end);
       const resultPaths = resultFiles.slice(start, end);
       const expectedCueCount = chunkPaths.reduce((total, path) => {
-        const chunkIndex = chunkFiles.indexOf(path);
+        const chunkIndex = chunkIndexByPath.get(path);
         return total + (Number(chunkCueCounts[chunkIndex]) || 0);
       }, 0);
       return {
@@ -363,13 +366,35 @@
     });
   }
 
-  function currentPackage(workflow) {
+  function recordIndexMap(records) {
+    if (!Array.isArray(records)) return new Map();
+    const cached = recordIndexMaps.get(records);
+    if (cached) return cached;
+    const indexById = new Map();
+    records.forEach((record, index) => {
+      if (record?.id != null && !indexById.has(record.id)) indexById.set(record.id, index);
+    });
+    recordIndexMaps.set(records, indexById);
+    return indexById;
+  }
+
+  function currentPart(workflow) {
     const partIndex = workflow.parts.findIndex((ids) => ids.some((id) => !Object.hasOwn(workflow.accepted, id)));
     if (partIndex < 0) return null;
-    const ids = workflow.parts[partIndex].filter((id) => !Object.hasOwn(workflow.accepted, id));
+    return {
+      partIndex,
+      ids: workflow.parts[partIndex].filter((id) => !Object.hasOwn(workflow.accepted, id)),
+    };
+  }
+
+  function currentPackage(workflow) {
+    const current = currentPart(workflow);
+    if (!current) return null;
+    const { partIndex, ids } = current;
     const selected = new Set(ids);
-    const first = workflow.records.findIndex((record) => record.id === ids[0]);
-    const last = workflow.records.findIndex((record) => record.id === ids[ids.length - 1]);
+    const indexes = recordIndexMap(workflow.records);
+    const first = indexes.get(ids[0]);
+    const last = indexes.get(ids[ids.length - 1]);
     const join = (records) => records.map((record, index) => record.source + (sentenceEnd(record, records[index + 1]) ? "\n" : " ")).join("").trim();
     const bounded = (records, backwards = false) => {
       const selected = [];
@@ -403,15 +428,21 @@
 
   function workflowProgress(workflow) {
     const completed = Object.keys(workflow.accepted).length;
-    const current = currentPackage(workflow);
-    return { completed, total: workflow.records.length, part: current?.part || `${workflow.parts.length}/${workflow.parts.length}`, complete: !current };
+    const current = currentPart(workflow);
+    return {
+      completed,
+      total: workflow.records.length,
+      part: current ? `${current.partIndex + 1}/${workflow.parts.length}` : `${workflow.parts.length}/${workflow.parts.length}`,
+      complete: !current,
+    };
   }
 
   function filePackageContext(workflow, records) {
     const context = {};
+    const indexes = recordIndexMap(workflow.records);
     for (const record of records) {
-      const index = workflow.records.indexOf(record);
-      if (index < 0) continue;
+      const index = indexes.get(record.id);
+      if (index == null) continue;
       const before = boundedContext(workflow.records.slice(Math.max(0, index - 4), index), true);
       const after = boundedContext(workflow.records.slice(index + 1, index + 5));
       if (before) context[`${record.id}:before`] = before;
@@ -511,8 +542,9 @@
   }
 
   function createWorkerChunk(workflow, translationPackage, records, index, total) {
-    const first = workflow.records.indexOf(records[0]);
-    const last = workflow.records.indexOf(records[records.length - 1]);
+    const indexes = recordIndexMap(workflow.records);
+    const first = indexes.get(records[0]?.id);
+    const last = indexes.get(records[records.length - 1]?.id);
     const beforeRecords = workflow.records.slice(Math.max(0, first - 4), first);
     const afterRecords = workflow.records.slice(last + 1, last + 5);
     const previousTranslations = beforeRecords
@@ -1282,7 +1314,15 @@ else:
   async function saveProgress(workflow, storage = root.Echo360Translator?.browserApi?.storage?.local, metadata = {}) {
     if (!storage?.set) return false;
     // One latest course only: bounded storage, no ever-growing course archive.
-    const entry = { sessionId: workflow.sessionId, accepted: workflow.accepted, savedAt: Date.now() };
+    // Snapshot accepted text before entering the serialized write queue. The
+    // workflow object is mutated as workers finish; retaining its live object
+    // here could make an older checkpoint write the newer state (or make two
+    // queued writes serialize the same final snapshot).
+    const entry = {
+      sessionId: workflow.sessionId,
+      accepted: { ...(workflow.accepted || {}) },
+      savedAt: Date.now(),
+    };
     const partialCache = metadata?.partialCache;
     if (partialCache && typeof partialCache === "object") {
       entry.partialCache = {
@@ -1300,8 +1340,41 @@ else:
         reason: String(partialCache.reason || "").slice(0, 80),
       };
     }
-    await storage.set({ [PROGRESS_KEY]: entry });
-    return true;
+    // Do not rewrite the same checkpoint on every progress callback. Keep the
+    // signature independent of savedAt so a duplicate call can share an
+    // in-flight write and avoid another storage.local serialization.
+    const signature = JSON.stringify({
+      sessionId: entry.sessionId,
+      accepted: entry.accepted,
+      partialCache: entry.partialCache || null,
+    });
+    const previous = progressWriteStates.get(storage);
+    if (previous?.signature === signature) {
+      if (previous.promise) await previous.promise;
+      return true;
+    }
+    const previousPromise = previous?.promise || Promise.resolve();
+    let writePromise;
+    writePromise = previousPromise.catch(() => {}).then(async () => {
+      await storage.set({ [PROGRESS_KEY]: entry });
+      const current = progressWriteStates.get(storage);
+      if (current?.promise === writePromise) {
+        // Keep only the in-flight coalescer. Another extension context may
+        // overwrite or remove the checkpoint after this promise settles, so a
+        // process-lifetime "last signature" cache could silently skip a
+        // needed persistence attempt.
+        progressWriteStates.delete(storage);
+      }
+      return true;
+    });
+    progressWriteStates.set(storage, { signature, promise: writePromise });
+    try {
+      return await writePromise;
+    } catch (error) {
+      const current = progressWriteStates.get(storage);
+      if (current?.promise === writePromise) progressWriteStates.delete(storage);
+      throw error;
+    }
   }
 
   async function restoreProgress(workflow, storage = root.Echo360Translator?.browserApi?.storage?.local) {
@@ -1354,11 +1427,20 @@ else:
 
   function rebuildVtt(sourceVtt, records, translations) {
     const lines = normalizeVttText(sourceVtt).split("\n");
-    for (let index = records.length - 1; index >= 0; index -= 1) {
-      const record = records[index];
-      lines.splice(record.textStart, record.textEnd - record.textStart, ...String(translations.get(record.id) || "").split("\n"));
+    const rebuilt = [];
+    const append = (segment) => {
+      for (const line of segment) rebuilt.push(line);
+    };
+    let cursor = 0;
+    for (const record of records) {
+      const start = Math.max(cursor, Number(record.textStart) || cursor);
+      const end = Math.max(start, Number(record.textEnd) || start);
+      append(lines.slice(cursor, start));
+      append(String(translations.get(record.id) || "").split("\n"));
+      cursor = Math.min(lines.length, end);
     }
-    return lines.join("\n");
+    append(lines.slice(cursor));
+    return rebuilt.join("\n");
   }
 
   function validateImportedJson(value, translationPackage, sourceVtt, { vtt } = {}) {

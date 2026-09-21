@@ -239,8 +239,15 @@
     // looks very different from "too many scan attempts" (high rvfcFrameCount
     // vs rvfcRenderCount, or many scanCount entries within one cue's grace
     // period) and needs a different fix.
+    // Cache text-matching candidates, including currently hidden ones. A
+    // frame can then notice CSS visibility changes without rescanning every
+    // player element. Text/tree mutations and cue changes invalidate the list.
+    const cached = state.nativeCandidateCache?.cueIndex === hintIndex
+      ? state.nativeCandidateCache : null;
     const scanStart = performance.now();
-    const elements = Array.from(state.player.querySelectorAll("*"));
+    const elements = cached?.elements || Array.from(state.player.querySelectorAll("*"));
+    if (cached && elements.length === 0) return null;
+    const candidates = [];
     const playerRect = state.player.getBoundingClientRect();
     let best = null;
 
@@ -265,7 +272,8 @@
         return elementTextWithoutInjectedLine(child).includes(matchedProbe);
       });
       if (childMatch) continue;
-      if (!isVisibleInPlayer(element)) continue;
+      candidates.push(element);
+      if (!element.isConnected || !isVisibleInPlayer(element)) continue;
 
       const rect = element.getBoundingClientRect();
       const bottomScore = Math.max(0, rect.top - playerRect.top) / Math.max(1, playerRect.height);
@@ -280,13 +288,17 @@
       if (!best || score > best.score) best = { element, cueIndex: matchedIndex, score };
     }
 
-    const scanDurationMs = performance.now() - scanStart;
-    state.scanCount += 1;
-    state.scanTotalMs += scanDurationMs;
-    state.lastScanMs = scanDurationMs;
-    state.lastScanElementCount = elements.length;
+    if (!cached) {
+      state.nativeCandidateCache = { cueIndex: hintIndex, elements: candidates };
+      const scanDurationMs = performance.now() - scanStart;
+      state.scanCount += 1;
+      state.scanTotalMs += scanDurationMs;
+      state.lastScanMs = scanDurationMs;
+      state.lastScanElementCount = elements.length;
+    }
 
-    return best ? { element: best.element, cueIndex: best.cueIndex, matchPath: "full-scan" } : null;
+    return best ? { element: best.element, cueIndex: best.cueIndex,
+      matchPath: cached ? "cached-candidates" : "full-scan" } : null;
   }
 
   function mutationCouldAffectActiveCaption(mutations) {
@@ -448,6 +460,7 @@
     if (!player) return false;
     if (state.player !== player) {
       state.player = player;
+      state.nativeCandidateCache = null;
       state.mutationObserver?.disconnect();
       state.mutationObserver?.observe(player, { childList: true, characterData: true, subtree: true });
     }
@@ -455,7 +468,16 @@
   }
 
   function renderCurrentCue() {
-    if (!state || !ensureAttached()) return;
+    if (!state?.visible || !ensureAttached()) return;
+    // A media event can run before MutationObserver's microtask delivery.
+    const pendingMutations = state.mutationObserver?.takeRecords() || [];
+    if (pendingMutations.length) {
+      state.nativeCandidateCache = null;
+      if (mutationCouldAffectActiveCaption(pendingMutations)) {
+        state.nativeInjectedCueIndex = -2;
+        state.nativeSearchExhausted = false;
+      }
+    }
     const now = performance.now();
     const gapSinceLastRender = now - state.lastRenderAt;
     state.lastRenderAt = now;
@@ -472,6 +494,10 @@
       state.totalStallMs += gapSinceLastRender;
     }
     const index = findCueIndex(Number(state.video.currentTime || 0));
+    if (index === state.lastCueIndex && state.nativeSearchExhausted && !state.nativeAnchor) {
+      publishDebugState();
+      return;
+    }
     if (index === state.lastCueIndex && state.nativeInjectedCueIndex === index && isInjectionStillValid()) {
       publishDebugState();
       return;
@@ -496,14 +522,8 @@
       state.nativeSearchExhausted = false;
     }
     const cue = index >= 0 ? state.cues[index] : null;
-    if (!state.visible) {
-      clearInjectedLines();
-      publishDebugState();
-      return;
-    }
-    // As long as this cue hasn't been matched yet, every trigger
-    // (timeupdate/rVFC/mutation) retries immediately - no fixed polling
-    // interval. Once matched, the early-return above avoids re-scanning the
+    // Before a match, triggers retry the cached text-matching candidates.
+    // Only a cue change or real DOM change requires another tree scan. Once matched, the early-return above avoids re-scanning the
     // DOM every frame. Once the grace period lapses without ever finding a
     // match (e.g. Echo360's own CC is turned off, so there is nothing to find
     // for the whole video), stop scanning altogether until a real DOM
@@ -578,9 +598,19 @@
     publishDebugState();
   }
 
+  function cancelVideoFrame() {
+    if (!state || state.frameHandle == null) return;
+    state.video.cancelVideoFrameCallback?.(state.frameHandle);
+    state.frameHandle = null;
+  }
+
   function scheduleVideoFrame() {
-    if (!state || typeof state.video.requestVideoFrameCallback !== "function") return;
-    state.frameHandle = state.video.requestVideoFrameCallback(() => {
+    if (!state?.visible || state.frameHandle != null || typeof state.video.requestVideoFrameCallback !== "function") return;
+    const mounted = state;
+    let handle;
+    handle = state.video.requestVideoFrameCallback(() => {
+      if (state !== mounted || state.frameHandle !== handle) return;
+      state.frameHandle = null;
       // Diagnostics: rvfcFrameCount tracks how often the browser actually
       // presents a video frame (i.e. roughly the effective display/decode
       // rate); rvfcRenderCount tracks how many of those actually passed the
@@ -597,6 +627,7 @@
       }
       scheduleVideoFrame();
     });
+    state.frameHandle = handle;
   }
 
   function updateTranslatedVtt({ originalVtt, translatedVtt, size, reverseOrder }) {
@@ -611,6 +642,7 @@
     state.nativeSearchExhausted = false;
     state.nativeAnchor = null;
     state.nativeAnchorDebug = null;
+    state.nativeCandidateCache = null;
     state.lastMatchPath = "none";
     clearInjectedLines();
     renderCurrentCue();
@@ -645,8 +677,8 @@
       nativeSearchExhausted: false,
       nativeAnchor: null,
       nativeAnchorDebug: null,
-      // Which path produced the last successful injection: "sticky-o1"
-      // (O(1) anchor reuse) vs "full-scan" (cold start / anchor lost).
+      nativeCandidateCache: null,
+      // Last successful path: sticky-o1, cached-candidates, or full-scan.
       lastMatchPath: "none",
       onNoCaptionCapability: typeof onNoCaptionCapability === "function" ? onNoCaptionCapability : null,
       capabilityFallbackFired: false,
@@ -680,12 +712,13 @@
       state.listeners.push([eventName, listener]);
     }
     state.mutationObserver = new MutationObserver((mutations) => {
+      if (state) state.nativeCandidateCache = null;
       // Handled synchronously, in the same microtask as Echo360's own DOM
       // write: MutationObserver callbacks run before the browser paints, so
       // reacting here (instead of deferring to requestAnimationFrame) lands
       // our injection in the *same* frame as the native caption change
       // instead of the next one.
-      if (!state || state.handlingMutation || !mutationCouldAffectActiveCaption(mutations)) return;
+      if (!state?.visible || state.handlingMutation || !mutationCouldAffectActiveCaption(mutations)) return;
       state.handlingMutation = true;
       try {
         // Force a fresh match even if this cue was already resolved: Echo360
@@ -762,8 +795,23 @@
 
   function setVisible(visible) {
     if (!state) return;
-    state.visible = !!visible;
+    const nextVisible = !!visible;
+    if (state.visible === nextVisible) return;
+    state.visible = nextVisible;
+    if (!nextVisible) {
+      cancelVideoFrame();
+      clearInjectedLines();
+      publishDebugState();
+      return;
+    }
+    // Hidden time is not a host stall. Re-match the currently visible cue.
+    state.nativeCandidateCache = null;
+    state.lastRenderAt = performance.now();
+    state.nativeInjectedCueIndex = -2;
+    state.nativeSearchExhausted = false;
+    state.nativeCaptionWaitUntil = performance.now() + NATIVE_CAPTION_GRACE_MS;
     renderCurrentCue();
+    scheduleVideoFrame();
   }
 
   function applySize(size) {
@@ -783,9 +831,7 @@
   function unmount() {
     if (!state) return;
     for (const [eventName, listener] of state.listeners) state.video.removeEventListener(eventName, listener);
-    if (state.frameHandle !== null && typeof state.video.cancelVideoFrameCallback === "function") {
-      state.video.cancelVideoFrameCallback(state.frameHandle);
-    }
+    cancelVideoFrame();
     state.mutationObserver?.disconnect();
     clearInjectedLines();
     state = null;

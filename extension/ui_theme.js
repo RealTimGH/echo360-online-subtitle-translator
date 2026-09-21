@@ -41,6 +41,7 @@
       errorStrong: "#fff4f4",
       errorMuted: "#ffe4e4",
       errorBorder: "rgba(255,130,130,0.72)",
+      success: "#8ee5ad",
       warning: "#ffd27d",
       warningMuted: "#ffeac0",
       warningBorder: "rgba(255,199,90,0.85)",
@@ -51,6 +52,10 @@
       mutedText: "rgba(255,255,255,0.62)",
       secondaryText: "rgba(255,255,255,0.76)",
       border: "rgba(255,255,255,0.16)",
+    },
+    focus: {
+      ring: "#9ed0ff",
+      soft: "rgba(158,208,255,0.22)",
     },
   };
 
@@ -88,6 +93,7 @@
       errorStrong: "#6f1111",
       errorMuted: "#721c1c",
       errorBorder: "rgba(166,27,27,0.72)",
+      success: "#167847",
       warning: "#7a4a00",
       warningMuted: "#5c3900",
       warningBorder: "rgba(122,74,0,0.78)",
@@ -98,6 +104,10 @@
       mutedText: "rgba(0,0,0,0.62)",
       secondaryText: "rgba(0,0,0,0.76)",
       border: "rgba(0,0,0,0.14)",
+    },
+    focus: {
+      ring: "#075fa8",
+      soft: "rgba(7,95,168,0.18)",
     },
   };
 
@@ -136,6 +146,7 @@
         --echo360-diagnostic-error-strong: ${theme.diagnostic.errorStrong};
         --echo360-diagnostic-error-muted: ${theme.diagnostic.errorMuted};
         --echo360-diagnostic-error-border: ${theme.diagnostic.errorBorder};
+        --echo360-diagnostic-success: ${theme.diagnostic.success};
         --echo360-diagnostic-warning: ${theme.diagnostic.warning};
         --echo360-diagnostic-warning-muted: ${theme.diagnostic.warningMuted};
         --echo360-diagnostic-warning-border: ${theme.diagnostic.warningBorder};
@@ -146,6 +157,8 @@
         --echo360-diagnostic-muted-text: ${theme.diagnostic.mutedText};
         --echo360-diagnostic-secondary-text: ${theme.diagnostic.secondaryText};
         --echo360-diagnostic-border: ${theme.diagnostic.border};
+        --echo360-focus-ring: ${theme.focus.ring};
+        --echo360-focus-ring-soft: ${theme.focus.soft};
     `;
   }
 

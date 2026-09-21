@@ -79,6 +79,7 @@ function setupControllerWithRenderer() {
     useNativeSubtitles: false,
   };
   const domMount = vi.fn(() => false);
+  let videoChangeListener = null;
 
   window.Echo360Translator = makeFullNs({
     browserApi: {
@@ -101,6 +102,13 @@ function setupControllerWithRenderer() {
       waitForVideo: vi.fn(async () => video),
       getAllVideos: () => [video],
       getPrimaryVideo: () => video,
+      subscribeToChanges: vi.fn((listener) => {
+        videoChangeListener = listener;
+        return () => {
+          if (videoChangeListener === listener) videoChangeListener = null;
+        };
+      }),
+      destroy: vi.fn(),
       querySelectorAllDeep: (selector) => Array.from(document.querySelectorAll(selector)),
       getVideoHintMediaIds: () => new Set(),
     },
@@ -121,7 +129,12 @@ function setupControllerWithRenderer() {
   evalModule("subtitle_strategy.js");
   evalModule("renderer.js");
   evalModule("controller.js");
-  return { ns: window.Echo360Translator, video, domMount };
+  return {
+    ns: window.Echo360Translator,
+    video,
+    domMount,
+    emitVideoChange: (change = {}) => videoChangeListener?.(change),
+  };
 }
 
 function setupManualController({ quickTranslateAutoExport = true } = {}) {
@@ -179,6 +192,7 @@ describe("controller track sync in Echo360 native CC mode", () => {
   });
 
   afterEach(() => {
+    window.Echo360Translator?.controller?.destroy?.();
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -199,6 +213,117 @@ describe("controller track sync in Echo360 native CC mode", () => {
     // periodic sync should not keep re-attempting the failed native CC mount.
     expect(domMount).toHaveBeenCalledOnce();
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
+  });
+
+  it("coalesces video changes into a prompt sync and keeps only a low-frequency safety pass", async () => {
+    const { ns, emitVideoChange } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(1200);
+    ensureTrack.mockClear();
+
+    // Repeated media/DOM signals must keep the first 100 ms deadline rather
+    // than turning into a trailing debounce.
+    emitVideoChange({ type: "media" });
+    await vi.advanceTimersByTimeAsync(50);
+    emitVideoChange({ type: "dom" });
+    emitVideoChange({ type: "media" });
+    await vi.advanceTimersByTimeAsync(49);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ensureTrack).toHaveBeenCalledOnce();
+
+    ensureTrack.mockClear();
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ensureTrack).toHaveBeenCalledOnce();
+  });
+
+  it("reuses preferences during maintenance and refreshes only after a storage change", async () => {
+    const { ns } = setupControllerWithRenderer();
+    let onChanged;
+    ns.browserApi.storage.onChanged = {
+      addListener: vi.fn((listener) => { onChanged = listener; }),
+      removeListener: vi.fn(),
+    };
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(1);
+    onChanged({ [ns.constants.PREFS_KEY_PREFIX + "global"]: { newValue: { enabled: false } } }, "local");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not stack asynchronous maintenance jobs when extension storage stalls", async () => {
+    const { ns } = setupControllerWithRenderer();
+    let onChanged;
+    ns.browserApi.storage.onChanged = { addListener: (listener) => { onChanged = listener; } };
+    await ns.controller.init();
+    let resolvePrefs;
+    ns.storage.getPrefs.mockImplementationOnce(() => new Promise((resolve) => { resolvePrefs = resolve; }));
+    onChanged({ [ns.constants.PREFS_KEY_PREFIX + "global"]: {} }, "local");
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+    resolvePrefs({ enabled: false });
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops maintenance in hidden pages and during page-cache suspension, then resumes", async () => {
+    const { ns } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await ns.controller.init();
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new Event("pageshow"));
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ensureTrack).toHaveBeenCalledTimes(2);
+    ns.controller.destroy();
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps track maintenance available to a visible picture-in-picture video", async () => {
+    const { ns, video } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await ns.controller.init();
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "pictureInPictureElement", { configurable: true, value: video });
+    try {
+      video.dispatchEvent(new Event("enterpictureinpicture"));
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(ensureTrack).toHaveBeenCalledTimes(1);
+    } finally {
+      delete document.pictureInPictureElement;
+    }
+    video.dispatchEvent(new Event("leavepictureinpicture"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds automatic failed-source prefetch retries while allowing an explicit retry", async () => {
+    const { ns, callbacks } = setupManualController();
+    ns.translationService.resolveSourceVtt.mockRejectedValue(Object.assign(new Error("No captions"), { code: "SOURCE_NOT_FOUND" }));
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(ns.translationService.resolveSourceVtt).toHaveBeenCalledTimes(3);
+    await callbacks().onManualPrepare();
+    expect(ns.translationService.resolveSourceVtt).toHaveBeenCalledTimes(4);
   });
 
   it("renders the Transcript panel as an independent surface without changing track mounting", () => {
@@ -321,7 +446,12 @@ describe("controller track sync in Echo360 native CC mode", () => {
       "source-vtt",
       ORIG_VTT
     );
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
+      expect.stringContaining("命中本地缓存。共 1 条字幕，已翻译 1 条，失败 0 条。"),
+      "cache"
+    );
+    expect(ns.ui.setStatusText.mock.calls.at(-1)[0])
+      .toContain("翻译服务：Google Translate 网页端点 1 条。");
   });
 
   it("skips automatic AI material export when the quick-action setting is disabled, including cache hits", async () => {
@@ -346,14 +476,23 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(ns.manualTranslation.copyText).not.toHaveBeenCalled();
     expect(ns.manualTranslation.downloadText).not.toHaveBeenCalled();
     expect(ns.storage.getCacheStore).toHaveBeenCalledOnce();
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith("命中本地缓存", "cache");
+    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
+      expect.stringContaining("命中本地缓存。共 1 条字幕，已翻译 1 条，失败 0 条。"),
+      "cache"
+    );
+    expect(ns.ui.setStatusText.mock.calls.at(-1)[0])
+      .toContain("翻译服务：Google Translate 网页端点 1 条。");
   });
 
   it("asks before retranslation and does not export duplicate AI materials when cancelled", async () => {
-    const { ns, callbacks } = setupManualController();
+    const { ns, video, callbacks } = setupManualController();
     await ns.controller.init();
     ns.renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, true, "medium", false, null, false);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    ns.ui.clearTranslationSummary = vi.fn();
+    const previousOverview = "翻译完成。共 1 条字幕，已翻译 1 条，失败 0 条。 翻译服务：Argos Translate（本地） 1 条。";
+    ns.ui.setStatusText(previousOverview, "success");
+    ns.ui.setStatusText.mockClear();
     ns.manualTranslation.copyText.mockClear();
     ns.manualTranslation.downloadText.mockClear();
 
@@ -363,10 +502,9 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("是否清除当前结果并重新翻译"));
     expect(ns.manualTranslation.copyText).not.toHaveBeenCalled();
     expect(ns.manualTranslation.downloadText).not.toHaveBeenCalled();
-    expect(ns.ui.setStatusText).toHaveBeenCalledWith(
-      "当前翻译字幕已保留，未重新翻译，也未重复下载材料。",
-      "info"
-    );
+    expect(ns.ui.setStatusText).not.toHaveBeenCalled();
+    expect(ns.ui.clearTranslationSummary).not.toHaveBeenCalled();
+    expect(video.querySelector('track[data-echo360-translated="1"]')).not.toBeNull();
   });
 
   it("does not promise AI material regeneration in the retranslation confirmation when disabled", async () => {
@@ -506,6 +644,51 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(messages).toContain("翻译准备中 0/1");
     expect(messages).toContain("翻译中 1/1（已开始显示）");
     expect(messages.some((message) => message.includes("0/0"))).toBe(false);
+    expect(messages.some((message) => message.includes("翻译完成。共 1 条字幕，已翻译 1 条，失败 0 条。"))).toBe(true);
+  });
+
+  it("includes the actual provider cue counts in the compact completion status", async () => {
+    const { ns, callbacks } = setupManualController();
+    ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => null);
+    ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+    ns.translationService.buildCacheKey = vi.fn(async () => ({
+      sourceKey: "source",
+      configSig: "config",
+      cacheKey: "source::config",
+    }));
+    ns.translationService.buildTranslatePayload = vi.fn(() => ({
+      vtt_text: ORIG_VTT,
+      provider: "mixed",
+      target: "ZH",
+      bilingual: false,
+    }));
+    ns.translationService.translateWithConfig = vi.fn(async () => ({
+      translated_vtt: TRANS_VTT,
+      warnings: [],
+      failed_items: [],
+      failure_codes: {},
+      metrics: {
+        total: 1,
+        totalCues: 1,
+        translated: 1,
+        translatedCues: 1,
+        failed: 0,
+        providerBreakdown: {
+          "google-web": { assignedCues: 1, completedCues: 0, failures: 1 },
+          deepl: { assignedCues: 0, completedCues: 1, failures: 0 },
+        },
+      },
+    }));
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+
+    await ns.controller.init();
+    await callbacks().onTranslate();
+
+    const messages = ns.ui.setStatusText.mock.calls.map(([message]) => String(message));
+    const completed = messages.find((message) => message.startsWith("翻译完成。"));
+    expect(completed).toContain("DeepL 1 条");
+    expect(completed).not.toContain("Google Translate 网页端点 0 条");
   });
 
   it.each([
@@ -705,5 +888,60 @@ describe("controller track sync in Echo360 native CC mode", () => {
     });
     expect(await callbacks().onManualImport()).toBeNull();
     expect(document.querySelector('track[data-echo360-translated="1"]')).toBeNull();
+  });
+
+  it("marks every failed cue for rendering when diagnostic details are sampled", async () => {
+    const { ns, callbacks } = setupManualController();
+    const source = "WEBVTT\n\n" + Array.from({ length: 61 }, (_, i) => (
+      `${ns.vtt.formatVttTime(i * 2)} --> ${ns.vtt.formatVttTime(i * 2 + 1)}\nSource ${i}\n`
+    )).join("\n");
+    const translated = source.replace("Source 60", "已翻译");
+    ns.translationService.resolveSourceVtt.mockResolvedValue({
+      vttText: source,
+      sourceId: "source",
+      sourceMeta: { stats: { cueCount: 61 } },
+    });
+    ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => null);
+    ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+    ns.translationService.buildCacheKey = vi.fn(async () => ({
+      sourceKey: "s",
+      configSig: "c",
+      cacheKey: "k",
+    }));
+    ns.translationService.buildTranslatePayload = vi.fn(() => ({
+      vtt_text: source,
+      provider: "google-web",
+      target: "ZH",
+      bilingual: false,
+    }));
+    ns.translationService.translateWithConfig = vi.fn(async () => ({
+      translated_vtt: translated,
+      warnings: [],
+      failed_items: Array.from({ length: 50 }, (_, i) => ({
+        cue: i + 1,
+        code: "HTTP_503",
+        message: "HTTP 503",
+      })),
+      failed_cues: Array.from({ length: 60 }, (_, i) => i + 1),
+      failure_codes: { HTTP_503: 60 },
+      metrics: {
+        total: 61,
+        processed: 61,
+        translated: 1,
+        failed: 60,
+        providerResults: 1,
+        targetResults: 1,
+      },
+    }));
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+
+    await ns.controller.init();
+    await callbacks().onTranslate();
+
+    const finalOptions = render.mock.calls.at(-1)[7];
+    expect(finalOptions.failedCues).toHaveLength(60);
+    expect(finalOptions.failedCues.at(-1)).toBe(60);
   });
 });

@@ -122,6 +122,7 @@
         "video.js",
         "source_finder.js",
         "player_caption_renderer.js",
+        "echo_caption_renderer.js",
         "bilingual_dom_renderer.js",
         "renderer.js",
         "ui_theme.js",

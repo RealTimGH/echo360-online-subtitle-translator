@@ -146,7 +146,7 @@ describe("structured error model", () => {
 
     expect(model.title).toContain("疑似被限流");
     expect(model.summary).toContain("HTTP 429");
-    expect(model.recommendation).toContain("RPS=3");
+    expect(model.recommendation).toContain("RPS=6");
   });
 
   it("explains subtitle fetch failures and unsupported resource hosts", () => {
@@ -442,4 +442,58 @@ WEBVTT is also valid caption text
     expect(second.details.find((item) => item.label === "结构化附加信息").value)
       .not.toContain("阶段");
   });
+
+  it("bounds failure-code and structured warning diagnostics before rendering them", () => {
+    const errors = loadErrors();
+    const failureCodes = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [`HTTP_${String(400 + (index % 100)).padStart(3, "0")}_${index}`, 1])
+    );
+    const warnings = Array.from({ length: 200 }, (_, index) => `warning-${index}`);
+    const extraDetails = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [`field-${index}`, `value-${index}`])
+    );
+    const model = errors.normalizeError({
+      code: "PARTIAL_TRANSLATION",
+      message: "partial",
+      failure_codes: failureCodes,
+      warnings,
+      details: extraDetails,
+      metrics: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`metric-${index}`, index])),
+    }, { severity: "warning" });
+
+    expect(Object.keys(model.failureCodes).length).toBeLessThanOrEqual(80);
+    expect(model.warnings).toHaveLength(30);
+    expect(Object.keys(model.extraDetails).length).toBeLessThanOrEqual(50);
+    expect(Object.keys(model.metrics).length).toBeLessThanOrEqual(50);
+    expect(model.copyText.length).toBeLessThan(100_000);
+  });
+
+  it("does not spread arbitrary provider payload keys while normalizing an error", () => {
+    const errors = loadErrors();
+    let unexpectedGetterReads = 0;
+    const error = { code: "HTTP_503", message: "upstream unavailable" };
+    Object.defineProperty(error, "unrelatedPayload", {
+      enumerable: true,
+      get() {
+        unexpectedGetterReads += 1;
+        return { very: "large" };
+      },
+    });
+
+    expect(errors.normalizeError(error).code).toBe("HTTP_503");
+    expect(unexpectedGetterReads).toBe(0);
+  });
+  it("bounds the total work for a wide, deeply nested diagnostic", () => {
+    const errors = loadErrors();
+    let reads = 0;
+    const leaf = {};
+    Object.defineProperty(leaf, "value", { enumerable: true, get: () => { reads += 1; return "detail"; } });
+    const branch = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [`item${index}`, leaf]));
+    const details = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [`group${index}`, branch]));
+    const output = errors.formatDebugLog([details]);
+    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBeLessThanOrEqual(500);
+    expect(output.length).toBeLessThanOrEqual(2400);
+  });
+
 });

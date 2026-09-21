@@ -500,6 +500,27 @@ describe("manual AI translation workflow helpers", () => {
     expect(outputCues.map(({ text }) => text)).toEqual(["同学们好。", "请打开练习册。"]);
   });
 
+  it("snapshots queued checkpoints and persists again after another context clears storage", async () => {
+    const writes = [];
+    let finish;
+    const storage = { set: vi.fn((entry) => {
+      writes.push(entry);
+      if (writes.length === 1) return new Promise((resolve) => { finish = resolve; });
+      return Promise.resolve();
+    }) };
+    const workflow = { sessionId: "snapshot", accepted: { c1: "第一条" } };
+    const first = manual.saveProgress(workflow, storage);
+    workflow.accepted.c2 = "第二条";
+    const second = manual.saveProgress(workflow, storage);
+    await vi.waitFor(() => expect(writes).toHaveLength(1));
+    expect(Object.values(writes[0])[0].accepted).toEqual({ c1: "第一条" });
+    finish();
+    await Promise.all([first, second]);
+    expect(Object.values(writes[1])[0].accepted).toEqual({ c1: "第一条", c2: "第二条" });
+    await manual.saveProgress(workflow, storage);
+    expect(storage.set).toHaveBeenCalledTimes(3);
+  });
+
   it("saves and resumes a checkpoint across workflow objects and discards mismatched or corrupt data", async () => {
     const source = makeVtt(["Welcome to class.", "Open the workbook."]);
     const store = {};
@@ -518,7 +539,10 @@ describe("manual AI translation workflow helpers", () => {
       accepted: { c000001: "欢迎来到课堂。" },
     };
 
-    await expect(manual.saveProgress(checkpoint, storage)).resolves.toBe(true);
+    await expect(Promise.all([
+      manual.saveProgress(checkpoint, storage),
+      manual.saveProgress(checkpoint, storage),
+    ])).resolves.toEqual([true, true]);
     expect(storage.set).toHaveBeenCalledOnce();
     const resumedSession = manual.createTranslationPackage({
       sourceVtt: source,

@@ -20,6 +20,21 @@
       /\/lti-app\/embed\//i.test(String(location?.pathname || ""));
   }
 
+  // Canvas's Instructure Media player has existed in two DOM generations.
+  // The newer Vidstack generation exposes [data-media-player], while the
+  // older Echo360-hosted embed uses a class-only player shell.  The video is
+  // absolutely positioned inside `.studio-player-container__player`; the
+  // larger `.studio-player-container` around it is the lesson's inner scroll
+  // surface, not the player that owns the controls.  Returning that outer
+  // shell was the reason the floating UI was calculated against the wrong
+  // edge (and why no stable per-video anchor was found at all).
+  const PLAYER_SELECTOR = [
+    "[data-media-player]",
+    "#player",
+    ".studio-player-container__player",
+    '[class*="studio-player-container__player"]',
+  ].join(",");
+
   function isSupportedPlayerDocument() {
     if (window.Echo360AssessmentGuard?.isAllowedDocument?.() === false) return false;
     // Instructure has changed the path used by its embedded player before,
@@ -31,15 +46,13 @@
   }
 
   function getPlayer(video) {
-    return video?.closest?.("[data-media-player]") ||
-      video?.closest?.("#player") ||
-      document.querySelector("[data-media-player]") ||
-      document.querySelector("#player");
+    return video?.closest?.(PLAYER_SELECTOR) || document.querySelector(PLAYER_SELECTOR);
   }
 
   function isInstructureVideo(video) {
     return !!(
       video?.closest?.("[data-media-player]") ||
+      video?.closest?.('.studio-player-container__player,[class*="studio-player-container__player"]') ||
       (isInstructureMediaHost() && video)
     );
   }

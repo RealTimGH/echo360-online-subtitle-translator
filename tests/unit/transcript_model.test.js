@@ -101,4 +101,28 @@ describe("transcript model", () => {
     const built = model.buildTranscriptModel({ originalVtt: original, translatedVtt: translated(["机器学习机器学习", "好的", "测试"]) });
     expect(model.searchTranslations(built, "机器学习").length).toBe(2);
   });
+
+  it("reuses cue search normalization without keeping stale incremental text", () => {
+    const built = model.buildTranscriptModel({
+      originalVtt: original,
+      translatedVtt: translated(["alpha beta", "好的", "测试"]),
+    });
+    expect(model.searchTranslations(built, "alpha").map((match) => match.cue.key)).toEqual([built.cues[0].key]);
+    // Incremental translation updates mutate the existing model cue object.
+    // The cache must be keyed by the current text so the next query sees the
+    // new ranges while repeated queries keep the normalized map hot.
+    built.cues[0].translatedText = "gamma delta";
+    expect(model.searchTranslations(built, "alpha")).toEqual([]);
+    expect(model.searchTranslations(built, "gamma").map((match) => match.cue.key)).toEqual([built.cues[0].key]);
+    expect(model.getCueByKey(built, built.cues[1].key)).toBe(built.cues[1]);
+  });
+
+  it("keeps dense near-time cue alignment bounded and ambiguous", () => {
+    const source = `WEBVTT\n\n${Array.from({ length: 120 }, (_, index) =>
+      `00:00:00.000 --> 00:00:02.000\nsource-${index}`).join("\n\n")}`;
+    const target = `WEBVTT\n\n${Array.from({ length: 121 }, (_, index) =>
+      `00:00:00.000 --> 00:00:02.000\ntarget-${index}`).join("\n\n")}`;
+    const built = model.buildTranscriptModel({ originalVtt: source, translatedVtt: target });
+    expect(built.cues.every((cue) => cue.status === "unmapped")).toBe(true);
+  });
 });

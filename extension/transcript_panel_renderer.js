@@ -41,7 +41,10 @@
 
   const state = {
     model: null,
-    enabled: true,
+    // The controller applies the persisted opt-in after preferences load.
+    // Starting disabled avoids a flash of Transcript-panel decorations on
+    // fresh installs/upgrades before that asynchronous read completes.
+    enabled: false,
     started: false,
     documentObserver: null,
     panelObservers: new Map(),
@@ -58,6 +61,7 @@
     flushScheduled: false,
     flushHandle: null,
     flushGeneration: 0,
+    discoveryPending: false,
     warnedReasons: new Set(),
     ownMutationDepth: 0,
     styleEl: null,
@@ -242,6 +246,40 @@
         node.matches?.(`[${ATTR}="1"], [${SEARCH_BRIDGE_ATTR}="1"], [${SEARCH_HIT_ATTR}="1"]`) ||
         node.closest?.(`[${ATTR}="1"], [${SEARCH_BRIDGE_ATTR}="1"]`)
       ));
+    });
+  }
+
+  function discoverySelectorList() {
+    const panelAdapter = adapter() || {};
+    return [
+      panelAdapter.PANEL_SELECTOR || '#transcripts-panel[role="tabpanel"]',
+      panelAdapter.LIST_SELECTOR || '.transcript-list[role="grid"]',
+      panelAdapter.SEARCH_SELECTOR || '#search-transcripts_input',
+      panelAdapter.ROWGROUP_SELECTOR || '.ReactVirtualized__Grid__innerScrollContainer[role="rowgroup"]',
+    ].filter(Boolean);
+  }
+
+  function nodeMatchesOrContainsSelector(node, selector) {
+    if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return false;
+    try {
+      return !!node.matches?.(selector) || !!node.querySelector?.(selector);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function nodeContainsKnownPanelRoot(node) {
+    if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return false;
+    return [...state.panelRoots].some((root) => node === root || node.contains?.(root));
+  }
+
+  function isPanelDiscoveryMutation(records) {
+    const selectors = discoverySelectorList();
+    return (records || []).some((record) => {
+      if (record.type !== "childList") return false;
+      const nodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+      return nodes.some((node) => nodeContainsKnownPanelRoot(node) ||
+        selectors.some((selector) => nodeMatchesOrContainsSelector(node, selector)));
     });
   }
 
@@ -1126,7 +1164,11 @@
     }
   }
 
-  async function flush() {
+  async function flush(options = {}) {
+    // Direct callers use flush() as an explicit reconciliation request.  The
+    // scheduled observer path passes discovery:false so panel-local cue
+    // mutations do not repeat the document-wide selector walks.
+    if (options?.discovery !== false) state.discoveryPending = true;
     // jsdom (and a page being torn down) can invalidate the document while a
     // previously scheduled observer frame is still queued.  Treat that as a
     // cancelled render rather than allowing the stale closure to touch the
@@ -1139,13 +1181,15 @@
     state.flushHandle = null;
     state.flushScheduled = false;
     const run = Promise.resolve().then(async () => {
-      if (!state.started) return;
+      if (!state.started || !state.enabled || !state.model) return;
       state.diagnostics.observerFlushCount += 1;
       state.diagnostics.discoveredCueRows = 0;
       state.diagnostics.decoratedCueRows = 0;
       state.diagnostics.unmappedCueRows = 0;
       state.diagnostics.duplicateTextResolutions = 0;
-      syncPanels();
+      const discoverPanels = state.discoveryPending;
+      state.discoveryPending = false;
+      if (discoverPanels) syncPanels();
       syncSearchPanels();
       if (!state.enabled || !state.model) return;
       const panels = [...state.panelStates.values()];
@@ -1168,8 +1212,9 @@
     }
   }
 
-  function scheduleFlush() {
-    if (!state.started) return;
+  function scheduleFlush(options = {}) {
+    if (options?.discovery === true) state.discoveryPending = true;
+    if (!state.started || !state.enabled || !state.model) return;
     if (state.flushInFlight) {
       state.flushPending = true;
       return;
@@ -1180,7 +1225,7 @@
     const run = () => {
       if (generation !== state.flushGeneration) return;
       state.flushHandle = null;
-      void flush();
+      void flush({ discovery: false });
     };
     if (typeof requestAnimationFrame === "function") {
       state.flushHandle = requestAnimationFrame(run);
@@ -1197,12 +1242,39 @@
     window.addEventListener("resize", scheduleFlush, false);
     state.documentObserver = new MutationObserver((records) => {
       if (state.ownMutationDepth > 0 || isExtensionOnlyMutation(records)) return;
-      scheduleFlush();
+      if (isPanelDiscoveryMutation(records)) scheduleFlush({ discovery: true });
     });
-    state.documentObserver.observe(document.documentElement || document, { childList: true, subtree: true });
-    scheduleFlush();
+    syncObservation();
+    scheduleFlush({ discovery: true });
     ns.transcriptSearchBridge?.start?.(api);
     return api;
+  }
+
+  function syncObservation() {
+    const active = state.started && state.enabled && !!state.model;
+    state.documentObserver?.disconnect();
+    if (active) {
+      state.documentObserver?.observe(document.documentElement || document, { childList: true, subtree: true });
+      return;
+    }
+    for (const observer of state.panelObservers.values()) observer.disconnect();
+    for (const panel of state.panelStates.values()) {
+      clearLayoutRetry(panel);
+      panel.resizeObserver?.disconnect();
+    }
+    state.panelObservers.clear();
+    state.panelStates.clear();
+    state.panelRoots.clear();
+    state.diagnostics.panelCount = 0;
+    state.discoveryPending = false;
+    state.flushGeneration += 1;
+    if (state.flushHandle != null) {
+      if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(state.flushHandle);
+      clearTimeout(state.flushHandle);
+    }
+    state.flushHandle = null;
+    state.flushScheduled = false;
+    state.flushPending = false;
   }
 
   function setTranslation(value) {
@@ -1211,6 +1283,7 @@
       clearDecorationsOnly();
     }
     state.model = next;
+    syncObservation();
     for (const panelState of state.panelStates.values()) {
       panelState.layoutCache = null;
       if (panelState.descriptor?.virtualized) setPanelLayoutPending(panelState);
@@ -1226,7 +1299,7 @@
     state.diagnostics.target = next?.target || null;
     ns.transcriptSearchBridge?.setModel?.(next);
     publishDiagnostics(true);
-    scheduleFlush();
+    scheduleFlush({ discovery: true });
     return next;
   }
 
@@ -1239,22 +1312,30 @@
   }
 
   function setVisible(enabled) {
-    state.enabled = enabled !== false;
+    const next = enabled !== false;
+    if (state.enabled === next) return;
+    state.enabled = next;
     if (!state.enabled) {
       clearDecorationsOnly();
       state.diagnostics.active = false;
       ns.transcriptSearchBridge?.clear?.();
       publishDiagnostics(true);
+      syncObservation();
     } else {
+      syncObservation();
       ns.transcriptSearchBridge?.setModel?.(state.model);
-      scheduleFlush();
+      scheduleFlush({ discovery: true });
     }
   }
 
   function clear() {
+    const wasEnabled = state.enabled;
     clearDecorationsOnly();
     state.model = null;
-    state.enabled = true;
+    syncObservation();
+    // Clearing a translation is a data reset, not a visibility preference
+    // reset. Preserve the explicit user choice across a retry/dismissal.
+    state.enabled = wasEnabled;
     state.diagnostics.active = false;
     state.diagnostics.modelCueCount = 0;
     state.diagnostics.modelOriginalCueCount = 0;

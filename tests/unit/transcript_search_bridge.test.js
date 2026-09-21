@@ -163,4 +163,24 @@ describe("transcript search bridge", () => {
     expect(renderer.scrollToCue).toHaveBeenCalledOnce();
     expect(ns.transcriptSearchBridge.getDebugState().virtualizedTargetMisses).toBe(1);
   });
+
+  it("cancels superseded animation-frame refreshes during rapid input", () => {
+    const { ns, input } = setup();
+    const baseline = ns.transcriptSearchBridge.getDebugState().refreshCount;
+    vi.useFakeTimers();
+    vi.stubGlobal("requestAnimationFrame", (callback) => setTimeout(callback, 16));
+    vi.stubGlobal("cancelAnimationFrame", (handle) => clearTimeout(handle));
+    try {
+      input.value = "世界";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.value = "再见";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      vi.advanceTimersByTime(16);
+      expect(ns.transcriptSearchBridge.getDebugState().query).toBe("再见");
+      expect(ns.transcriptSearchBridge.getDebugState().refreshCount).toBe(baseline + 1);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
 });

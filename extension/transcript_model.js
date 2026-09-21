@@ -4,6 +4,12 @@
   const DEFAULT_PENDING_LABEL = ns.constants?.SUBTITLE_PENDING_LABEL || "正在翻译中...";
   const DEFAULT_FAILURE_LABEL = ns.constants?.SUBTITLE_FAILURE_LABEL || "[翻译失败]";
   const TIME_TOLERANCE_MS = 250;
+  // Search ranges are derived from the translated cue text, which is stable
+  // for the lifetime of a model in normal use.  Keep the cache weakly keyed by
+  // cue so a discarded model does not retain a transcript, while still
+  // invalidating correctly when callers update a cue during incremental
+  // translation previews.
+  const searchInfoCache = new WeakMap();
 
   function normalizeSearchText(value) {
     let text = String(value == null ? "" : value);
@@ -85,7 +91,6 @@
 
   function alignTranslationCues(originalCues, translatedCues) {
     const mapping = new Map();
-    const used = new Set();
     if (originalCues.length === 0 || translatedCues.length === 0) return mapping;
 
     const sameShape = originalCues.length === translatedCues.length &&
@@ -93,7 +98,6 @@
     if (sameShape) {
       originalCues.forEach((cue, index) => {
         mapping.set(index, translatedCues[index]);
-        used.add(index);
       });
       return mapping;
     }
@@ -102,37 +106,66 @@
     // consume one translated cue for the first of two equally plausible
     // source cues and silently mis-map the second; ambiguity must remain
     // unmapped until a later flush has a stronger anchor.
-    const remainingOriginals = new Set(originalCues.map((_, index) => index));
-    const remainingTranslations = new Set(translatedCues.map((_, index) => index));
-    while (remainingOriginals.size > 0 && remainingTranslations.size > 0) {
-      const candidatesByOriginal = new Map();
-      const ownersByTranslation = new Map();
-      for (const oi of remainingOriginals) {
-        const original = originalCues[oi];
-        const candidates = [...remainingTranslations].filter((ti) => {
-          const translated = translatedCues[ti];
-          if (Math.abs(original.startMs - translated.startMs) > TIME_TOLERANCE_MS) return false;
-          return intervalOverlapRatio(original, translated) >= 0.5;
-        });
-        candidatesByOriginal.set(oi, candidates);
-        for (const ti of candidates) {
-          const owners = ownersByTranslation.get(ti) || [];
-          owners.push(oi);
-          ownersByTranslation.set(ti, owners);
-        }
+    //
+    // Search only the time-window that can satisfy the tolerance.  The old
+    // implementation compared every original cue with every translated cue,
+    // then rebuilt those candidate lists repeatedly.  A sorted start-time
+    // index reduces the normal case to O((N + M) log(N + M)); candidate counts
+    // are deliberately capped at two because a row with two or more possible
+    // matches is ambiguous and must remain unmapped.  Keeping only the sole
+    // index also bounds memory when a malformed transcript contains thousands
+    // of cues at the same timestamp.
+    const lowerBound = (items, value) => {
+      let low = 0;
+      let high = items.length;
+      while (low < high) {
+        const middle = low + Math.floor((high - low) / 2);
+        if (items[middle].start < value) low = middle + 1;
+        else high = middle;
       }
-      const assignments = [];
-      for (const [oi, candidates] of candidatesByOriginal.entries()) {
-        if (candidates.length !== 1) continue;
-        const ti = candidates[0];
-        if ((ownersByTranslation.get(ti) || []).length === 1) assignments.push([oi, ti]);
+      return low;
+    };
+    const upperBound = (items, value) => {
+      let low = 0;
+      let high = items.length;
+      while (low < high) {
+        const middle = low + Math.floor((high - low) / 2);
+        if (items[middle].start <= value) low = middle + 1;
+        else high = middle;
       }
-      if (assignments.length === 0) break;
-      for (const [oi, ti] of assignments) {
+      return low;
+    };
+    const translatedByStart = translatedCues
+      .map((cue, index) => ({ start: Number(cue.startMs), index }))
+      .sort((a, b) => a.start - b.start || a.index - b.index);
+    const originalByStart = originalCues
+      .map((cue, index) => ({ start: Number(cue.startMs), index }))
+      .sort((a, b) => a.start - b.start || a.index - b.index);
+
+    const findCandidates = (cue, sortedOther, otherCues) => {
+      const start = Number(cue.startMs);
+      const from = lowerBound(sortedOther, start - TIME_TOLERANCE_MS);
+      const to = upperBound(sortedOther, start + TIME_TOLERANCE_MS);
+      let count = 0;
+      let soleIndex = -1;
+      for (let cursor = from; cursor < to; cursor += 1) {
+        const otherIndex = sortedOther[cursor].index;
+        if (intervalOverlapRatio(cue, otherCues[otherIndex]) < 0.5) continue;
+        count += 1;
+        if (count === 1) soleIndex = otherIndex;
+        if (count > 1) return { count: 2, soleIndex: -1 };
+      }
+      return { count, soleIndex };
+    };
+
+    const originals = originalCues.map((cue) => findCandidates(cue, translatedByStart, translatedCues));
+    const translations = translatedCues.map((cue) => findCandidates(cue, originalByStart, originalCues));
+    for (let oi = 0; oi < originals.length; oi += 1) {
+      const candidate = originals[oi];
+      if (candidate.count !== 1) continue;
+      const ti = candidate.soleIndex;
+      if (ti >= 0 && translations[ti].count === 1 && translations[ti].soleIndex === oi) {
         mapping.set(oi, translatedCues[ti]);
-        used.add(ti);
-        remainingOriginals.delete(oi);
-        remainingTranslations.delete(ti);
       }
     }
     return mapping;
@@ -192,6 +225,8 @@
     const originalCues = parseCues(originalVtt);
     const translatedCues = parseCues(translatedVtt);
     const mapping = alignTranslationCues(originalCues, translatedCues);
+    let mappedCueCount = 0;
+    let unmappedCueCount = 0;
     const cues = originalCues.map((original, index) => {
       const translatedCue = mapping.get(index) || null;
       const originalText = plainCueText(original.text);
@@ -213,6 +248,8 @@
         : status === "pending"
           ? pendingLabel
           : translatedText;
+      if (status === "unmapped") unmappedCueCount += 1;
+      else mappedCueCount += 1;
       return {
         key: cueKey(original, index),
         index,
@@ -226,6 +263,7 @@
         translatedIndex: translatedCue ? translatedCue.index : null,
       };
     });
+    const cueByKey = new Map(cues.map((cue) => [cue.key, cue]));
     const model = {
       sessionKey: makeSessionKey({ sessionKey: options.sessionKey, sourceMeta: options.sourceMeta, target }),
       sourceMeta: options.sourceMeta || {},
@@ -234,12 +272,13 @@
       pendingLabel,
       failureLabel,
       cues,
+      cueByKey,
       searchIndex: buildSearchIndex(cues),
       stats: {
         originalCueCount: originalCues.length,
         translatedCueCount: translatedCues.length,
-        mappedCueCount: cues.filter((cue) => cue.status !== "unmapped").length,
-        unmappedCueCount: cues.filter((cue) => cue.status === "unmapped").length,
+        mappedCueCount,
+        unmappedCueCount,
       },
     };
     return model;
@@ -279,10 +318,17 @@
     return { text: normalized, map };
   }
 
-  function findOccurrences(text, query) {
-    const sourceInfo = normalizedWithMap(text);
+  function searchInfoForCue(cue) {
+    const text = String(cue?.translatedText || "");
+    const cached = cue && searchInfoCache.get(cue);
+    if (cached?.text === text) return cached.info;
+    const info = normalizedWithMap(text);
+    if (cue) searchInfoCache.set(cue, { text, info });
+    return info;
+  }
+
+  function findOccurrencesFromInfo(sourceInfo, needle) {
     const source = sourceInfo.text;
-    const needle = normalizeSearchText(query);
     if (!source || !needle) return [];
     const ranges = [];
     let from = 0;
@@ -300,22 +346,30 @@
     return ranges;
   }
 
+  function findOccurrences(text, query) {
+    const needle = normalizeSearchText(query);
+    return findOccurrencesFromInfo(normalizedWithMap(text), needle);
+  }
+
   function searchTranslations(model, query, visibleRowCount = null) {
     const matches = [];
     const text = String(query || "");
-    if (!model?.cues || !normalizeSearchText(text)) return matches;
+    const needle = normalizeSearchText(text);
+    if (!model?.cues || !needle) return matches;
     const limit = visibleRowCount == null ? model.cues.length : Number(visibleRowCount);
     if (!Number.isInteger(limit) || limit < 0) return matches;
-    for (const cue of model.cues.slice(0, Math.min(model.cues.length, limit))) {
+    const count = Math.min(model.cues.length, limit);
+    for (let index = 0; index < count; index += 1) {
+      const cue = model.cues[index];
       if (!cue.translatedText || cue.status === "unmapped") continue;
-      const ranges = findOccurrences(cue.translatedText, text);
+      const ranges = findOccurrencesFromInfo(searchInfoForCue(cue), needle);
       for (const range of ranges) matches.push({ cue, ...range });
     }
     return matches;
   }
 
   function getCueByKey(model, key) {
-    return model?.cues?.find((cue) => cue.key === key) || null;
+    return model?.cueByKey?.get?.(key) || model?.cues?.find((cue) => cue.key === key) || null;
   }
 
   ns.transcriptModel = {

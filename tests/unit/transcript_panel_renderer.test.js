@@ -26,6 +26,9 @@ function setup({ virtualized = false } = {}) {
   const ns = window.Echo360Translator;
   const model = ns.transcriptModel.buildTranscriptModel({ originalVtt: original, translatedVtt: translated });
   ns.transcriptPanelRenderer.start();
+  // The production controller enables this only after the persisted opt-in
+  // preference has been read. Most renderer tests model that explicit choice.
+  ns.transcriptPanelRenderer.setVisible(true);
   ns.transcriptPanelRenderer.setTranslation(model);
   return { ns, model, root: document.querySelector("#transcripts-panel") };
 }
@@ -36,6 +39,26 @@ describe("transcript panel renderer", () => {
     document.body.innerHTML = "";
   });
 
+  it("starts hidden until the controller applies an explicit opt-in", async () => {
+    fixture();
+    window.Echo360Translator = makeFullNs();
+    evalModule("vtt.js");
+    evalModule("transcript_model.js");
+    evalModule("transcript_panel_adapter.js");
+    evalModule("transcript_search_bridge.js");
+    evalModule("transcript_panel_renderer.js");
+    const ns = window.Echo360Translator;
+    const model = ns.transcriptModel.buildTranscriptModel({ originalVtt: original, translatedVtt: translated });
+    ns.transcriptPanelRenderer.start();
+    ns.transcriptPanelRenderer.setTranslation(model);
+    await ns.transcriptPanelRenderer.flush();
+    expect(document.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(0);
+
+    ns.transcriptPanelRenderer.setVisible(true);
+    await ns.transcriptPanelRenderer.flush();
+    expect(document.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
+  });
+
   it("injects one safe translation node per mapped cue and is idempotent", async () => {
     const { ns, root } = setup();
     await ns.transcriptPanelRenderer.flush();
@@ -44,6 +67,67 @@ describe("transcript panel renderer", () => {
     await ns.transcriptPanelRenderer.flush();
     expect(root.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
     expect(ns.transcriptPanelRenderer.getDebugState().decoratedCueRows).toBeGreaterThanOrEqual(2);
+  });
+
+  it("stops panel discovery and observers while disabled and restores them on enable", async () => {
+    const { ns } = setup();
+    await ns.transcriptPanelRenderer.flush();
+    const find = vi.spyOn(ns.transcriptPanelAdapter, "findPanelRoots");
+    ns.transcriptPanelRenderer.setVisible(false);
+    await ns.transcriptPanelRenderer.flush();
+    expect(find).not.toHaveBeenCalled();
+    expect(ns.transcriptPanelRenderer._state.panelObservers.size).toBe(0);
+    document.body.appendChild(document.createElement("div"));
+    await Promise.resolve();
+    expect(ns.transcriptPanelRenderer._state.flushScheduled).toBe(false);
+    ns.transcriptPanelRenderer.setVisible(true);
+    await ns.transcriptPanelRenderer.flush();
+    expect(find).toHaveBeenCalled();
+    expect(document.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
+  });
+
+  it("does not flush or rescan panels for unrelated document churn", async () => {
+    const { ns } = setup();
+    await ns.transcriptPanelRenderer.flush();
+    // Let the document-start scheduled frame settle before measuring observer
+    // activity for the unrelated subtree.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const find = vi.spyOn(ns.transcriptPanelAdapter, "findPanelRoots");
+    const before = ns.transcriptPanelRenderer._state.diagnostics.observerFlushCount;
+    const unrelated = document.createElement("div");
+    unrelated.className = "unrelated-page-churn";
+    unrelated.appendChild(document.createElement("span"));
+    document.body.appendChild(unrelated);
+    unrelated.appendChild(document.createElement("em"));
+    unrelated.firstElementChild.remove();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(find).not.toHaveBeenCalled();
+    expect(ns.transcriptPanelRenderer._state.diagnostics.observerFlushCount).toBe(before);
+  });
+
+  it("discovers and removes panel roots from relevant document mutations", async () => {
+    const { ns, root } = setup();
+    await ns.transcriptPanelRenderer.flush();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const find = vi.spyOn(ns.transcriptPanelAdapter, "findPanelRoots");
+    const parent = root.parentElement;
+    // The host can change its identifying attributes before React removes it;
+    // the tracked root still needs to be detached from renderer state.
+    root.id = "replaced-transcript-host";
+    root.remove();
+    await vi.waitFor(() => {
+      expect(ns.transcriptPanelRenderer._state.panelRoots.size).toBe(0);
+      expect(ns.transcriptPanelRenderer._state.panelObservers.size).toBe(0);
+    }, { timeout: 1000, interval: 20 });
+    expect(find).toHaveBeenCalled();
+
+    const reopened = root.cloneNode(true);
+    reopened.id = "transcripts-panel";
+    parent.appendChild(reopened);
+    await vi.waitFor(() => {
+      expect(ns.transcriptPanelRenderer._state.panelRoots.has(reopened)).toBe(true);
+      expect(reopened.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
+    }, { timeout: 1000, interval: 20 });
   });
 
   it("publishes panel discovery and model/layout diagnostics for field reports", async () => {
@@ -118,6 +202,7 @@ describe("transcript panel renderer", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     const first = root.querySelector('[data-echo360-transcript-translation="1"]');
     expect(first).not.toBeNull();
+    const find = vi.spyOn(ns.transcriptPanelAdapter, "findPanelRoots");
 
     // React may remove an unknown child while reconciling the native cue.  In
     // that case the MutationObserver record contains only the extension node;
@@ -126,6 +211,7 @@ describe("transcript panel renderer", () => {
     await vi.waitFor(() => {
       expect(root.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
     }, { timeout: 1500, interval: 20 });
+    expect(find).not.toHaveBeenCalled();
   });
 
   it("repairs a removed translation after the virtualized layout handshake", async () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { evalModule, makeFullNs } from "../helpers/load-module.js";
 
 const ORIGINAL_VTT = `WEBVTT
@@ -42,6 +42,10 @@ function setupPlayer() {
 }
 
 describe("player_caption_renderer", () => {
+  afterEach(() => {
+    window.Echo360Translator?.playerCaptionRenderer?.unmount();
+    vi.restoreAllMocks();
+  });
   beforeEach(() => {
     document.body.innerHTML = "";
   });
@@ -253,4 +257,47 @@ Short original
     })).toBe(false);
     expect(renderer.getDebugState().cueCount).toBe(2);
   });
+  it("does not rebuild an unchanged cue on repeated video frames, but switches at the cue boundary", () => {
+    const { renderer, video, surface } = setupPlayer();
+    let frame;
+    let handle = 0;
+    video.requestVideoFrameCallback = vi.fn((callback) => { frame = callback; return ++handle; });
+    video.cancelVideoFrameCallback = vi.fn();
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT });
+    const overlay = surface.parentElement.querySelector('[data-echo360-instructure-caption="1"]');
+    const firstLine = overlay.firstChild;
+    const replace = vi.spyOn(overlay, "replaceChildren");
+    const surfaceRect = vi.spyOn(surface, "getBoundingClientRect");
+    for (let i = 1; i <= 100; i += 1) { clock.mockReturnValue(i); frame(); }
+    expect(replace).not.toHaveBeenCalled();
+    expect(surfaceRect).not.toHaveBeenCalled();
+    expect(overlay.firstChild).toBe(firstLine);
+    video.currentTime = 2;
+    frame();
+    expect(replace).toHaveBeenCalledOnce();
+    expect(overlay.textContent).toBe("第二行");
+    renderer.setVisible(false);
+    expect(video.cancelVideoFrameCallback).toHaveBeenCalled();
+    const requests = video.requestVideoFrameCallback.mock.calls.length;
+    frame();
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requests);
+    renderer.setVisible(true);
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requests + 1);
+  });
+
+  it("observes native caption visibility changes without waiting for another video frame", async () => {
+    const { renderer, video, surface, nativeCaption } = setupPlayer();
+    vi.spyOn(video.parentElement, "getBoundingClientRect").mockReturnValue({ top: 0, bottom: 360, width: 640, height: 360 });
+    vi.spyOn(surface, "getBoundingClientRect").mockReturnValue({ top: 0, bottom: 360, width: 640, height: 360 });
+    vi.spyOn(nativeCaption, "getBoundingClientRect").mockReturnValue({ top: 280, bottom: 310, width: 200, height: 30 });
+    renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT, bilingual: true });
+    const overlay = surface.parentElement.querySelector('[data-echo360-instructure-caption="1"]');
+    expect(overlay.textContent).toBe("你好世界");
+    surface.hidden = true;
+    await Promise.resolve();
+    expect(overlay.textContent).toBe("你好世界Hello world");
+    expect(overlay.style.paddingBottom).toContain("48px");
+  });
+
 });

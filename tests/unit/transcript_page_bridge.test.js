@@ -391,4 +391,29 @@ describe("MAIN-world transcript layout bridge", () => {
     expect(listHost.scrollTop).toBe(100);
     expect(grid.scrollToPosition).toHaveBeenCalledWith({ scrollTop: 100 });
   });
+
+  it("keeps the lifecycle observer dormant until a bridge is installed and ignores unrelated DOM churn", async () => {
+    const { bridge, list, send } = setup();
+    const originalRowHeight = list.props.rowHeight;
+    expect(bridge.statesByToken.size).toBe(0);
+
+    expect(send(message("capabilities"))).toMatchObject({ ok: true });
+    expect(bridge.statesByToken.size).toBe(1);
+    const bridgedRowHeight = list.props.rowHeight;
+    expect(bridgedRowHeight).not.toBe(originalRowHeight);
+
+    const unrelated = document.createElement("div");
+    document.body.appendChild(unrelated);
+    unrelated.remove();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(bridge.statesByToken.has("panel-1")).toBe(true);
+    expect(list.props.rowHeight).toBe(bridgedRowHeight);
+
+    document.querySelector("#transcripts-panel").remove();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(bridge.statesByToken.has("panel-1")).toBe(false);
+    expect(list.props.rowHeight).toBe(originalRowHeight);
+  });
 });

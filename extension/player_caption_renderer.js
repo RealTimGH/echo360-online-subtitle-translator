@@ -6,6 +6,7 @@
   const SIZE_MAP = { small: "0.88em", medium: "1em", large: "1.14em" };
   const DEFAULT_BOTTOM_PADDING = "calc(var(--media-controls-height, 48px) + 2%)";
   const NATIVE_CAPTION_GAP_PX = 8;
+  const GEOMETRY_RECHECK_MS = 200;
 
   let state = null;
 
@@ -133,6 +134,18 @@
   }
 
   function styleOverlay(overlay, player, surface) {
+    // Read host geometry before touching our style to avoid read/write layout
+    // thrashing. Text and position are independent: moving native CC need not
+    // rebuild the translated cue nodes.
+    const nativeTop = state?.nativeInjection ? null : nativeCaptionTop(surface, player);
+    state.nativeTop = nativeTop;
+    const playerRect = nativeTop == null ? null : player?.getBoundingClientRect?.();
+    const nativeOffset = playerRect && Number.isFinite(playerRect.bottom)
+      ? Math.max(0, Math.ceil(playerRect.bottom - nativeTop + NATIVE_CAPTION_GAP_PX)) : 0;
+    const styleKey = `${state.size}:${nativeOffset}`;
+    if (state.styledOverlay === overlay && state.overlayStyleKey === styleKey) return;
+    state.styledOverlay = overlay;
+    state.overlayStyleKey = styleKey;
     overlay.style.display = "flex";
     overlay.style.position = "absolute";
     overlay.style.inset = "0";
@@ -147,11 +160,6 @@
     // a sibling of Vidstack's native captions surface: that surface is often
     // display:none/aria-hidden while the CC toggle is off, which would make
     // any child translation invisible as well.
-    const nativeTop = state?.nativeInjection ? null : nativeCaptionTop(surface, player);
-    const playerRect = nativeTop == null ? null : player?.getBoundingClientRect?.();
-    const nativeOffset = playerRect && Number.isFinite(playerRect.bottom)
-      ? Math.max(0, Math.ceil(playerRect.bottom - nativeTop + NATIVE_CAPTION_GAP_PX))
-      : 0;
     overlay.style.paddingTop = "0";
     overlay.style.paddingRight = "0.35em";
     overlay.style.paddingBottom = nativeOffset > 0 ? `${nativeOffset}px` : DEFAULT_BOTTOM_PADDING;
@@ -202,7 +210,10 @@
         priority: surface.style.getPropertyPriority("visibility"),
       });
     }
-    surface.style.setProperty("visibility", "hidden", "important");
+    if (surface.style.getPropertyValue("visibility") !== "hidden" ||
+      surface.style.getPropertyPriority("visibility") !== "important") {
+      surface.style.setProperty("visibility", "hidden", "important");
+    }
   }
 
   function ensureOverlay() {
@@ -214,7 +225,9 @@
       state.overlay?.remove();
       restorePlayerPosition(state.player);
       state.player = player;
-      state.observer?.observe(player, { childList: true, characterData: true, subtree: true });
+      state.observer?.observe(player, observerOptions);
+      state.resizeObserver?.disconnect();
+      state.resizeObserver?.observe(player);
     }
     ensurePositionedPlayer(player);
     const surface = state.surface?.isConnected ? state.surface : findSurface(state.video);
@@ -264,19 +277,26 @@
         restoreNativeCaptionSurface(surface);
       }
       if (state.overlay) {
-        state.overlay.hidden = true;
-        state.overlay.replaceChildren();
+        if (!state.overlay.hidden) state.overlay.hidden = true;
+        if (state.overlay.childNodes.length) state.overlay.replaceChildren();
       }
       return;
     }
+    if (!state.video?.isConnected) { unmount(); return; }
+    const index = findCueIndex(Number(state.video.currentTime || 0));
+    const now = performance.now();
+    if (index === state.currentCueIndex && !state.geometryDirty &&
+      state.overlay?.isConnected && state.player?.isConnected &&
+      now - state.lastGeometryAt < GEOMETRY_RECHECK_MS) return;
     const overlay = ensureOverlay();
     if (!overlay) return;
-    const index = findCueIndex(Number(state.video.currentTime || 0));
+    state.geometryDirty = false;
+    state.lastGeometryAt = now;
     const cue = index >= 0 ? state.cues[index] : null;
     state.currentCueIndex = index;
     if (!cue) {
-      overlay.hidden = true;
-      overlay.replaceChildren();
+      if (!overlay.hidden) overlay.hidden = true;
+      if (overlay.childNodes.length) overlay.replaceChildren();
       return;
     }
 
@@ -286,17 +306,22 @@
     // English line. If native CC is off, the user's bilingual preference still
     // works entirely inside the independent overlay.
     const nativeOriginalVisible = !state.nativeInjection &&
-      nativeCaptionTop(state.surface, state.player) != null;
+      state.nativeTop != null;
     if (state.bilingual && !nativeOriginalVisible) {
       const ordered = state.reverseOrder
         ? [["original", cue.original], ["translated", cue.translated]]
         : [["translated", cue.translated], ["original", cue.original]];
-      for (const [kind, text] of ordered) if (text) lines.push(lineElement(kind, text));
+      for (const [kind, text] of ordered) if (text) lines.push([kind, text]);
     } else if (cue.translated) {
-      lines.push(lineElement("translated", cue.translated));
+      lines.push(["translated", cue.translated]);
     }
-    overlay.replaceChildren(...lines);
-    overlay.hidden = lines.length === 0;
+    const unchanged = overlay.childNodes.length === lines.length && lines.every(([kind, text], index) => {
+      const node = overlay.childNodes[index];
+      return node.nodeType === 1 && node.getAttribute(LINE_ATTR) === kind && node.textContent === text;
+    });
+    if (!unchanged) overlay.replaceChildren(...lines.map(([kind, text]) => lineElement(kind, text)));
+    const hidden = lines.length === 0;
+    if (overlay.hidden !== hidden) overlay.hidden = hidden;
   }
 
   function isOwnMutation(record) {
@@ -310,13 +335,28 @@
   }
 
   function scheduleVideoFrame() {
-    if (!state || typeof state.video.requestVideoFrameCallback !== "function") return;
-    state.frameHandle = state.video.requestVideoFrameCallback(() => {
-      if (!state) return;
+    if (!state || !state.visible || state.frameHandle != null || typeof state.video.requestVideoFrameCallback !== "function") return;
+    const mounted = state;
+    let handle;
+    handle = state.video.requestVideoFrameCallback(() => {
+      if (state !== mounted || state.frameHandle !== handle) return;
+      state.frameHandle = null;
       render();
       scheduleVideoFrame();
     });
+    state.frameHandle = handle;
   }
+
+  function invalidateGeometry() {
+    if (!state) return;
+    state.geometryDirty = true;
+    render();
+  }
+
+  const observerOptions = {
+    childList: true, characterData: true, subtree: true, attributes: true,
+    attributeFilter: ["class", "style", "hidden", "aria-hidden", "data-part"],
+  };
 
   function update({ video, originalVtt, translatedVtt, size, bilingual, reverseOrder, nativeInjection } = {}) {
     if (!state) return false;
@@ -335,6 +375,7 @@
     if (reverseOrder !== undefined) state.reverseOrder = !!reverseOrder;
     if (nativeInjection !== undefined) state.nativeInjection = !!nativeInjection;
     state.currentCueIndex = -1;
+    state.geometryDirty = true;
     render();
     return true;
   }
@@ -367,6 +408,12 @@
       listeners: [],
       observer: null,
       frameHandle: null,
+      resizeObserver: null,
+      geometryDirty: true,
+      lastGeometryAt: -Infinity,
+      nativeTop: null,
+      styledOverlay: null,
+      overlayStyleKey: "",
       handlingMutation: false,
       surfaceVisibility: new Map(),
       playerPositions: new Map(),
@@ -378,10 +425,24 @@
     }
     state.observer = new MutationObserver((records) => {
       if (!state || state.handlingMutation || records.length === 0 || records.every(isOwnMutation)) return;
+      const relevant = records.some((record) => {
+        if (isOwnMutation(record)) return false;
+        if (record.type !== "attributes") return true;
+        const target = record.target;
+        return target === state.player || target === state.surface || target === state.video ||
+          state.surface?.contains(target) || target.contains?.(state.surface);
+      });
+      if (!relevant) return;
       state.handlingMutation = true;
-      try { render(); } finally { state.handlingMutation = false; }
+      try { invalidateGeometry(); } finally { if (state) state.handlingMutation = false; }
     });
-    state.observer.observe(player, { childList: true, characterData: true, subtree: true });
+    state.observer.observe(player, observerOptions);
+    if (typeof ResizeObserver === "function") {
+      state.resizeObserver = new ResizeObserver(invalidateGeometry);
+      state.resizeObserver.observe(player);
+    }
+    window.addEventListener("resize", invalidateGeometry);
+    document.addEventListener("fullscreenchange", invalidateGeometry);
     render();
     scheduleVideoFrame();
     console.info("[echo360-translator] mounted Instructure Media captions overlay", { cueCount: cues.length });
@@ -390,14 +451,23 @@
 
   function setVisible(visible) {
     if (!state) return;
-    state.visible = !!visible;
-    render();
+    const nextVisible = !!visible;
+    if (state.visible === nextVisible) return;
+    state.visible = nextVisible;
+    if (!nextVisible && state.frameHandle != null) {
+      state.video.cancelVideoFrameCallback?.(state.frameHandle);
+      state.frameHandle = null;
+    }
+    invalidateGeometry();
+    if (nextVisible) scheduleVideoFrame();
   }
 
   function applySize(size) {
     if (!state) return;
-    state.size = SIZE_MAP[size] ? size : "medium";
-    render();
+    const nextSize = SIZE_MAP[size] ? size : "medium";
+    if (state.size === nextSize) return;
+    state.size = nextSize;
+    invalidateGeometry();
   }
 
   function ensureMounted() {
@@ -406,9 +476,8 @@
       unmount();
       return false;
     }
-    const overlay = ensureOverlay();
     render();
-    return !!overlay?.isConnected;
+    return !!state?.overlay?.isConnected;
   }
 
   function isMounted() {
@@ -422,6 +491,9 @@
       state.video.cancelVideoFrameCallback(state.frameHandle);
     }
     state.observer?.disconnect();
+    state.resizeObserver?.disconnect();
+    window.removeEventListener("resize", invalidateGeometry);
+    document.removeEventListener("fullscreenchange", invalidateGeometry);
     for (const surface of Array.from(state.surfaceVisibility.keys())) {
       restoreNativeCaptionSurface(surface);
     }

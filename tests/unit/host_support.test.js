@@ -55,4 +55,20 @@ describe("host_support", () => {
     expect(support.getPlayer(video)).toBe(player);
     expect(support.getCaptionSurface(video)).toBe(surface);
   });
+
+  it("finds the class-only Instructure player instead of its outer lesson scroll shell", () => {
+    const support = setup();
+    const lessonShell = document.createElement("div");
+    lessonShell.className = "studio-player-container LtiEmbeddedPerspective";
+    const player = document.createElement("span");
+    player.className = "studio-player-container__player css-player-view";
+    const video = document.createElement("video");
+    player.appendChild(video);
+    lessonShell.appendChild(player);
+    document.body.appendChild(lessonShell);
+
+    expect(support.getPlayer(video)).toBe(player);
+    expect(support.getPlayer(video)).not.toBe(lessonShell);
+    expect(support.isInstructureVideo(video)).toBe(true);
+  });
 });

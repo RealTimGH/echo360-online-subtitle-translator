@@ -28,7 +28,11 @@
     // One shared budget covers candidate scans and transcript-file probes.
     // Individual requests may use less of it, but none may reset the clock.
     const sourceDeadlineAt = Date.now() + 12_000;
-    const sourceOptions = { deadlineAt: sourceDeadlineAt };
+    // Keep request results scoped to this resolution attempt. Candidate scans
+    // repeat while the player is still loading, so sharing this map prevents
+    // the same failed URL from creating another network request every 500 ms
+    // without retaining anything after the attempt settles.
+    const sourceOptions = { deadlineAt: sourceDeadlineAt, resourceRequests: new Map() };
     const isInstructureMedia = (
       ns.hostSupport?.isInstructureMediaHost?.() ||
       ns.hostSupport?.isInstructureMediaDocument?.()
@@ -331,7 +335,7 @@
       max_paragraphs: Number(cfg.maxParagraphs) || 6,
       max_chars: Number(cfg.maxChars) || 1200,
       // Keep the stored/shared tuning fields in the payload. The provider
-      // adapter clamps Google Web to its conservative 3 RPS / 3-worker profile.
+      // adapter clamps Google Web to its conservative 6 RPS / 3-worker profile.
       concurrency: Number(cfg.concurrency) || 96,
       rps: cfg.rps != null ? Number(cfg.rps) : 0,
       retries: cfg.retries != null ? Number(cfg.retries) : 1,
@@ -400,6 +404,7 @@
     // failure and must not be silently converted into a second translation.
     const waitOptions = {
       isActive: options.isActive || (() => true),
+      signal: options.signal,
       onProgress: options.onProgress || (() => {}),
       onPartialVtt: options.onPartialVtt || (() => {}),
       sourceVtt: payload.vtt_text || "",
@@ -415,6 +420,7 @@
     create = validateCreatedJobResponse(create, "backend");
     const waitOptions = {
       isActive: options.isActive || (() => true),
+      signal: options.signal,
       onProgress: options.onProgress || (() => {}),
       onPartialVtt: options.onPartialVtt || (() => {}),
       sourceVtt: payload.vtt_text || "",
@@ -487,6 +493,10 @@
     const warning = `Google Translate 在短时间内返回 ${rateLimitCount || "多"} 次 HTTP 429，已停止 Google 重试并改用本机 Argos 完成翻译。`;
     return {
       ...result,
+      // The returned VTT was produced by the fallback backend. Keep the
+      // provider field truthful so compact translation summaries report the
+      // service that actually completed the cues.
+      provider: "argos",
       warnings: [warning, ...(Array.isArray(result?.warnings) ? result.warnings : [])],
       metrics: {
         ...(result?.metrics || {}),
@@ -777,6 +787,63 @@
     }
   }
 
+  function resetMixedUnits(outputLines, sourceLines, units, indexes = new Set()) {
+    for (const index of indexes) {
+      const unit = units[index];
+      if (!unit) continue;
+      for (const textIndex of unit.textIndexes) outputLines[textIndex] = sourceLines[textIndex];
+    }
+  }
+
+  function mixedPartialTextIsUsable(value, sourceValue) {
+    const text = String(value ?? "").replace(/\r/g, "").trim();
+    const source = String(sourceValue ?? "").replace(/\r/g, "").trim();
+    if (!text || text === source) return false;
+    const pendingLabel = String(ns.constants?.SUBTITLE_PENDING_LABEL || "正在翻译中…").trim();
+    const failureLabel = String(ns.constants?.SUBTITLE_FAILURE_LABEL || "翻译失败").trim();
+    return text !== pendingLabel && text !== failureLabel;
+  }
+
+  // A mixed route receives a complete VTT-shaped partial from its child
+  // provider. Merge only non-source text lines into the outer VTT. Pending
+  // lines remain the original text, which lets the renderer turn them into
+  // its normal "正在翻译中" preview without ever exposing malformed cue
+  // structure or a child provider's local cue numbering.
+  function applyMixedShardPartial(outputLines, sourceLines, units, partialVtt) {
+    const partial = parseMixedCueUnits(partialVtt || "");
+    if (partial.units.length !== units.length) return { changed: false, updatedLines: 0 };
+    let changed = false;
+    let updatedLines = 0;
+    for (let index = 0; index < units.length; index += 1) {
+      const sourceUnit = units[index];
+      const partialUnit = partial.units[index];
+      if (partialUnit.textIndexes.length !== sourceUnit.textIndexes.length) {
+        return { changed: false, updatedLines: 0 };
+      }
+      for (let textIndex = 0; textIndex < sourceUnit.textIndexes.length; textIndex += 1) {
+        const sourceIndex = sourceUnit.textIndexes[textIndex];
+        const partialIndex = partialUnit.textIndexes[textIndex];
+        const nextText = partial.lines[partialIndex];
+        if (!mixedPartialTextIsUsable(nextText, sourceLines[sourceIndex])) continue;
+        if (outputLines[sourceIndex] === nextText) continue;
+        outputLines[sourceIndex] = nextText;
+        changed = true;
+        updatedLines += 1;
+      }
+    }
+    return { changed, updatedLines };
+  }
+
+  function addMixedCountMap(target, source) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return target;
+    for (const [key, value] of Object.entries(source)) {
+      const count = Number(value);
+      if (!key || !Number.isFinite(count) || count <= 0) continue;
+      target[key] = (target[key] || 0) + count;
+    }
+    return target;
+  }
+
   function mixedFailedUnitIndexes(result, unitCount) {
     const failedItems = Array.isArray(result?.failed_items) ? result.failed_items : [];
     const expectedFailed = Number(result?.metrics?.failed);
@@ -878,6 +945,11 @@
       fallbacksReceived: 0,
       inFlight: 0,
       circuitOpen: false,
+      retryCount: 0,
+      rateLimitCount: 0,
+      google429Responses: 0,
+      googleCircuitTripped: false,
+      observedFailureCodes: {},
       ...(priority.enabled
         ? { priorityGroup: item.priorityGroup, priorityIndex: item.priorityIndex }
         : {}),
@@ -886,6 +958,60 @@
     const routeProgress = new Map();
     const warnings = [];
     let completedLines = 0;
+
+    function providerBreakdownSnapshot() {
+      return Object.fromEntries(Array.from(providerState.entries()).map(([provider, state]) => [
+        provider,
+        {
+          ...state,
+          observedFailureCodes: { ...(state.observedFailureCodes || {}) },
+        },
+      ]));
+    }
+
+    function mixedTelemetry() {
+      const observedFailureCodes = {};
+      let retryCount = 0;
+      let rateLimitCount = 0;
+      let google429Responses = 0;
+      let googleCircuitTripped = false;
+      for (const state of providerState.values()) {
+        retryCount += Number(state.retryCount) || 0;
+        rateLimitCount += Number(state.rateLimitCount) || 0;
+        google429Responses += Number(state.google429Responses) || 0;
+        googleCircuitTripped = googleCircuitTripped || state.googleCircuitTripped === true;
+        addMixedCountMap(observedFailureCodes, state.observedFailureCodes);
+      }
+      return {
+        retryCount,
+        rateLimitCount,
+        google429Responses,
+        googleCircuitTripped,
+        observedFailureCodes,
+        observed_failure_codes: { ...observedFailureCodes },
+      };
+    }
+
+    function absorbProviderTelemetry(provider, resultOrError) {
+      const state = providerState.get(provider);
+      if (!state) return;
+      const metrics = resultOrError?.metrics && typeof resultOrError.metrics === "object"
+        ? resultOrError.metrics
+        : {};
+      state.retryCount += Number(metrics.retryCount) || 0;
+      state.rateLimitCount += Number(metrics.rateLimitCount) || 0;
+      state.google429Responses += Number(metrics.google429Responses) || 0;
+      state.googleCircuitTripped = state.googleCircuitTripped || metrics.googleCircuitTripped === true;
+      const observed = metrics.observedFailureCodes || metrics.observed_failure_codes ||
+        metrics.failureCodes || metrics.failure_codes || resultOrError?.failure_codes || resultOrError?.failureCodes;
+      addMixedCountMap(state.observedFailureCodes, observed);
+      const status = Number(resultOrError?.status ?? resultOrError?.statusCode);
+      if (status === 429) state.observedFailureCodes.HTTP_429 = (state.observedFailureCodes.HTTP_429 || 0) + 1;
+      const code = String(resultOrError?.code || resultOrError?.error_code || "").trim().toUpperCase();
+      if (code && code !== "ERROR" && code !== "UNKNOWN" && code !== "UNKNOWN_ERROR") {
+        state.observedFailureCodes[code] = (state.observedFailureCodes[code] || 0) + 1;
+      }
+    }
 
     function reportProgress(routeKey, current, total, line, provider, isFallback = false, completedBeforeAttempt = 0, attemptLines = null) {
       const group = groups.find((item) => item.provider === routeKey);
@@ -900,8 +1026,9 @@
         provider: "mixed",
         activeProvider: provider,
         fallback: isFallback,
-        providerBreakdown: Object.fromEntries(providerState),
+        providerBreakdown: providerBreakdownSnapshot(),
       });
+      return inFlight;
     }
 
     async function withProviderLease(provider, operation) {
@@ -969,12 +1096,50 @@
               completedRouteLines,
               attemptedLines
             ),
-            // A child partial cannot be merged safely until all of its cue
-            // lines have passed the normal result validator.
-            onPartialVtt: () => {},
+            onPartialVtt: (partialVtt, partialMeta = {}) => {
+              const merged = applyMixedShardPartial(outputLines, parsed.lines, attemptedUnits, partialVtt);
+              const partialCurrent = Number(partialMeta?.current ?? partialMeta?.completed ?? 0);
+              const partialTotal = Number(partialMeta?.total ?? attemptedLines);
+              const inFlight = reportProgress(
+                group.provider,
+                partialCurrent,
+                partialTotal,
+                partialMeta?.line || "",
+                candidate,
+                isFallback,
+                completedRouteLines,
+                attemptedLines
+              );
+              if (!merged.changed) return;
+              const telemetry = mixedTelemetry();
+              options.onPartialVtt?.(outputLines.join("\n"), {
+                current: inFlight,
+                completed: inFlight,
+                total: totalLines,
+                done: false,
+                translated: inFlight,
+                failed: 0,
+                activeProvider: candidate,
+                fallback: isFallback,
+                metrics: {
+                  provider: "mixed",
+                  total: totalLines,
+                  totalCues: parsed.units.length,
+                  processed: inFlight,
+                  translated: inFlight,
+                  failed: 0,
+                  providerResults: inFlight,
+                  targetResults: inFlight,
+                  providerBreakdown: providerBreakdownSnapshot(),
+                  ...telemetry,
+                },
+              });
+            },
           }));
+          absorbProviderTelemetry(candidate, result);
           const failedIndexes = mixedFailedUnitIndexes(result, attemptedUnits.length);
           applyMixedShardResult(outputLines, attemptedUnits, result, failedIndexes);
+          resetMixedUnits(outputLines, parsed.lines, attemptedUnits, failedIndexes);
           const succeededUnits = attemptedUnits.filter((_unit, index) => !failedIndexes.has(index));
           const succeededLines = succeededUnits.reduce((sum, unit) => sum + unit.textCount, 0);
           state.completedCues += succeededUnits.length;
@@ -982,12 +1147,24 @@
           completedRouteLines += succeededLines;
           routeProgress.set(group.provider, completedRouteLines);
           options.onPartialVtt?.(outputLines.join("\n"), {
+            current: completedLines,
             completed: completedLines,
             total: totalLines,
             done: false,
             translated: completedLines,
             failed: 0,
-            metrics: { provider: "mixed", providerBreakdown: Object.fromEntries(providerState) },
+            metrics: {
+              provider: "mixed",
+              total: totalLines,
+              totalCues: parsed.units.length,
+              processed: completedLines,
+              translated: completedLines,
+              failed: 0,
+              providerResults: completedLines,
+              targetResults: completedLines,
+              providerBreakdown: providerBreakdownSnapshot(),
+              ...mixedTelemetry(),
+            },
           });
           if (failedIndexes.size === 0) {
             if (isFallback) warnings.push(`${group.provider} 的剩余分片已由 ${candidate} 接管并完成。`);
@@ -1006,6 +1183,7 @@
           if (mixedPermanentFailure(firstFailure) || state.failures >= 2) state.circuitOpen = true;
           warnings.push(`${candidate} 有 ${pendingUnits.length} 个 cue 失败${state.circuitOpen ? "，本次任务已熔断" : ""}；已保留 ${succeededUnits.length} 个成功 cue 并改派。`);
         } catch (error) {
+          absorbProviderTelemetry(candidate, error);
           lastError = error;
           state.failures += 1;
           if (mixedPermanentFailure(error) || state.failures >= 2) state.circuitOpen = true;
@@ -1017,7 +1195,21 @@
       error.phase = "translation";
       error.cause = lastError;
       error.warnings = warnings.slice(0, 30);
-      error.providerBreakdown = Object.fromEntries(providerState);
+      error.providerBreakdown = providerBreakdownSnapshot();
+      error.metrics = {
+        provider: "mixed",
+        total: totalLines,
+        totalCues: parsed.units.length,
+        processed: completedLines,
+        translated: completedLines,
+        failed: Math.max(0, totalLines - completedLines),
+        providerResults: completedLines,
+        targetResults: completedLines,
+        providerBreakdown: error.providerBreakdown,
+        ...mixedTelemetry(),
+      };
+      error.failure_codes = { ...error.metrics.observedFailureCodes };
+      error.failureCodes = { ...error.metrics.observedFailureCodes };
       error.partial_vtt = outputLines.join("\n");
       throw error;
     }
@@ -1035,23 +1227,45 @@
       error.code = error.code || "MIXED_ALL_PROVIDERS_FAILED";
       error.phase = error.phase || "translation";
       error.warnings = warnings.slice(0, 30);
-      error.providerBreakdown = Object.fromEntries(providerState);
+      error.providerBreakdown = providerBreakdownSnapshot();
+      error.metrics = {
+        ...(error.metrics && typeof error.metrics === "object" ? error.metrics : {}),
+        provider: "mixed",
+        total: totalLines,
+        totalCues: parsed.units.length,
+        processed: completedLines,
+        translated: completedLines,
+        failed: Math.max(0, totalLines - completedLines),
+        providerResults: completedLines,
+        targetResults: completedLines,
+        providerBreakdown: error.providerBreakdown,
+        ...mixedTelemetry(),
+      };
+      error.failure_codes = error.failure_codes || { ...error.metrics.observedFailureCodes };
+      error.failureCodes = error.failureCodes || { ...error.metrics.observedFailureCodes };
       error.partial_vtt = outputLines.join("\n");
       throw error;
     }
+    const telemetry = mixedTelemetry();
+    const providerBreakdown = providerBreakdownSnapshot();
     const metrics = {
       provider: "mixed",
       total: totalLines,
+      totalCues: parsed.units.length,
       processed: totalLines,
+      processedCues: parsed.units.length,
       translated: totalLines,
+      translatedCues: parsed.units.length,
       failed: 0,
+      failedCues: 0,
       providerResults: totalLines,
       provider_results: totalLines,
       targetResults: totalLines,
       target_results: totalLines,
       failureCodes: {},
       failure_codes: {},
-      providerBreakdown: Object.fromEntries(providerState),
+      providerBreakdown,
+      ...telemetry,
     };
     if (priority.enabled) {
       const activeGroups = activePriorityGroups.map((group) => ({
@@ -1124,9 +1338,11 @@
   }
 
   async function buildCacheKey(cfg, sourceId, vttText) {
-    const vttHash = await ns.storage.sha256Text(vttText);
-    const stableSourceId = ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId;
-    const sourceKey = stableSourceId || `${location.href}#${vttHash}`;
+    const stableSourceId = String(ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId || "").trim();
+    // A canonical source URL already identifies the subtitle bytes for cache
+    // purposes. Avoid hashing the full VTT (which can be several megabytes)
+    // unless the source adapter could not provide a stable identifier.
+    const sourceKey = stableSourceId || `${location.href}#${await ns.storage.sha256Text(vttText)}`;
     const configSig = ns.storage.buildConfigSignature(cfg);
     return {
       sourceKey,

@@ -15,7 +15,7 @@ const TRANS_VTT = `WEBVTT
 
 `;
 
-function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaptionRenderer } = {}) {
+function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaptionRenderer, echoCaptionRenderer, hostSupport } = {}) {
   document.body.innerHTML = "";
   document.head.innerHTML = "";
   let objectUrlId = 0;
@@ -79,6 +79,8 @@ function setupRenderer({ domMountResult = true, buildBilingualVtt, playerCaption
       applySize: vi.fn(),
     },
     playerCaptionRenderer,
+    echoCaptionRenderer,
+    hostSupport,
     storage: {
       getPrefs: vi.fn(async () => ({ enabled: true, useNativeSubtitles: false })),
     },
@@ -106,6 +108,17 @@ describe("renderer Echo360 native CC mode", () => {
     expect(mounted).toBe(true);
     expect(domMount).toHaveBeenCalledOnce();
     expect(video.querySelectorAll("track").length).toBe(0);
+  });
+
+  it("does no video/track discovery while no translation render is active", () => {
+    const { renderer } = setupRenderer({ domMountResult: false });
+    const getAllVideos = vi.spyOn(window.Echo360Translator.video, "getAllVideos");
+    const queryDeep = vi.spyOn(window.Echo360Translator.video, "querySelectorAllDeep");
+
+    renderer.applySubtitleVisibility(true);
+
+    expect(getAllVideos).not.toHaveBeenCalled();
+    expect(queryDeep).not.toHaveBeenCalled();
   });
 
   it("removes an existing translated browser track before mounting the DOM renderer", () => {
@@ -299,6 +312,72 @@ describe("renderer Canvas Instructure Media mode", () => {
   });
 });
 
+describe("renderer Echo360 DOM caption mode", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("uses a player-local caption overlay instead of a browser track", () => {
+    let mounted = false;
+    const echoCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => mounted),
+      mount: vi.fn(() => {
+        mounted = true;
+        return true;
+      }),
+      update: vi.fn(() => true),
+      unmount: vi.fn(() => {
+        mounted = false;
+      }),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({
+      echoCaptionRenderer,
+      hostSupport: { isEcho360Document: () => true },
+    });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+    expect(echoCaptionRenderer.mount).toHaveBeenCalledWith(expect.objectContaining({
+      video,
+      originalVtt: ORIG_VTT,
+      translatedVtt: TRANS_VTT,
+      size: "medium",
+    }));
+    expect(video.querySelectorAll("track").length).toBe(0);
+  });
+
+  it("updates the Echo360 overlay in place during incremental refreshes", () => {
+    let mounted = false;
+    const echoCaptionRenderer = {
+      isSupportedVideo: vi.fn(() => true),
+      isMounted: vi.fn(() => mounted),
+      mount: vi.fn(() => {
+        mounted = true;
+        return true;
+      }),
+      update: vi.fn(() => true),
+      unmount: vi.fn(() => {
+        mounted = false;
+      }),
+      ensureMounted: vi.fn(),
+      setVisible: vi.fn(),
+      applySize: vi.fn(),
+    };
+    const { renderer, video } = setupRenderer({
+      echoCaptionRenderer,
+      hostSupport: { isEcho360Document: () => true },
+    });
+
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+    expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true, { incremental: true })).toBe(true);
+    expect(echoCaptionRenderer.update).toHaveBeenCalledWith(expect.objectContaining({ video }));
+    expect(echoCaptionRenderer.mount).toHaveBeenCalledOnce();
+  });
+});
+
 describe("renderer browser track mode", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -355,5 +434,48 @@ Partial
     expect(secondTrack).toBe(firstTrack);
     expect(secondSrc).not.toBe(firstSrc);
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
+  });
+
+  it("cleans superseded blob revocation timers and load listeners on teardown", () => {
+    vi.useFakeTimers();
+    try {
+      const { renderer, video } = setupRenderer();
+      expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+      const firstTrack = video.querySelector('track[data-echo360-translated="1"]');
+      const firstSrc = firstTrack?.getAttribute("src");
+      const updated = `${TRANS_VTT}\n<!-- incremental payload -->`;
+      expect(renderer.renderTranslatedTrack(updated, ORIG_VTT, false, "medium", false, null, true, { incremental: true })).toBe(true);
+      renderer.cleanupTranslatedTracks();
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith(firstSrc);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not inject a guessed WebVTT line coordinate into browser fallback cues", () => {
+    const OriginalBlob = globalThis.Blob;
+    let serializedPayload = "";
+    Object.defineProperty(globalThis, "Blob", {
+      configurable: true,
+      value: class extends OriginalBlob {
+        constructor(parts, options) {
+          super(parts, options);
+          serializedPayload = parts.map((part) => String(part)).join("");
+        }
+      },
+    });
+
+    try {
+      const { renderer } = setupRenderer();
+      expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+      expect(serializedPayload).toContain("00:00:00.000 --> 00:00:02.000");
+      expect(serializedPayload).not.toContain("line:-2");
+    } finally {
+      Object.defineProperty(globalThis, "Blob", {
+        configurable: true,
+        value: OriginalBlob,
+      });
+    }
   });
 });

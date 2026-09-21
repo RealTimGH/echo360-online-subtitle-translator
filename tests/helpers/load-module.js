@@ -4,17 +4,18 @@
  * Each extension module is an IIFE that registers itself onto
  * `window.Echo360Translator`. We:
  *  1. Set up the namespace with required constants/deps.
- *  2. Call `evalModule(filename)` — reads the source file from disk and
- *     instruments it when Vitest coverage is enabled.
- *     and executes it via `new Function`, which runs in global scope
- *     where jsdom's `window` is available.
+ *  2. Call `evalModule(filename)` — reads, compiles, and caches the source
+ *     for the current working-tree revision, instruments it when Vitest
+ *     coverage is enabled, and executes it via `new Function`, which runs in
+ *     global scope where jsdom's `window` is available.
  *  3. Tests then access the registered functions from the namespace.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInstrumenter } from "istanbul-lib-instrument";
+import { inject } from "vitest";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -25,6 +26,7 @@ export const PROJECT_ROOT = resolve(__dirname, "../..");
 export const EXT_DIR = resolve(PROJECT_ROOT, "extension");
 
 let instrumenter;
+const moduleCache = new Map();
 
 function getInstrumenter() {
   if (!instrumenter) {
@@ -37,29 +39,76 @@ function getInstrumenter() {
   return instrumenter;
 }
 
-/** Instrument extension IIFEs during Vitest runs. */
+/**
+ * Coverage is enabled by the Vitest coverage command, not by every Vitest
+ * invocation. The config passes the documented CLI state to each worker via
+ * Vitest's public provide/inject API. The CLI/env fallbacks keep this helper
+ * usable with older Vitest versions and with direct helper consumers.
+ */
 function shouldInstrumentForCoverage() {
-  return process.env.VITEST === "true";
+  if (process.env.ECHO360_COVERAGE === "true") return true;
+  if (process.env.ECHO360_COVERAGE === "false") return false;
+  try {
+    const provided = inject("echo360CoverageEnabled");
+    if (typeof provided === "boolean") return provided;
+  } catch (_) {
+    // Direct consumers do not have a Vitest worker context.
+  }
+  return process.argv.some((arg, index) => {
+    if (arg === "--coverage") return true;
+    if (arg === "--coverage.enabled") return process.argv[index + 1] !== "false";
+    return arg.startsWith("--coverage.enabled=") && arg.slice("--coverage.enabled=".length) !== "false";
+  });
+}
+
+function cachedModule(filepath) {
+  const { mtimeMs, size } = statSync(filepath);
+  const cached = moduleCache.get(filepath);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached;
+
+  const next = {
+    mtimeMs,
+    size,
+    source: readFileSync(filepath, "utf-8"),
+    plainFunction: null,
+    instrumentedFunction: null,
+  };
+  moduleCache.set(filepath, next);
+  return next;
+}
+
+function compileModule(code) {
+  // eslint-disable-next-line no-new-func
+  return new Function(code);
 }
 
 /**
  * Read an extension source file from disk and execute its IIFE in the
- * current global scope. Reading at runtime keeps tests aligned with the
- * exact working-tree source under review.
+ * current global scope. The cache is invalidated by source mtime/size, which
+ * keeps watch-mode reruns aligned with the working-tree source under review
+ * without repeating the expensive compile/instrument step on every setup.
  *
- * Under vitest, the source is istanbul-instrumented first so branch/line
- * hits are attributed back to extension/*.js (plain v8 cannot track code
- * executed via `new Function()`).
+ * When coverage is enabled, the source is istanbul-instrumented first so
+ * branch/line hits are attributed back to extension/*.js (plain v8 cannot
+ * track code executed via `new Function()`).
  */
 export function evalModule(filename) {
   const filepath = resolve(EXT_DIR, filename);
-  let code = readFileSync(filepath, "utf-8");
-  if (shouldInstrumentForCoverage()) {
+  const cached = cachedModule(filepath);
+  const instrument = shouldInstrumentForCoverage();
+  let evaluator = cached.plainFunction;
+  if (instrument && !cached.instrumentedFunction) {
     const coveragePath = relative(PROJECT_ROOT, filepath);
-    code = getInstrumenter().instrumentSync(code, coveragePath);
+    const code = getInstrumenter().instrumentSync(cached.source, coveragePath);
+    cached.instrumentedFunction = compileModule(code);
+    evaluator = cached.instrumentedFunction;
+  } else if (instrument) {
+    evaluator = cached.instrumentedFunction;
+  } else if (!evaluator) {
+    cached.plainFunction = compileModule(cached.source);
+    evaluator = cached.plainFunction;
   }
-  // eslint-disable-next-line no-new-func
-  new Function(code)();
+  evaluator();
 }
 
 /** Minimal namespace stub for modules that only need vtt constants. */

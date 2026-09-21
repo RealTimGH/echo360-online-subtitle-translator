@@ -10,6 +10,7 @@ const DIRECT_CACHE_KEY = "echo360DirectTranslateCache";
 const DIRECT_CACHE_SCHEMA = 3;
 const DIRECT_CACHE_MAX_ENTRIES = 10;
 const DIRECT_CACHE_MAX_CHARS = 5_000_000;
+const DIRECT_CACHE_TOUCH_INTERVAL_MS = 60_000;
 const MAX_TEXT_RESOURCE_BYTES = 5_000_000;
 const TEXT_RESOURCE_TIMEOUT_MS = 20_000;
 const MAX_BACKEND_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -17,8 +18,10 @@ const BACKEND_REQUEST_TIMEOUT_MS = 30_000;
 const BACKEND_SYNC_TRANSLATE_TIMEOUT_MS = 9 * 60 * 1000;
 const DIRECT_JOB_TTL_MS = 60 * 60 * 1000;
 const DIRECT_JOB_MAX_COUNT = 100;
+const DIRECT_JOB_MAX_RETAINED_CHARS = 24_000_000;
 const DIRECT_JOB_MAX_ACTIVE_COUNT = 4;
 const directJobs = new Map();
+let directCacheMutation = Promise.resolve();
 const INSTRUCTURE_MEDIA_HOST_RE = /(^|\.)instructuremedia\.com$/i;
 const SUPPORTED_PROVIDER_CODES_BG = new Set(["google-web", "deepl", "azure", "openai", "deepseek", "gemini", "argos", "custom-backend"]);
 const SUPPORTED_TARGET_CODES_BG = globalThis.Echo360Translator?.errorUtils?.SUPPORTED_TARGET_CODES || new Set([
@@ -814,6 +817,12 @@ async function setDirectCache(cache) {
   await extensionApi.storage.local.set({ [DIRECT_CACHE_KEY]: pruneDirectCache(cache) });
 }
 
+function enqueueDirectCacheMutation(operation) {
+  const next = directCacheMutation.catch(() => {}).then(operation);
+  directCacheMutation = next.catch(() => {});
+  return next;
+}
+
 async function getDirectCacheEntry(cacheKey, sourceVtt = "", target = "", bilingual = false) {
   const cache = await getDirectCache();
   const entry = cache[cacheKey];
@@ -835,23 +844,31 @@ async function getDirectCacheEntry(cacheKey, sourceVtt = "", target = "", biling
       phase: "cache",
     });
   }
-  entry.used_at = Date.now();
-  try {
-    await setDirectCache(cache);
-    return entry;
-  } catch (err) {
-    // Cache metadata updates should never block a valid cache hit.
-    const warning = {
-      code: "CACHE_WRITE_FAILED",
-      message: "翻译缓存命中，但更新缓存使用时间失败；本次仍使用缓存",
-      details: { operation: "touch_cache_entry", cause: String(err?.message || err || "storage write failed").slice(0, 240) },
-    };
-    backgroundLog("warn", "direct cache metadata update failed", {
-      error: serializeBackgroundError(Object.assign(new Error(warning.message), warning), { phase: "cache" }),
-    });
-    entry.cache_warning = warning;
-    return entry;
+  const now = Date.now();
+  const lastUsedAt = Number(entry.used_at);
+  if (!Number.isFinite(lastUsedAt) || now - lastUsedAt >= DIRECT_CACHE_TOUCH_INTERVAL_MS) {
+    try {
+      await enqueueDirectCacheMutation(async () => {
+        const latestCache = await getDirectCache();
+        const latestEntry = latestCache[cacheKey];
+        if (!latestEntry) return;
+        latestEntry.used_at = now;
+        await setDirectCache(latestCache);
+      });
+    } catch (err) {
+      // Cache metadata updates should never block a valid cache hit.
+      const warning = {
+        code: "CACHE_WRITE_FAILED",
+        message: "翻译缓存命中，但更新缓存使用时间失败；本次仍使用缓存",
+        details: { operation: "touch_cache_entry", cause: String(err?.message || err || "storage write failed").slice(0, 240) },
+      };
+      backgroundLog("warn", "direct cache metadata update failed", {
+        error: serializeBackgroundError(Object.assign(new Error(warning.message), warning), { phase: "cache" }),
+      });
+      entry.cache_warning = warning;
+    }
   }
+  return entry;
 }
 
 function pruneDirectCache(cache) {
@@ -873,9 +890,11 @@ function pruneDirectCache(cache) {
 async function setDirectCacheEntry(cacheKey, translatedVtt, sourceVtt = "", target = "", bilingual = false) {
   const targetCode = String(target || "").toUpperCase();
   const targetRequiresCjk = ["ZH", "ZH-HK", "YUE", "CANTONESE"].includes(targetCode);
+  const sourceTextCount = countTranslatableLines(sourceVtt);
+  const translatedTextCount = countTranslatableLines(translatedVtt || "");
   if (!translatedVtt || !validTranslatedVtt(translatedVtt, sourceVtt) ||
-    ((!bilingual && countTranslatableLines(translatedVtt) !== countTranslatableLines(sourceVtt)) ||
-      (bilingual && countTranslatableLines(translatedVtt) < countTranslatableLines(sourceVtt))) ||
+    ((!bilingual && translatedTextCount !== sourceTextCount) ||
+      (bilingual && translatedTextCount < sourceTextCount)) ||
     (targetRequiresCjk && hasCjkInEveryTimedCue(translatedVtt, {
       bilingual,
       sourceVtt,
@@ -886,38 +905,41 @@ async function setDirectCacheEntry(cacheKey, translatedVtt, sourceVtt = "", targ
   if (translatedVtt.length > DIRECT_CACHE_MAX_CHARS) {
     return { ok: false, error: Object.assign(new Error("translated_vtt 超出本地缓存大小限制"), { code: "CACHE_WRITE_FAILED" }) };
   }
-  let cache;
-  try {
-    cache = await getDirectCache();
-  } catch (err) {
-    return {
-      ok: false,
-      error: Object.assign(new Error("本地翻译缓存读取失败，无法更新缓存"), {
-        code: "CACHE_READ_FAILED",
-        cause: err,
-      }),
-    };
-  }
-  cache[cacheKey] = {
-    translated_vtt: translatedVtt,
-    created_at: Date.now(),
-    used_at: Date.now(),
-    size: translatedVtt.length,
-  };
-  try {
-    await setDirectCache(cache);
-    return { ok: true };
-  } catch (_) {
+  return enqueueDirectCacheMutation(async () => {
+    let cache;
     try {
-      await extensionApi.storage.local.set({
-        [DIRECT_CACHE_KEY]: pruneDirectCache({ [cacheKey]: cache[cacheKey] }),
-      });
-      return { ok: true };
+      cache = await getDirectCache();
     } catch (err) {
-      console.warn("[echo360-translator] direct cache skipped:", err?.message || String(err));
-      return { ok: false, error: Object.assign(new Error(err?.message || String(err)), { code: "CACHE_WRITE_FAILED" }) };
+      return {
+        ok: false,
+        error: Object.assign(new Error("本地翻译缓存读取失败，无法更新缓存"), {
+          code: "CACHE_READ_FAILED",
+          cause: err,
+        }),
+      };
     }
-  }
+    const now = Date.now();
+    cache[cacheKey] = {
+      translated_vtt: translatedVtt,
+      created_at: now,
+      used_at: now,
+      size: translatedVtt.length,
+    };
+    try {
+      await setDirectCache(cache);
+      return { ok: true };
+    } catch (_) {
+      try {
+        await extensionApi.storage.local.set({
+          [DIRECT_CACHE_KEY]: pruneDirectCache({ [cacheKey]: cache[cacheKey] }),
+        });
+        return { ok: true };
+      } catch (err) {
+        console.warn("[echo360-translator] direct cache skipped:", err?.message || String(err));
+        return { ok: false, error: Object.assign(new Error(err?.message || String(err)), { code: "CACHE_WRITE_FAILED" }) };
+      }
+    }
+  });
 }
 
 /**
@@ -997,6 +1019,7 @@ function createDirectJob(payload) {
       stage: "preparing",
     },
     partial_vtt: "",
+    partial_revision: 0,
     result: null,
     error: "",
     error_code: "",
@@ -1106,8 +1129,10 @@ function createDirectJob(payload) {
           job.warnings = cachedWarnings;
           job.failure_codes = {};
           job.failed_items = [];
+          job.partial_vtt = "";
           job.status = "completed";
           job.updatedAt = Date.now();
+          pruneDirectJobs();
           backgroundLog("info", "direct job cache hit", { jobId });
           return;
         }
@@ -1120,7 +1145,10 @@ function createDirectJob(payload) {
           job.updatedAt = Date.now();
         },
         onPartialVtt: (partialVtt, meta = {}) => {
-          job.partial_vtt = partialVtt;
+          if (partialVtt !== job.partial_vtt) {
+            job.partial_vtt = partialVtt;
+            job.partial_revision = Number(job.partial_revision || 0) + 1;
+          }
           job.progress = {
             current: Number(meta.completed || job.progress?.current || 0),
             total: Number(meta.total || job.progress?.total || 0),
@@ -1129,6 +1157,7 @@ function createDirectJob(payload) {
             translated: Number(meta.translated || 0),
             failed: Number(meta.failed || 0),
             failed_items: Array.isArray(meta.failed_items) ? meta.failed_items : (job.progress?.failed_items || []),
+            failed_cues: Array.isArray(meta.failed_cues) ? meta.failed_cues : (job.progress?.failed_cues || []),
             ...(meta.metrics || {}),
           };
           job.metrics = meta.metrics || job.metrics;
@@ -1138,9 +1167,13 @@ function createDirectJob(payload) {
       validateDirectTranslationResult(result, payload);
       const combinedWarnings = [...preTranslationWarnings, ...(Array.isArray(result.warnings) ? result.warnings : [])];
       job.result = { ...result, warnings: combinedWarnings, cache_hit: false };
+      // The terminal result is retained for polling, so the last partial VTT
+      // would otherwise duplicate the full translated payload in memory.
+      job.partial_vtt = "";
       job.metrics = result.metrics || null;
       job.warnings = combinedWarnings;
       job.failed_items = Array.isArray(result.failed_items) ? result.failed_items : [];
+      job.failed_cues = Array.isArray(result.failed_cues) ? result.failed_cues : [];
       job.failure_codes = result.failure_codes || result.failureCodes || result.metrics?.failure_codes || result.metrics?.failureCodes || {};
       job.status = "completed";
       job.updatedAt = Date.now();
@@ -1180,6 +1213,7 @@ function createDirectJob(payload) {
         warnings: job.warnings.length,
         metrics: job.metrics,
       });
+      pruneDirectJobs();
     } catch (err) {
       job.status = "failed";
       job.metrics = err?.metrics || job.metrics || null;
@@ -1210,7 +1244,10 @@ function createDirectJob(payload) {
         target: job.target,
         phase: errorDetail.phase || err?.phase || "translation",
       };
-      if (err?.partial_vtt) job.partial_vtt = err.partial_vtt;
+      if (err?.partial_vtt && err.partial_vtt !== job.partial_vtt) {
+        job.partial_vtt = err.partial_vtt;
+        job.partial_revision = Number(job.partial_revision || 0) + 1;
+      }
       job.updatedAt = Date.now();
       backgroundLog("error", "direct job failed", {
         jobId,
@@ -1220,6 +1257,7 @@ function createDirectJob(payload) {
         failureSample: job.failed_items.slice(0, 10),
         failureCodes: job.failure_codes,
       });
+      pruneDirectJobs();
     }
   })();
 
@@ -1229,7 +1267,8 @@ function createDirectJob(payload) {
 function pruneDirectJobs() {
   const now = Date.now();
   for (const [jobId, job] of directJobs.entries()) {
-    if (now - (job.updatedAt || job.createdAt) > DIRECT_JOB_TTL_MS) directJobs.delete(jobId);
+    const terminal = job.status === "completed" || job.status === "failed";
+    if (terminal && now - (job.updatedAt || job.createdAt) > DIRECT_JOB_TTL_MS) directJobs.delete(jobId);
   }
   const overflow = directJobs.size - DIRECT_JOB_MAX_COUNT;
   if (overflow > 0) {
@@ -1237,6 +1276,23 @@ function pruneDirectJobs() {
       .filter(([, job]) => job.status === "completed" || job.status === "failed")
       .sort((a, b) => Number(a[1].updatedAt || a[1].createdAt || 0) - Number(b[1].updatedAt || b[1].createdAt || 0));
     for (const [jobId] of removable.slice(0, overflow)) directJobs.delete(jobId);
+  }
+
+  const retainedChars = (job) =>
+    String(job?.partial_vtt || "").length + String(job?.result?.translated_vtt || "").length;
+  let totalChars = Array.from(directJobs.values()).reduce((sum, job) => sum + retainedChars(job), 0);
+  if (totalChars <= DIRECT_JOB_MAX_RETAINED_CHARS) return;
+
+  // Keep the newest terminal result available for a caller that is about to
+  // poll it. Evict older terminal payloads first; active work is never
+  // cancelled or removed by memory pruning.
+  const terminal = Array.from(directJobs.entries())
+    .filter(([, job]) => job.status === "completed" || job.status === "failed")
+    .sort((a, b) => Number(b[1].updatedAt || b[1].createdAt || 0) - Number(a[1].updatedAt || a[1].createdAt || 0));
+  for (const [jobId, job] of terminal.slice(1)) {
+    if (totalChars <= DIRECT_JOB_MAX_RETAINED_CHARS) break;
+    totalChars -= retainedChars(job);
+    directJobs.delete(jobId);
   }
 }
 
@@ -1468,6 +1524,7 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
         "INVALID_REQUEST"
       );
     }
+    pruneDirectJobs();
     const job = directJobs.get(message.jobId);
     if (!job) {
       return backgroundErrorResponse(
@@ -1476,7 +1533,16 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
         "JOB_NOT_FOUND"
       );
     }
-    return { ok: true, data: job };
+    const responseJob = { ...job };
+    // Partial VTT can be several megabytes. Once the caller has seen the
+    // current revision, omit the unchanged body from the next poll while
+    // preserving progress, diagnostics, and the revision token.
+    if (job.status === "running" &&
+      Number.isInteger(job.partial_revision) &&
+      Number(message.partial_revision) === job.partial_revision) {
+      delete responseJob.partial_vtt;
+    }
+    return { ok: true, data: responseJob };
   }
 
   if (message.type === "OPEN_OPTIONS_PAGE") {

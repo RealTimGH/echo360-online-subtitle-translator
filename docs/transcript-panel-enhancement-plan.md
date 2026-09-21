@@ -742,7 +742,7 @@ Echo360 原文
 
 - 视频字幕 `enabled=false` 不自动隐藏 panel 译文。
 - 视频字幕 `bilingual=false` 不把 panel 原文移除。
-- 新增 `transcriptPanelEnabled`，默认 `true`；用户可以在扩展设置中单独关闭。
+- 新增 `transcriptPanelEnabled`，默认 `false`；新安装和升级均保持关闭，用户可以在扩展设置中明确开启，已有显式开启选择会保留。
 - target 跟随当前翻译目标；默认 ZH，因此本需求呈现中文。若用户主动选择 JA/YUE 等，第二行显示相应目标语言。
 
 此产品决定已于 2026-08-24 获用户确认，首版实现按上述行为交付；真实浏览器验收仍按第 14.5 节执行。
@@ -763,7 +763,7 @@ Echo360 原文
 | `extension/transcript_search_bridge.js` | 新增；同输入框中文索引、译文高亮、计数和导航 |
 | `extension/page_probe.js` | 增加 allowlist MAIN-world transcript layout bridge；只做 capability、rowHeight、reflow、scroll/restore |
 | `extension/controller.js` | 增加统一 render surfaces helper，接入所有翻译状态 |
-| `extension/storage.js` | prefs schema 加 `transcriptPanelEnabled`，默认 `true` |
+| `extension/storage.js` | prefs schema 加 `transcriptPanelEnabled`，默认 `false`，保留显式开启选择 |
 | `extension/ui_popover.js` | 加入独立“增强 Transcript 面板”设置 |
 | `extension/ui_styles.js` 或新 renderer style | 添加完全 namespace 的宿主 panel 样式 |
 | `tests/helpers/load-module.js` | 注册新模块的 namespace/test loader |
@@ -1024,7 +1024,7 @@ Safari 手工验收前，必须确认“当前源代码、manifest、Xcode bundl
 
 - 已统一 render surfaces helper。
 - 已接入 cache、partial、final、failed、retry、cancel。
-- 已加入确认的独立 prefs 开关，默认开启，并覆盖 panel disabled 早退。
+- 已加入确认的独立 prefs 开关，默认关闭，并覆盖 panel disabled 早退。
 
 代码退出条件已满足：所有翻译状态的自动化回归通过，无重复、无串课证据。
 
@@ -1051,7 +1051,7 @@ Safari 手工验收前，必须确认“当前源代码、manifest、Xcode bundl
 
 已确认采用：
 
-- `Transcript panel 增强` 独立开关，默认开启；
+- `Transcript panel 增强` 独立开关，默认关闭；新安装/升级只有在用户明确开启后才装饰 cue；
 - 关闭视频字幕不隐藏 panel 译文；
 - 关闭双语视频字幕不影响 panel 的“英文 + 译文”；
 - 译文语言跟随当前 target，默认中文。

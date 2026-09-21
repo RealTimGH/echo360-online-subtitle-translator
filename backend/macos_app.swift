@@ -9,7 +9,14 @@ import Foundation
 /// view, Tcl/Tk runtime, polling thread, or second event loop.
 final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static let maxLogLines = 500
+    // A child can emit a malformed/no-newline diagnostic indefinitely. Keep
+    // both the cross-thread queue and the current partial line bounded so a
+    // noisy process cannot grow the host's memory without limit.
+    private static let maxQueuedOutputBytes = 1_048_576
+    private static let maxPendingLineBytes = 65_536
+    private static let maxLogLineBytes = 16_384
     private let coreName = "echo360-subtitle-backend-core"
+    private let outputQueueLock = NSLock()
 
     private var window: NSWindow!
     private var statusField: NSTextField!
@@ -18,6 +25,9 @@ final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var backendProcess: Process?
     private var outputPipe: Pipe?
     private var pendingOutput = ""
+    private var queuedOutput = ""
+    private var outputDrainScheduled = false
+    private var logRefreshScheduled = false
     private var logLines: [String] = []
     private var requestCount = 0
     private var listenSummary = "监听 127.0.0.1:8765"
@@ -165,12 +175,12 @@ final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 guard let self else { return }
                 self.backendProcess = nil
                 self.outputPipe?.fileHandleForReading.readabilityHandler = nil
-                self.flushPendingOutput()
+                self.drainQueuedOutputAndFlush()
                 let code = process.terminationStatus
                 self.setStatus("后端已停止", color: .systemRed)
                 self.detailField.stringValue = "退出码：\(code)"
                 self.appendLogLine("后端核心已退出，退出码 \(code)。")
-                self.refreshLogView()
+                self.scheduleLogRefresh()
             }
         }
 
@@ -179,15 +189,13 @@ final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             if data.isEmpty {
                 handle.readabilityHandler = nil
                 DispatchQueue.main.async {
-                    self?.flushPendingOutput()
+                    self?.drainQueuedOutputAndFlush()
                 }
                 return
             }
             let output = String(decoding: data, as: UTF8.self)
             guard !output.isEmpty else { return }
-            DispatchQueue.main.async {
-                self?.appendOutput(output)
-            }
+            self?.enqueueOutput(output)
         }
 
         backendProcess = child
@@ -218,33 +226,89 @@ final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         setStatus("启动失败", color: .systemRed)
         detailField.stringValue = "请检查应用包中的后端核心"
         appendLogLine(message)
-        refreshLogView()
+        scheduleLogRefresh()
     }
 
     private func appendOutput(_ output: String) {
         pendingOutput += output
+        if pendingOutput.utf8.count > Self.maxPendingLineBytes {
+            pendingOutput = boundedUtf8Suffix(pendingOutput, maxBytes: Self.maxPendingLineBytes)
+        }
         let parts = pendingOutput.components(separatedBy: "\n")
         let completeLines = parts.dropLast()
         pendingOutput = parts.last ?? ""
         for line in completeLines {
             appendLogLine(line.trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
         }
-        refreshLogView()
+        scheduleLogRefresh()
     }
 
     private func flushPendingOutput() {
         guard !pendingOutput.isEmpty else { return }
         appendLogLine(pendingOutput.trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
         pendingOutput = ""
-        refreshLogView()
+        scheduleLogRefresh()
+    }
+
+    private func enqueueOutput(_ output: String) {
+        guard !output.isEmpty else { return }
+        var shouldSchedule = false
+        outputQueueLock.lock()
+        queuedOutput += output
+        if queuedOutput.utf8.count > Self.maxQueuedOutputBytes {
+            queuedOutput = boundedUtf8Suffix(queuedOutput, maxBytes: Self.maxQueuedOutputBytes)
+        }
+        if !outputDrainScheduled {
+            outputDrainScheduled = true
+            shouldSchedule = true
+        }
+        outputQueueLock.unlock()
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in
+                self?.drainQueuedOutput()
+            }
+        }
+    }
+
+    private func drainQueuedOutput() {
+        outputQueueLock.lock()
+        let output = queuedOutput
+        queuedOutput = ""
+        outputDrainScheduled = false
+        outputQueueLock.unlock()
+        if !output.isEmpty {
+            appendOutput(output)
+        }
+    }
+
+    private func drainQueuedOutputAndFlush() {
+        // EOF is delivered after the pipe has no more bytes. Drain anything
+        // already queued before publishing the final unterminated line.
+        outputQueueLock.lock()
+        outputDrainScheduled = true
+        outputQueueLock.unlock()
+        while true {
+            outputQueueLock.lock()
+            let output = queuedOutput
+            queuedOutput = ""
+            if output.isEmpty {
+                outputDrainScheduled = false
+                outputQueueLock.unlock()
+                break
+            }
+            outputQueueLock.unlock()
+            appendOutput(output)
+        }
+        flushPendingOutput()
     }
 
     private func appendLogLine(_ line: String) {
-        logLines.append(line)
+        let boundedLine = boundedUtf8Suffix(line, maxBytes: Self.maxLogLineBytes)
+        logLines.append(boundedLine)
         if logLines.count > Self.maxLogLines {
             logLines.removeFirst(logLines.count - Self.maxLogLines)
         }
-        if line.contains(" HTTP/") {
+        if boundedLine.contains(" HTTP/") {
             requestCount += 1
             detailField?.stringValue = "\(listenSummary) · 已处理 \(requestCount) 个请求"
         }
@@ -257,6 +321,28 @@ final class BackendAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             logView.string += "\n"
             logView.scrollToEndOfDocument(nil)
         }
+    }
+
+    private func scheduleLogRefresh() {
+        guard !logRefreshScheduled else { return }
+        logRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.logRefreshScheduled = false
+            self.refreshLogView()
+        }
+    }
+
+    private func boundedUtf8Suffix(_ value: String, maxBytes: Int) -> String {
+        guard maxBytes > 0, value.utf8.count > maxBytes else { return value }
+        let bytes = value.utf8
+        var start = bytes.index(bytes.endIndex, offsetBy: -maxBytes)
+        // Skip a truncated code point rather than introducing a replacement
+        // character whose encoding could exceed the byte budget.
+        while start < bytes.endIndex && (bytes[start] & 0xC0) == 0x80 {
+            start = bytes.index(after: start)
+        }
+        return String(decoding: bytes[start...], as: UTF8.self)
     }
 
     private func setStatus(_ value: String, color: NSColor) {

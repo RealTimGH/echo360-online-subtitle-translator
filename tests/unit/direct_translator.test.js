@@ -87,7 +87,7 @@ Third line
     const adapter = translator.getProviderAdapter("google-web");
 
     expect(adapter.concurrencyCap).toBe(3);
-    expect(adapter.defaultRps).toBe(3);
+    expect(adapter.defaultRps).toBe(6);
   });
 
   it("stops before the provider request when the whole-task deadline has expired", async () => {
@@ -303,12 +303,12 @@ Third line
         effectiveConcurrency: 2,
         requestedRps: 96,
         batches: 2,
-        effectiveRps: 3,
+        effectiveRps: 6,
         failed: 1,
         translated: 1,
         rateLimitCount: 1,
       });
-      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 3 }));
+      expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 6 }));
       expect(progress).toHaveBeenLastCalledWith(2, 2, "[2/2] Translating...", expect.objectContaining({ failed: 1 }));
       expect(partial).toHaveBeenLastCalledWith(
         expect.stringContaining("第二条"),
@@ -397,7 +397,7 @@ Third line
         code: "GOOGLE_WEB_ALL_REQUESTS_FAILED",
         metrics: expect.objectContaining({
           effectiveConcurrency: 2,
-          effectiveRps: 3,
+          effectiveRps: 6,
           failed: 2,
         }),
         failure_codes: { HTTP_429: 2 },
@@ -510,7 +510,7 @@ Third line
         effectiveRps: 1,
         initialProfile: {
           effectiveConcurrency: 2,
-          effectiveRps: 3,
+          effectiveRps: 6,
           failed: 2,
           failureCodes: { HTTP_429: 2 },
         },
@@ -657,6 +657,38 @@ Third line
         metrics: expect.objectContaining({ total: 1, failed: 1, providerResults: 0 }),
       });
     } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("keeps aggregate failure counts while bounding item-level diagnostics", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Load failed"));
+    const cues = Array.from({ length: 60 }, (_, index) => (
+      `00:00:${String(index).padStart(2, "0")}.000 --> 00:00:${String(index + 1).padStart(2, "0")}.000\nline ${index + 1}`
+    )).join("\n\n");
+    try {
+      const error = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "ZH",
+        concurrency: 3,
+        retries: 0,
+        max_paragraphs: 6,
+        max_chars: 1200,
+        vtt_text: `WEBVTT\n\n${cues}\n`,
+      }).catch((caught) => caught);
+      expect(error).toMatchObject({
+        code: "NO_TRANSLATIONS",
+        metrics: expect.objectContaining({ failed: 60, total: 60 }),
+        failed_items: expect.any(Array),
+        failure_codes: expect.any(Object),
+      });
+      expect(error.failed_items).toHaveLength(50);
+      expect(error.failed_cues).toHaveLength(60);
+      expect(error.failed_cues.at(-1)).toBe(60);
+      expect(Object.values(error.failure_codes).reduce((sum, count) => sum + count, 0)).toBe(60);
+    } finally {
+      expect(fetchMock).toHaveBeenCalled();
       fetchMock.mockRestore();
     }
   });

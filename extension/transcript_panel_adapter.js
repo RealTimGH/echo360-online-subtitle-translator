@@ -11,6 +11,11 @@
   const LIST_SELECTOR = '.transcript-list[role="grid"]';
   const ROWGROUP_SELECTOR = '.ReactVirtualized__Grid__innerScrollContainer[role="rowgroup"]';
   const CUE_SELECTOR = 'dd[data-test-component="Content"][title$=" min"], dd[data-test-component="Content"][title$=" sec"]';
+  // Panel structure is stable across cue mutations.  Keep the expensive
+  // selector walk for the panel's structural nodes in a weak cache, while cue
+  // candidates remain live because React virtualisation replaces those rows.
+  // WeakMap avoids retaining detached SPA panel roots.
+  const structureCache = new WeakMap();
 
   function normalizeText(value) {
     return modelApi()?.normalizeSearchText?.(value) || String(value || "").trim().toLowerCase();
@@ -37,29 +42,68 @@
       !!panelRoot.querySelector(SEARCH_SELECTOR);
   }
 
+  function getPanelStructure(panelRoot) {
+    if (!panelRoot?.querySelector) return null;
+    const cached = structureCache.get(panelRoot);
+    if (cached &&
+      cached.searchInput?.isConnected && panelRoot.contains(cached.searchInput) &&
+      cached.listHost?.isConnected && panelRoot.contains(cached.listHost) &&
+      cached.rowGroup?.isConnected && cached.listHost.contains(cached.rowGroup) &&
+      cached.searchContainer?.isConnected && panelRoot.contains(cached.searchContainer) &&
+      cached.searchInput.matches?.(SEARCH_SELECTOR) &&
+      cached.listHost.matches?.(LIST_SELECTOR) &&
+      cached.searchContainer.matches?.('[data-test-id="search-transcripts"]') &&
+      (!cached.hasRowGroup || cached.rowGroup.matches?.(ROWGROUP_SELECTOR)) &&
+      panelRoot.id === "transcripts-panel" &&
+      panelRoot.getAttribute("role") === "tabpanel" &&
+      !isEditorContext(panelRoot) &&
+      (!panelRoot.getAttribute("aria-labelledby") || panelRoot.getAttribute("aria-labelledby") === "transcripts-tab") &&
+      (cached.hasRowGroup || !cached.listHost.querySelector(ROWGROUP_SELECTOR))) {
+      return cached;
+    }
+    if (!isViewerPanel(panelRoot)) {
+      structureCache.delete(panelRoot);
+      return null;
+    }
+    const searchInput = panelRoot.querySelector(SEARCH_SELECTOR);
+    const searchContainer = panelRoot.querySelector('#search-transcripts[data-test-id="search-transcripts"]') ||
+      searchInput?.closest?.('[data-test-id="search-transcripts"]') || null;
+    const listHost = panelRoot.querySelector(LIST_SELECTOR);
+    const rowGroup = listHost?.querySelector?.(ROWGROUP_SELECTOR) || listHost || null;
+    const hasRowGroup = rowGroup !== listHost;
+    if (!searchInput || String(searchInput.tagName).toLowerCase() !== "input" || !searchContainer || !listHost || !rowGroup) {
+      structureCache.delete(panelRoot);
+      return null;
+    }
+    const structure = { root: panelRoot, searchInput, searchContainer, listHost, rowGroup, hasRowGroup };
+    structureCache.set(panelRoot, structure);
+    return structure;
+  }
+
   function findPanelRoots(root = document) {
     const scope = root?.querySelectorAll ? root : document;
     const own = scope.matches?.(PANEL_SELECTOR) ? [scope] : [];
+    const seen = new Set();
     return [...own, ...Array.from(scope.querySelectorAll(PANEL_SELECTOR))]
-      .filter((panel, index, all) => all.indexOf(panel) === index)
+      .filter((panel) => {
+        if (seen.has(panel)) return false;
+        seen.add(panel);
+        return true;
+      })
       .filter(isViewerPanel);
   }
 
   function findSearchInput(panelRoot) {
-    if (!panelRoot?.querySelector) return null;
-    const input = panelRoot.querySelector(SEARCH_SELECTOR);
-    if (!input || String(input.tagName).toLowerCase() !== "input") return null;
-    return input;
+    const structure = getPanelStructure(panelRoot);
+    return structure?.searchInput || null;
   }
 
   function findSearchContainer(panelRoot) {
-    return panelRoot?.querySelector?.('#search-transcripts[data-test-id="search-transcripts"]') ||
-      findSearchInput(panelRoot)?.closest?.("[data-test-id=search-transcripts]") || null;
+    return getPanelStructure(panelRoot)?.searchContainer || null;
   }
 
   function findScrollContainer(panelRoot) {
-    if (!panelRoot?.querySelector) return null;
-    const list = panelRoot.querySelector(LIST_SELECTOR);
+    const list = getPanelStructure(panelRoot)?.listHost;
     if (!list || !list.matches(LIST_SELECTOR)) return null;
     // The List host owns the actual overflow/scroll position.  Keep the
     // rowgroup separate for cue enumeration and absolute-row lookup.
@@ -67,19 +111,17 @@
   }
 
   function findRowGroup(panelRoot) {
-    const list = findScrollContainer(panelRoot);
-    return list?.querySelector?.(ROWGROUP_SELECTOR) || list || null;
+    return getPanelStructure(panelRoot)?.rowGroup || null;
   }
 
   function findListHost(panelRoot) {
-    if (!panelRoot?.querySelector) return null;
-    const list = panelRoot.querySelector(LIST_SELECTOR);
+    const list = getPanelStructure(panelRoot)?.listHost;
     if (!list || !list.matches(LIST_SELECTOR)) return null;
     return list;
   }
 
   function findCueCandidates(panelRoot) {
-    const rowgroup = findRowGroup(panelRoot);
+    const rowgroup = getPanelStructure(panelRoot)?.rowGroup;
     if (!rowgroup?.querySelectorAll) return [];
     return Array.from(rowgroup.querySelectorAll(CUE_SELECTOR)).filter((candidate) => {
       const content = candidate.closest?.('[data-test-component="Content"]');
@@ -164,22 +206,23 @@
   }
 
   function hasVirtualizedLayout(panelRoot) {
-    const list = findListHost(panelRoot);
+    const list = getPanelStructure(panelRoot)?.listHost;
     return !!(list && list.classList.contains("ReactVirtualized__Grid") &&
       list.classList.contains("ReactVirtualized__List") &&
-      list.querySelector(ROWGROUP_SELECTOR));
+      getPanelStructure(panelRoot)?.hasRowGroup);
   }
 
   function getPanelDescriptor(panelRoot) {
-    if (!isViewerPanel(panelRoot)) return null;
+    const structure = getPanelStructure(panelRoot);
+    if (!structure) return null;
     return {
       root: panelRoot,
       token: panelRoot.getAttribute("data-echo360-transcript-panel-token") || "",
-      searchInput: findSearchInput(panelRoot),
-      searchContainer: findSearchContainer(panelRoot),
-      listHost: findListHost(panelRoot),
-      scrollContainer: findScrollContainer(panelRoot),
-      rowGroup: findRowGroup(panelRoot),
+      searchInput: structure.searchInput,
+      searchContainer: structure.searchContainer,
+      listHost: structure.listHost,
+      scrollContainer: structure.listHost,
+      rowGroup: structure.rowGroup,
       virtualized: hasVirtualizedLayout(panelRoot),
       cueCandidates: findCueCandidates(panelRoot),
     };
@@ -214,5 +257,8 @@
     // are made until a real legacy fixture is available.
     supportsLegacy: () => false,
     normalizeText: (value) => modelApi()?.normalizeSearchText?.(value) || String(value || "").trim().toLowerCase(),
+    invalidate: (panelRoot) => {
+      if (panelRoot) structureCache.delete(panelRoot);
+    },
   };
 })();

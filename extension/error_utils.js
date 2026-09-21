@@ -41,6 +41,10 @@
   const SUPPORTED_TARGET_CODES = new Set(Object.keys(TARGET_LABELS));
   const CJK_TARGET_CODES = new Set(["ZH", "ZH-HK", "YUE", "CANTONESE"]);
   const CJK_TEXT_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/;
+  const MAX_PROBLEM_DEPTH = 6;
+  const MAX_PROBLEM_RECORDS = 24;
+  const MAX_METRIC_KEYS = 80;
+  const MAX_FAILURE_CODE_KEYS = 80;
   const TARGET_NEUTRAL_CODE_STOPWORDS = new Set([
     "A", "AN", "THE", "AND", "OR", "BUT", "IF", "IS", "ARE", "WAS", "WERE",
     "TO", "OF", "IN", "ON", "FOR", "WITH", "THIS", "THAT", "THESE", "THOSE",
@@ -553,7 +557,7 @@
   // accidentally displaying credentials or raw provider response objects when
   // a normal debug statement includes structured data.
   function formatDebugLog(values, limit = 2_400) {
-    const items = Array.isArray(values) ? values : [values];
+    const items = Array.isArray(values) ? values.slice(0, 12) : [values];
     const parts = items.map((value) => {
       if (value instanceof Error) return safeStructured(serializeError(value), 1_200);
       if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
@@ -572,7 +576,11 @@
       /(?:^|_)source_(?:url|uri|href|id|key)$/.test(normalized);
   }
 
-  function sanitizeDetails(value, depth = 0, seen = new WeakSet(), keyName = "") {
+  function sanitizeDetails(value, depth = 0, seen = new WeakSet(), keyName = "", budget = { remaining: 500 }) {
+    // A depth limit alone still permits 50^4 fields. Share a total traversal
+    // budget across siblings so formatting a diagnostic cannot freeze a page.
+    if (budget.remaining <= 0) return "[详情已截断]";
+    budget.remaining -= 1;
     if (value == null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
       return typeof value === "string"
         ? (isUrlDetailKey(keyName) ? redactUrl(value, 500) : clean(value, 500))
@@ -582,19 +590,25 @@
     if (typeof value !== "object") return String(value);
     if (seen.has(value)) return "[Circular]";
     seen.add(value);
+    let result;
     if (Array.isArray(value)) {
-      const result = value.slice(0, 50).map((item) => sanitizeDetails(item, depth + 1, seen, keyName));
-      // `seen` is path-local. A shared object in two sibling fields is not a
-      // cycle and must not be displayed as a false `[Circular]` diagnostic.
-      seen.delete(value);
-      return result;
+      result = [];
+      for (let index = 0; index < Math.min(50, value.length) && budget.remaining > 0; index += 1) {
+        result.push(sanitizeDetails(value[index], depth + 1, seen, keyName, budget));
+      }
+    } else {
+      const entries = [];
+      for (const key in value) {
+        if (entries.length >= 50 || budget.remaining <= 0) break;
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        entries.push([
+          key.slice(0, 120),
+          isSensitiveKey(key) ? "[REDACTED]" : sanitizeDetails(value[key], depth + 1, seen, key, budget),
+        ]);
+      }
+      result = Object.fromEntries(entries);
     }
-    const result = Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, item]) => [
-      key,
-      isSensitiveKey(key)
-        ? "[REDACTED]"
-        : sanitizeDetails(item, depth + 1, seen, key),
-    ]));
+    // Keep cycle detection path-local: shared siblings are not circular.
     seen.delete(value);
     return result;
   }
@@ -618,6 +632,14 @@
     ));
   }
 
+  function hasOwnEnumerableKey(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) return true;
+    }
+    return false;
+  }
+
   function problemObjects(errorLike) {
     if (!errorLike || typeof errorLike !== "object") return [];
     const candidates = [
@@ -636,8 +658,9 @@
     ];
     const records = [];
     const seen = new Set();
-    const add = (item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item) || seen.has(item)) return;
+    const add = (item, depth = 0) => {
+      if (!item || typeof item !== "object" || Array.isArray(item) || seen.has(item) ||
+          depth > MAX_PROBLEM_DEPTH || seen.size >= 96 || records.length >= MAX_PROBLEM_RECORDS) return;
       seen.add(item);
       if (isProblemRecord(item)) records.push(item);
       // Adapters sometimes put a wrapper inside `error` and the actual
@@ -645,10 +668,10 @@
       // generic outer envelope cannot hide a concrete nested diagnosis.
       for (const key of ["problem", "error_detail", "errorDetail", "error", "data"]) {
         const nested = item[key];
-        if (nested && typeof nested === "object" && !Array.isArray(nested)) add(nested);
+        if (nested && typeof nested === "object" && !Array.isArray(nested)) add(nested, depth + 1);
       }
     };
-    candidates.forEach(add);
+    candidates.forEach((item) => add(item));
     return records;
   }
 
@@ -720,17 +743,19 @@
         if (nested) return cleanMessage(nested);
       }
     }
-    const objectFallback = errorLike && typeof errorLike === "object"
-      ? safeStructured(errorLike, 800)
-      : String(errorLike);
     const problem = preferredProblem;
-    return cleanMessage(
+    const directMessage =
       errorLike.message ||
       (typeof errorLike.error === "string" ? errorLike.error : "") ||
       problem.message ||
-      (typeof problem.error === "string" ? problem.error : "") ||
-      problem.title || errorLike.title || objectFallback
-    );
+      (typeof problem.error === "string" ? problem.error : "");
+    if (directMessage) return cleanMessage(directMessage);
+    // Avoid traversing the entire provider payload when one of the normal
+    // message fields already supplied a useful diagnosis.
+    const objectFallback = errorLike && typeof errorLike === "object"
+      ? safeStructured(errorLike, 800)
+      : String(errorLike);
+    return cleanMessage(problem.title || errorLike.title || objectFallback);
   }
 
   // Error objects cross several boundaries in this extension: provider ->
@@ -858,23 +883,34 @@
     // Async jobs may put counters directly on `progress` while direct jobs put
     // them under `metrics`. Merge both so a failure never loses its last known
     // 304/91/0 progress snapshot at the UI boundary.
-    return {
-      ...(errorLike?.progress && typeof errorLike.progress === "object" ? errorLike.progress : {}),
-      ...(context?.metrics && typeof context.metrics === "object" ? context.metrics : {}),
-      ...(errorLike?.progress?.metrics && typeof errorLike.progress.metrics === "object" ? errorLike.progress.metrics : {}),
-      ...(errorLike?.metrics && typeof errorLike.metrics === "object" ? errorLike.metrics : {}),
-      ...problemObjects(errorLike).reduce((merged, problem) => ({
-        ...merged,
-        ...(problem.metrics && typeof problem.metrics === "object" ? problem.metrics : {}),
-      }), {}),
+    const merged = {};
+    const merge = (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      let copied = 0;
+      for (const key in value) {
+        if (copied >= MAX_METRIC_KEYS) break;
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        merged[key] = value[key];
+        copied += 1;
+      }
     };
+    merge(errorLike?.progress);
+    merge(context?.metrics);
+    merge(errorLike?.progress?.metrics);
+    merge(errorLike?.metrics);
+    for (const problem of problemObjects(errorLike)) merge(problem.metrics);
+    return merged;
   }
 
   function normalizeFailureCodeMap(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const normalized = {};
-    for (const [key, count] of Object.entries(value)) {
-      const amount = positiveInteger(count, 0);
+    let visited = 0;
+    for (const key in value) {
+      if (visited >= MAX_FAILURE_CODE_KEYS) break;
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const amount = positiveInteger(value[key], 0);
+      visited += 1;
       if (amount <= 0) continue;
       const code = normalizeFailureCode(key);
       normalized[code] = (normalized[code] || 0) + amount;
@@ -892,7 +928,7 @@
       context?.failureCodes,
       context?.failure_codes,
     ];
-    const explicitValue = candidates.find((value) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length > 0) ||
+    const explicitValue = candidates.find((value) => hasOwnEnumerableKey(value)) ||
       candidates.find((value) => value && typeof value === "object" && !Array.isArray(value));
     const explicit = normalizeFailureCodeMap(explicitValue);
 
@@ -1090,7 +1126,7 @@
       if (rateLimited) {
         title = "Google 网页翻译被限流";
         summary = `Google 网页端点拒绝了本次请求${total != null ? `（${failed ?? total}/${total} 条字幕失败）` : ""}，检测到 HTTP 429。`;
-        recommendation = "请先停止连续重试，等待几分钟解除限流；之后使用 concurrency=3、RPS=3，或切换到 DeepSeek/Gemini/OpenAI/DeepL。";
+        recommendation = "请先停止连续重试，等待几分钟解除限流；之后使用 concurrency=3、RPS=6，或切换到 DeepSeek/Gemini/OpenAI/DeepL。";
       } else {
         title = "Google 网页翻译全部失败";
         summary = `Google 网页端点没有返回可用译文${total != null ? `（${failed ?? total}/${total} 条字幕失败）` : ""}。`;
@@ -1112,7 +1148,7 @@
       if (rateLimited) {
         title = "翻译服务返回空结果，且疑似被限流";
         summary = "字幕请求没有得到目标语言译文，同时检测到 HTTP 429 或限流计数；这通常不是字幕文件本身的问题。";
-        recommendation = "请停止连续重试，等待几分钟后用 concurrency=3、RPS=3 重试，或切换到 API Provider。";
+        recommendation = "请停止连续重试，等待几分钟后用 concurrency=3、RPS=6 重试，或切换到 API Provider。";
       } else if (String(context.provider || "").toLowerCase() === "google-web") {
         title = "Google 网页翻译没有返回中文";
         summary = "字幕源有效，但 Google 网页端点没有返回可识别的中文译文；这不是 API Key 缺失。";
@@ -1171,7 +1207,7 @@
     } else if (code === "HTTP_429") {
       title = "翻译服务请求过于频繁";
       summary = "上游服务返回 HTTP 429，当前请求过于频繁，已被限流。";
-      recommendation = "等待几分钟后重试，并降低 RPS/并发；Google 网页端点建议 3/3。";
+      recommendation = "等待几分钟后重试，并降低 RPS/并发；Google 网页端点建议 6/3。";
     } else if (code === "HTTP_401" || code === "HTTP_403") {
       const httpStatus = diagnosticHttpStatus || code.slice(5);
       if (context.phase === "source") {
@@ -1541,7 +1577,13 @@
   }
 
   function formatFailureCodes(failureCodes) {
-    const entries = Object.entries(failureCodes || {});
+    if (!failureCodes || typeof failureCodes !== "object" || Array.isArray(failureCodes)) return "无";
+    const entries = [];
+    for (const code in failureCodes) {
+      if (entries.length >= MAX_FAILURE_CODE_KEYS) break;
+      if (!Object.prototype.hasOwnProperty.call(failureCodes, code)) continue;
+      entries.push([code, failureCodes[code]]);
+    }
     return entries.length ? entries.map(([code, count]) => `${code} × ${count}`).join("，") : "无";
   }
 
@@ -1670,7 +1712,9 @@
   function normalizeError(errorLike, context = {}) {
     const message = readMessage(errorLike);
     const status = readStatus(errorLike);
-    const errorObject = errorLike && typeof errorLike === "object" ? { ...errorLike } : {};
+    // Read boundary fields directly. Spreading an arbitrary provider payload
+    // here would copy every response key before the diagnostic limits apply.
+    const errorObject = errorLike && typeof errorLike === "object" ? errorLike : {};
     const problem = problemObject(errorLike);
     const existingCandidates = [
       errorObject.code,
@@ -1729,15 +1773,28 @@
     const provider = String(context.provider || errorLike?.provider || metrics.provider || "").trim().toLowerCase();
     const target = String(context.target || errorLike?.target || "").trim().toUpperCase();
     const phase = normalizePhase(errorLike?.phase || problem.phase || context.phase);
-    const warnings = Array.from(new Set([
-      ...(Array.isArray(errorLike?.warnings) ? errorLike.warnings : []),
-      ...(Array.isArray(problem.warnings) ? problem.warnings : []),
-      ...(Array.isArray(context.warnings) ? context.warnings : []),
-    ].map((item) => clean(item, 500)).filter(Boolean))).slice(0, 30);
+    const warnings = [];
+    const warningSet = new Set();
+    let warningsVisited = 0;
+    for (const source of [errorLike?.warnings, problem.warnings, context.warnings]) {
+      if (!Array.isArray(source)) continue;
+      for (const item of source) {
+        if (warnings.length >= 30 || warningsVisited >= 120) break;
+        warningsVisited += 1;
+        const warning = clean(item, 500);
+        if (!warning || warningSet.has(warning)) continue;
+        warningSet.add(warning);
+        warnings.push(warning);
+      }
+      if (warnings.length >= 30) break;
+    }
     const sourceContext = {
-      ...context,
+      severity: context.severity,
       error: errorLike,
       provider,
+      phase: context.phase,
+      backend: context.backend,
+      warning: context.warning,
     };
     const descriptor = describe(code, status, message, metrics, failureCodes, sourceContext);
     const upstreamTitle = clean(errorLike?.title || problem.title || "", 240);

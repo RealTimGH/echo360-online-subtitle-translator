@@ -5,6 +5,7 @@
   const BRIDGE_ATTR = "data-echo360-transcript-search-bridge";
   const HIT_ATTR = "data-echo360-transcript-search-hit";
   const CURRENT_CLASS = "echo360-transcript-search-current";
+  const renderSignatures = new WeakMap();
 
   const state = {
     model: null,
@@ -16,6 +17,7 @@
     inputListeners: new Map(),
     renderer: null,
     refreshHandle: null,
+    refreshHandleType: "",
     refreshGeneration: 0,
     diagnostics: { refreshCount: 0, virtualizedTargetMisses: 0 },
   };
@@ -47,7 +49,21 @@
     if (offset < raw.length) parent.appendChild(document.createTextNode(raw.slice(offset)));
   }
 
+  function pruneDetachedPanels() {
+    for (const [root, panelState] of state.panels) {
+      if (root.isConnected !== false) continue;
+      const input = adapter()?.findSearchInput(root);
+      if (input) {
+        input.removeEventListener("input", state.inputListeners.get(input));
+        state.inputListeners.delete(input);
+      }
+      panelState.ui?.remove?.();
+      state.panels.delete(root);
+    }
+  }
+
   function findMatches(model, query) {
+    pruneDetachedPanels();
     if (!model?.cues || state.panels.size === 0) return [];
     const limits = [...state.panels.values()].map((panelState) => {
       if (!panelState.descriptor?.virtualized) return model.cues.length;
@@ -63,10 +79,17 @@
   }
 
   function ensureUi(panelState) {
-    const input = adapter()?.findSearchInput(panelState.root);
-    const container = adapter()?.findSearchContainer(panelState.root) || input?.parentElement;
+    const descriptor = panelState.descriptor?.searchInput?.isConnected && panelState.root.contains(panelState.descriptor.searchInput)
+      ? panelState.descriptor
+      : adapter()?.getPanelDescriptor(panelState.root);
+    if (descriptor) panelState.descriptor = descriptor;
+    const input = descriptor?.searchInput || adapter()?.findSearchInput(panelState.root);
+    const container = descriptor?.searchContainer || adapter()?.findSearchContainer(panelState.root) || input?.parentElement;
     if (!input || !container) return null;
-    let ui = container.querySelector(`[${BRIDGE_ATTR}="1"]`);
+    let ui = panelState.ui;
+    if (!ui || !ui.isConnected || !container.contains(ui)) {
+      ui = container.querySelector(`[${BRIDGE_ATTR}="1"]`);
+    }
     if (!ui) {
       ui = document.createElement("div");
       ui.setAttribute(BRIDGE_ATTR, "1");
@@ -90,6 +113,15 @@
       ui.append(label, previous, next);
       container.appendChild(ui);
     }
+    const uiChanged = panelState.ui !== ui;
+    panelState.ui = ui;
+    if (uiChanged || !panelState.uiElements) {
+      panelState.uiElements = {
+        label: ui.querySelector(`[data-echo360-transcript-search-count="1"]`),
+        previous: ui.querySelector(`[data-echo360-transcript-search-prev="1"]`),
+        next: ui.querySelector(`[data-echo360-transcript-search-next="1"]`),
+      };
+    }
     return ui;
   }
 
@@ -109,13 +141,31 @@
   function queueRefresh(query) {
     const nextQuery = String(query || "");
     const generation = ++state.refreshGeneration;
+    cancelQueuedRefresh();
     const run = () => {
       if (generation !== state.refreshGeneration) return;
       state.refreshHandle = null;
+      state.refreshHandleType = "";
       refresh(nextQuery);
     };
-    if (typeof requestAnimationFrame === "function") state.refreshHandle = requestAnimationFrame(run);
-    else state.refreshHandle = setTimeout(run, 0);
+    if (typeof requestAnimationFrame === "function") {
+      state.refreshHandleType = "raf";
+      state.refreshHandle = requestAnimationFrame(run);
+    } else {
+      state.refreshHandleType = "timeout";
+      state.refreshHandle = setTimeout(run, 0);
+    }
+  }
+
+  function cancelQueuedRefresh() {
+    if (state.refreshHandle == null) return;
+    if (state.refreshHandleType === "raf" && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(state.refreshHandle);
+    } else if (state.refreshHandleType === "timeout") {
+      clearTimeout(state.refreshHandle);
+    }
+    state.refreshHandle = null;
+    state.refreshHandleType = "";
   }
 
   function highlightVisibleTranslations() {
@@ -125,21 +175,30 @@
       list.push(match);
       visibleMatches.set(match.cue.key, list);
     }
+    const current = getCurrentMatch();
+    const currentKey = current?.cue?.key || "";
     for (const panelState of state.panels.values()) {
-      const candidates = adapter()?.findCueCandidates(panelState.root) || [];
-      for (const candidate of candidates) {
-        const translation = candidate.querySelector?.('[data-echo360-transcript-translation="1"]');
-        if (!translation) continue;
+      // The bridge only owns translation nodes.  Querying those directly
+      // avoids re-enumerating every virtualized English cue on every keypress
+      // and keeps native search markup completely untouched.
+      const translations = panelState.root.querySelectorAll?.('[data-echo360-transcript-translation="1"]') || [];
+      for (const translation of translations) {
         const key = translation.getAttribute("data-echo360-cue-key") || "";
         const text = translation.getAttribute("data-echo360-translated-text") || translation.textContent || "";
-        translation.querySelectorAll?.(`[${HIT_ATTR}="1"]`).forEach((node) => node.remove());
-        // Rebuild only extension-owned translation content.  Native English
-        // spans, including Echo's own <mark> nodes, are never touched.
-        translation.textContent = "";
         const ranges = visibleMatches.get(key) || [];
-        createTextNodes(translation, text, ranges);
-        translation.classList.toggle(CURRENT_CLASS, !!getCurrentMatch() && getCurrentMatch().cue.key === key);
-        if (getCurrentMatch()?.cue.key === key) translation.setAttribute("aria-current", "true");
+        const rangeSignature = ranges.map((range) => `${range.start}:${range.end}`).join(",");
+        const currentForNode = currentKey === key;
+        const signature = `${text}\u0000${rangeSignature}\u0000${currentForNode ? "1" : "0"}`;
+        if (renderSignatures.get(translation) !== signature) {
+          translation.querySelectorAll?.(`[${HIT_ATTR}="1"]`).forEach((node) => node.remove());
+          // Rebuild only extension-owned translation content.  Native English
+          // spans, including Echo's own <mark> nodes, are never touched.
+          translation.textContent = "";
+          createTextNodes(translation, text, ranges);
+          renderSignatures.set(translation, signature);
+        }
+        translation.classList.toggle(CURRENT_CLASS, currentForNode);
+        if (currentForNode) translation.setAttribute("aria-current", "true");
         else translation.removeAttribute("aria-current");
       }
     }
@@ -150,9 +209,8 @@
     for (const panelState of state.panels.values()) {
       const ui = ensureUi(panelState);
       if (!ui) continue;
-      const label = ui.querySelector(`[data-echo360-transcript-search-count="1"]`);
-      const previous = ui.querySelector(`[data-echo360-transcript-search-prev="1"]`);
-      const next = ui.querySelector(`[data-echo360-transcript-search-next="1"]`);
+      const { label, previous, next } = panelState.uiElements || {};
+      if (!label || !previous || !next) continue;
       const visible = !!normalize(state.query) && total > 0;
       ui.hidden = !visible;
       if (visible) label.textContent = `译文匹配 ${state.currentIndex + 1} / ${total}`;
@@ -166,10 +224,9 @@
     if (!match) return false;
     let found = false;
     for (const panelState of state.panels.values()) {
-      const candidates = adapter()?.findCueCandidates(panelState.root) || [];
-      for (const candidate of candidates) {
-        const translation = candidate.querySelector?.('[data-echo360-transcript-translation="1"]');
-        if (!translation || translation.getAttribute("data-echo360-cue-key") !== match.cue.key) continue;
+      const translations = panelState.root.querySelectorAll?.('[data-echo360-transcript-translation="1"]') || [];
+      for (const translation of translations) {
+        if (translation.getAttribute("data-echo360-cue-key") !== match.cue.key) continue;
         found = true;
         try { translation.scrollIntoView?.({ block: "center" }); } catch (_) {}
       }
@@ -194,6 +251,11 @@
 
   function refresh(query = state.query) {
     if (typeof document === "undefined") return [];
+    // A direct refresh supersedes any queued input-frame refresh.  Incrementing
+    // the generation here prevents a stale callback from restoring an older
+    // query after callers update the model or panel synchronously.
+    cancelQueuedRefresh();
+    state.refreshGeneration += 1;
     state.diagnostics.refreshCount += 1;
     const previousQuery = normalize(state.query);
     const previous = getCurrentMatch();
@@ -213,9 +275,10 @@
   function setPanels(panelRoots) {
     const roots = Array.isArray(panelRoots) ? panelRoots : [];
     const validRoots = roots.filter((root) => !!adapter()?.getPanelDescriptor(root));
+    const validRootSet = new Set(validRoots);
     const next = new Map();
     for (const oldPanel of state.panels.values()) {
-      if (validRoots.includes(oldPanel.root)) continue;
+      if (validRootSet.has(oldPanel.root)) continue;
       const oldInput = adapter()?.findSearchInput(oldPanel.root);
       if (oldInput) {
         oldInput.removeEventListener("input", state.inputListeners.get(oldInput));
@@ -226,7 +289,7 @@
     for (const root of validRoots) {
       const descriptor = adapter()?.getPanelDescriptor(root);
       if (!descriptor) continue;
-      const panelState = state.panels.get(root) || { root, descriptor };
+      const panelState = state.panels.get(root) || { root, descriptor, ui: null, uiElements: null };
       panelState.descriptor = descriptor;
       const modelCount = state.model?.cues?.length || 0;
       if (!Number.isInteger(panelState.visibleRowCount) || panelState.visibleRowCount < 0 || panelState.visibleRowCount > modelCount) {
@@ -247,6 +310,8 @@
   }
 
   function clear() {
+    state.refreshGeneration += 1;
+    cancelQueuedRefresh();
     state.model = null;
     state.query = "";
     state.matches = [];
@@ -283,6 +348,7 @@
   }
 
   function getDebugState() {
+    pruneDetachedPanels();
     return {
       query: state.query,
       searchQuery: state.query,
