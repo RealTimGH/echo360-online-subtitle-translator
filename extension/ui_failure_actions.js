@@ -357,23 +357,35 @@
 
     function normalizeTranslationSummary(summary) {
       if (!summary || typeof summary !== "object") return null;
-      const providers = Array.isArray(summary.providers)
-        ? summary.providers
-          .filter((item) => item && typeof item === "object")
-          .map((item) => ({
-            provider: String(item.provider || "unknown"),
-            label: String(item.label || item.provider || "未知服务"),
+      const providers = [];
+      if (Array.isArray(summary.providers)) {
+        for (const item of summary.providers) {
+          if (providers.length >= 24) break;
+          if (!item || typeof item !== "object") continue;
+          const provider = String(item.provider || "unknown").slice(0, 120);
+          providers.push({
+            provider,
+            label: String(item.label || provider || "未知服务").slice(0, 240),
             assignedCues: Number(item.assignedCues) || 0,
             translatedCues: Number(item.translatedCues ?? item.completedCues) || 0,
             failedCues: Number(item.failedCues ?? item.failures) || 0,
             failedAttempts: Number(item.failedAttempts ?? item.failures) || 0,
-          }))
-        : [];
-      const observedFailureCodes = summary.observedFailureCodes && typeof summary.observedFailureCodes === "object"
-        ? Object.fromEntries(Object.entries(summary.observedFailureCodes)
-          .map(([code, count]) => [String(code), Number(count) || 0])
-          .filter(([, count]) => count > 0))
-        : {};
+          });
+        }
+      }
+      const observedFailureCodes = {};
+      if (summary.observedFailureCodes && typeof summary.observedFailureCodes === "object" &&
+          !Array.isArray(summary.observedFailureCodes)) {
+        let observedCount = 0;
+        for (const code in summary.observedFailureCodes) {
+          if (observedCount >= 40) break;
+          if (!Object.prototype.hasOwnProperty.call(summary.observedFailureCodes, code)) continue;
+          const count = Number(summary.observedFailureCodes[code]) || 0;
+          if (count <= 0) continue;
+          observedFailureCodes[String(code).slice(0, 120)] = count;
+          observedCount += 1;
+        }
+      }
       return {
         status: String(summary.status || "completed"),
         cacheHit: summary.cacheHit === true,
@@ -1044,7 +1056,7 @@
       refs.copy.setAttribute("aria-hidden", refs.copy.hidden ? "true" : "false");
       refs.actions.hidden = empty;
       refs.detailList.replaceChildren();
-      for (const detail of currentModel.details || []) {
+      for (const detail of (currentModel.details || []).slice(0, 60)) {
         const row = document.createElement("div");
         row.className = "echo360-error-detail-row";
         const label = document.createElement("span");

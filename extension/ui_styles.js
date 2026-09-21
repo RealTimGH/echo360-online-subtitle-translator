@@ -54,11 +54,10 @@
         top: var(--echo360-floating-top);
         right: auto;
         bottom: auto;
-        /* The Canvas embed has room beside the player. Keep both the
-           collapsed and hovered states at the same coordinates; only the
-           secondary controls become available through the existing hover /
-           focus-within interaction. Legacy Echo360 pages keep the generic
-           half-hidden slide-out behavior below. */
+        /* Keep the anchored group stationary. Auto-retract is currently
+           disabled on every host, including legacy Echo360 classroom pages.
+           If that half-hidden dock is restored, this override still keeps
+           Instructure Media fully visible. */
         transform: translateX(0);
       }
       #echo360-ui-root.echo360-media-anchored #echo360-translator-ball-group.echo360-ball-hidden {
@@ -123,8 +122,12 @@
         justify-content: flex-end;
         z-index: 2147483647;
         pointer-events: auto;
-        /* Keep at least 24 px of the primary target visible while docked. */
-        transform: translateX(28px);
+        /* TEMP: keep the dock fully visible on every host. Restore
+           translateX(28px) to re-enable the half-hidden auto-retract on
+           legacy Echo360 classroom pages. Hover/focus-within below already
+           expand to translateX(0); Instructure Media stays fully visible
+           via .echo360-media-anchored regardless of this default. */
+        transform: translateX(0);
         will-change: transform, opacity;
         transition: transform 0.28s cubic-bezier(0.34,1.4,0.64,1), opacity 0.2s ease;
       }

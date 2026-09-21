@@ -202,6 +202,40 @@ describe("formatJobError (via waitDirectJob)", () => {
     expect(result.translated_vtt).toContain("译文");
   });
 
+  it("copies complete failed_cues from metrics onto a sampled translation result", () => {
+    const cues = Array.from({ length: 61 }, (_, index) => {
+      const start = index * 2;
+      const minute = String(Math.floor(start / 60)).padStart(2, "0");
+      const second = String(start % 60).padStart(2, "0");
+      const endMinute = String(Math.floor((start + 1) / 60)).padStart(2, "0");
+      const endSecond = String((start + 1) % 60).padStart(2, "0");
+      return `00:${minute}:${second}.000 --> 00:${endMinute}:${endSecond}.000\n${index === 60 ? "已翻译" : `Source ${index}`}`;
+    }).join("\n\n");
+    const translatedVtt = `WEBVTT\n\n${cues}\n`;
+    const sourceVtt = translatedVtt.replace("已翻译", "Source 60");
+    const result = client.validateTranslationResult({
+      translated_vtt: translatedVtt,
+      target: "ZH",
+      failed_items: Array.from({ length: 50 }, (_, index) => ({
+        cue: index + 1,
+        code: "HTTP_503",
+        status: 503,
+        message: "HTTP 503",
+      })),
+      failure_codes: { HTTP_503: 60 },
+      metrics: {
+        total: 61,
+        processed: 61,
+        translated: 1,
+        failed: 60,
+        providerResults: 1,
+        targetResults: 1,
+        failed_cues: Array.from({ length: 60 }, (_, index) => index + 1),
+      },
+    }, "translation", { sourceVtt, target: "ZH" });
+    expect(result.failed_cues).toEqual(Array.from({ length: 60 }, (_, index) => index + 1));
+  });
+
   it("does not accept a completed job with a header-only VTT as success", async () => {
     await expect(runDirectJobWith({
       status: "completed",
@@ -366,6 +400,22 @@ describe("formatJobError (via waitDirectJob)", () => {
     ).rejects.toThrow("stale job");
   });
 
+  it("cancels an in-flight poll wait through AbortSignal", async () => {
+    const controller = new AbortController();
+    runtimeSendMessage.mockResolvedValue({
+      ok: true,
+      data: { status: "running", progress: { current: 0, total: 1 } },
+    });
+    const pending = client.waitDirectJob("job-1", {
+      isActive: () => true,
+      signal: controller.signal,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort("user cancelled");
+    await expect(pending).rejects.toMatchObject({ code: "TRANSLATION_CANCELLED", name: "AbortError" });
+  });
+
   it("calls onProgress when job is running and total > 0", async () => {
     const onProgress = vi.fn();
     let calls = 0;
@@ -409,6 +459,7 @@ describe("formatJobError (via waitDirectJob)", () => {
           ok: true,
           data: {
             status: "running",
+            partial_revision: 3,
             partial_vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPartial\n",
             progress: { current: 1, total: 10, partial: true },
           },
@@ -430,6 +481,7 @@ describe("formatJobError (via waitDirectJob)", () => {
       }
     });
     await client.waitDirectJob("job-1", { isActive: () => true, onPartialVtt });
+    expect(runtimeSendMessage.mock.calls[1][0].partial_revision).toBe(3);
     expect(onPartialVtt).toHaveBeenCalledWith(
       "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nPartial\n",
       expect.objectContaining({ current: 1, total: 10 })
@@ -444,6 +496,7 @@ describe("formatJobError (via waitDirectJob)", () => {
         ok: true,
         data: {
           status: "running",
+          partial_revision: 4,
           partial_vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n部分结果\n",
           progress: { current: 1, total: 10, partial: true },
         },
@@ -463,6 +516,7 @@ describe("formatJobError (via waitDirectJob)", () => {
       });
 
     await client.waitJob("http://127.0.0.1:8765", "job-1", { onPartialVtt });
+    expect(runtimeSendMessage.mock.calls[1][0].path).toBe("/translate-async/job-1?since_partial_revision=4");
     expect(onPartialVtt).toHaveBeenCalledWith(
       "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n部分结果\n",
       expect.objectContaining({ current: 1, total: 10 })

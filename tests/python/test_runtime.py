@@ -167,6 +167,52 @@ class BackendRuntimeTests(unittest.TestCase):
         self.assertEqual(backend.translatable_line_count(SAMPLE_VTT), 1)
         self.assertEqual(backend.timed_cue_ranges(SAMPLE_VTT), [(0, 1000)])
 
+    def test_backend_timed_cue_scan_does_not_reparse_dense_unseparated_cues(self):
+        lines = ["WEBVTT"]
+        for index in range(80):
+            start_minute, start_second = divmod(index, 60)
+            end_minute, end_second = divmod(index + 1, 60)
+            lines.extend([
+                f"00:{start_minute:02d}:{start_second:02d}.000 --> "
+                f"00:{end_minute:02d}:{end_second:02d}.000",
+                f"caption-{index}",
+            ])
+        value = "\n".join(lines)
+        with mock.patch.object(
+            backend,
+            "parse_vtt_timing_line",
+            wraps=backend.parse_vtt_timing_line,
+        ) as parse_timing:
+            entries = backend.timed_cue_text_entries(value)
+        self.assertEqual(len(entries), 80)
+        # One timestamp parse per physical line keeps malformed/no-separator
+        # tracks linear instead of repeatedly slicing and rescanning suffixes.
+        self.assertEqual(parse_timing.call_count, len(lines))
+
+    def test_translation_cache_pruning_removes_stale_and_oldest_vtt_files(self):
+        with tempfile.TemporaryDirectory(prefix="echo360-cache-") as tmpdir:
+            cache_dir = Path(tmpdir)
+            old = cache_dir / "old.vtt"
+            middle = cache_dir / "middle.vtt"
+            newest = cache_dir / "newest.vtt"
+            keep = cache_dir / "keep.txt"
+            old.write_text("old", encoding="utf-8")
+            middle.write_text("middle", encoding="utf-8")
+            newest.write_text("newest", encoding="utf-8")
+            keep.write_text("unrelated", encoding="utf-8")
+            os.utime(old, (90, 90))
+            os.utime(middle, (95, 95))
+            os.utime(newest, (99, 99))
+            with mock.patch.object(backend, "CACHE_DIR", cache_dir), \
+                    mock.patch.object(backend, "CACHE_TTL_SECONDS", 5), \
+                    mock.patch.object(backend, "CACHE_MAX_FILES", 1), \
+                    mock.patch.object(backend, "CACHE_MAX_BYTES", 1024):
+                backend.cleanup_translation_cache(now=100)
+            self.assertFalse(old.exists())
+            self.assertFalse(middle.exists())
+            self.assertTrue(newest.exists())
+            self.assertTrue(keep.exists())
+
     def test_backend_normalizes_numbered_srt_without_rewriting_caption_text(self):
         normalized = backend.normalize_timed_text(SAMPLE_SRT)
         self.assertEqual(
@@ -346,6 +392,56 @@ class BackendRuntimeTests(unittest.TestCase):
         finally:
             with backend._jobs_lock:
                 backend._jobs.pop(job_id, None)
+
+    def test_async_status_can_omit_an_unchanged_partial_snapshot(self):
+        job_id = "partial-revision-test"
+        with backend._jobs_lock:
+            backend._jobs[job_id] = {
+                "status": "running",
+                "progress": {"current": 1, "total": 2},
+                "partial_vtt": "WEBVTT\n\npartial",
+                "partial_revision": 7,
+                "created_at": int(backend.time.time()),
+                "updated_at": int(backend.time.time()),
+            }
+        try:
+            unchanged = backend.translate_async_status(job_id, since_partial_revision=7)
+            self.assertNotIn("partial_vtt", unchanged)
+            self.assertEqual(unchanged["partial_revision"], 7)
+            changed = backend.translate_async_status(job_id, since_partial_revision=6)
+            self.assertEqual(changed["partial_vtt"], "WEBVTT\n\npartial")
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.pop(job_id, None)
+
+    def test_terminal_job_results_have_an_aggregate_memory_budget(self):
+        with backend._jobs_lock:
+            original_jobs = dict(backend._jobs)
+            backend._jobs.clear()
+            backend._jobs.update({
+                "old-result": {
+                    "status": "completed",
+                    "result": {"translated_vtt": "x" * 80},
+                    "partial_vtt": "y" * 80,
+                    "updated_at": 1,
+                },
+                "new-result": {
+                    "status": "completed",
+                    "result": {"translated_vtt": "z" * 80},
+                    "partial_vtt": "",
+                    "updated_at": 2,
+                },
+            })
+        try:
+            with mock.patch.object(backend, "JOB_MAX_RESULT_BYTES", 200):
+                with backend._jobs_lock:
+                    backend.trim_completed_job_memory_locked(protected_job_id="new-result")
+                    self.assertNotIn("old-result", backend._jobs)
+                    self.assertIn("new-result", backend._jobs)
+        finally:
+            with backend._jobs_lock:
+                backend._jobs.clear()
+                backend._jobs.update(original_jobs)
 
     def test_target_coverage_accepts_neutral_unchanged_caption_but_not_ordinary_english(self):
         self.assertTrue(backend.is_target_neutral_text("F.", "F.", "ZH"))
@@ -719,6 +815,87 @@ class TranslatorRuntimeTests(unittest.TestCase):
         with mock.patch.object(translator, "_load_argos_translate_module", return_value=fake_module):
             self.assertEqual(translator.argos_translate_batch(["Hello", "Class"], "ZH"), ["译:Hello", "译:Class"])
 
+    def test_argos_batch_reuses_the_resolved_model_for_each_target(self):
+        class FakeTranslation:
+            def translate(self, text):
+                return f"译:{text}"
+
+        class FakeLanguage:
+            def __init__(self, code):
+                self.code = code
+
+            def get_translation(self, target):
+                return FakeTranslation() if self.code == "en" and target.code == "zh" else None
+
+        fake_module = mock.Mock()
+        fake_module.get_installed_languages.return_value = [FakeLanguage("en"), FakeLanguage("zh")]
+        with mock.patch.object(translator, "_load_argos_translate_module", return_value=fake_module):
+            self.assertEqual(translator.argos_translate_batch(["Hello"], "ZH"), ["译:Hello"])
+            self.assertEqual(translator.argos_translate_batch(["Class"], "ZH"), ["译:Class"])
+        self.assertEqual(fake_module.get_installed_languages.call_count, 1)
+
+    def test_web_provider_reuses_one_session_on_the_same_worker(self):
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+
+            def get(self, _url, **_kwargs):
+                response = mock.Mock(status_code=200, headers={})
+                response.json.return_value = [[["译", "source"]]]
+                return response
+
+        old_sessions = getattr(translator._HTTP_SESSION_LOCAL, "sessions", None)
+        translator._HTTP_SESSION_LOCAL.sessions = {}
+        try:
+            with mock.patch.object(translator.requests, "Session", side_effect=FakeSession) as session_factory, \
+                    mock.patch.object(translator.time, "sleep"):
+                self.assertEqual(
+                    translator.google_web_translate_batch(["source"], "ZH", rps=0),
+                    ["译"],
+                )
+                self.assertEqual(
+                    translator.google_web_translate_batch(["source"], "ZH", rps=0),
+                    ["译"],
+                )
+            self.assertEqual(session_factory.call_count, 1)
+        finally:
+            if old_sessions is None:
+                try:
+                    del translator._HTTP_SESSION_LOCAL.sessions
+                except AttributeError:
+                    pass
+            else:
+                translator._HTTP_SESSION_LOCAL.sessions = old_sessions
+
+    def test_partial_progress_snapshots_are_bounded_for_long_tracks(self):
+        lines = ["WEBVTT", ""]
+        for index in range(40):
+            lines.extend([
+                f"00:00:{index:02d}.000 --> 00:00:{index + 1:02d}.000",
+                f"caption-{index}",
+                "",
+            ])
+        snapshots = []
+        with mock.patch.object(
+            translator,
+            "argos_translate_batch",
+            side_effect=lambda texts, target_lang: [f"译:{text}" for text in texts],
+        ):
+            translator.translate_lines_native(
+                lines,
+                api_key="",
+                provider="argos",
+                target_lang="ZH",
+                concurrency=1,
+                max_paragraphs=1,
+                max_chars=1200,
+                partial_callback=lambda completed, total, partial: snapshots.append((completed, total)),
+                log_progress=False,
+            )
+        self.assertLess(len(snapshots), 40)
+        self.assertLessEqual(len(snapshots), translator.PROGRESS_SNAPSHOT_TARGETS)
+        self.assertEqual(snapshots[-1], (40, 40))
+
     def test_argos_missing_model_has_an_actionable_error(self):
         fake_module = mock.Mock()
         fake_module.get_installed_languages.return_value = []
@@ -828,6 +1005,39 @@ class GoogleArgosFallbackTests(unittest.TestCase):
         self.assertEqual(outcome["provider_results"], 7)
         self.assertEqual(outcome["failed"], 0)
         self.assertEqual(outcome["failed_items"], [])
+        self.assertEqual(outcome["failed_cues"], [])
+
+    def test_failure_details_are_sampled_but_failed_cues_stay_complete(self):
+        lines = ["WEBVTT", ""]
+        for index in range(60):
+            start_minute, start_second = divmod(index, 60)
+            end_minute, end_second = divmod(index + 1, 60)
+            lines.extend([
+                f"00:{start_minute:02d}:{start_second:02d}.000 --> 00:{end_minute:02d}:{end_second:02d}.000",
+                f"caption-{index}",
+                "",
+            ])
+        outcome = {}
+        with mock.patch.object(
+            translator,
+            "argos_translate_batch",
+            side_effect=RuntimeError("HTTP 503 upstream unavailable"),
+        ):
+            translator.translate_lines_native(
+                lines,
+                api_key="",
+                provider="argos",
+                target_lang="ZH",
+                concurrency=1,
+                max_paragraphs=1,
+                max_chars=1200,
+                max_retries=0,
+                outcome_callback=outcome.update,
+                log_progress=False,
+            )
+        self.assertEqual(outcome["failed"], 60)
+        self.assertEqual(len(outcome["failed_items"]), 50)
+        self.assertEqual(outcome["failed_cues"], list(range(1, 61)))
 
     def test_unsupported_argos_target_does_not_trigger_fallback(self):
         google_calls = []

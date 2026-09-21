@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 from collections import deque
-from functools import partial
+from functools import lru_cache, partial
 import json
 import os
 import re
@@ -85,6 +85,10 @@ ARGOS_DEFAULT_MAX_RETRIES = 0
 # worker and a small, overridable CPU budget for the desktop app.
 ARGOS_DEFAULT_INTER_THREADS = 1
 ARGOS_DEFAULT_INTRA_THREADS = 2
+# Partial VTT snapshots rewrite the whole document. Bound the number of
+# snapshots for large tracks so progress I/O stays approximately linear in
+# track size while numeric progress remains per-batch.
+PROGRESS_SNAPSHOT_TARGETS = 20
 ARGOS_SOURCE_CODE = "en"
 ARGOS_TARGET_MAP = {
     "ZH": "zh",
@@ -162,6 +166,20 @@ TIMECODE_RE = re.compile(
 WEBVTT_RE = re.compile(r"^\s*WEBVTT", re.IGNORECASE)
 INDEX_RE = re.compile(r"^\s*\d+\s*$")
 VOICE_TAG_RE = re.compile(r"^(?P<prefix>\s*<v\b[^>]*>)(?P<body>.*?)(?P<suffix>\s*</v>\s*)?$")
+_HTTP_SESSION_LOCAL = threading.local()
+
+
+def _thread_http_session(name: str) -> requests.Session:
+    """Return one pooled Requests session per worker thread and provider."""
+    sessions = getattr(_HTTP_SESSION_LOCAL, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _HTTP_SESSION_LOCAL.sessions = sessions
+    session = sessions.get(name)
+    if session is None:
+        session = requests.Session()
+        sessions[name] = session
+    return session
 
 
 def _caption_plain_text(value: object) -> str:
@@ -370,6 +388,20 @@ class GoogleWebRateLimitCircuit:
     def total_429_responses(self) -> int:
         with self._lock:
             return self._total_429
+
+
+def _failed_cues(items: list[dict]) -> list[int]:
+    cues: list[int] = []
+    seen: set[int] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        cue = item.get("cue")
+        if isinstance(cue, bool) or not isinstance(cue, int) or cue <= 0 or cue in seen:
+            continue
+        seen.add(cue)
+        cues.append(cue)
+    return cues
 
 
 def _failure_codes(items: list[dict]) -> dict[str, int]:
@@ -821,6 +853,14 @@ def argos_translate_batch(texts: List[str], target_lang: str) -> List[str]:
     """Translate an English subtitle batch with already-installed Argos models."""
     target_code = _resolve_argos_target_lang(target_lang)
     argos_translate = _load_argos_translate_module()
+    translation = _cached_argos_translation(argos_translate, target_code)
+    translated = [str(translation.translate(text)).strip() for text in texts]
+    return _validate_provider_batch_output(translated, len(texts))
+
+
+@lru_cache(maxsize=8)
+def _cached_argos_translation(argos_translate: object, target_code: str):
+    """Resolve an installed model once per translator module/target pair."""
     try:
         installed_languages = list(argos_translate.get_installed_languages())
     except Exception as exc:
@@ -841,9 +881,7 @@ def argos_translate_batch(texts: List[str], target_lang: str) -> List[str]:
             f"run 'argospm update' and 'argospm install translate-{ARGOS_SOURCE_CODE}_{target_code}'; "
             f"installed_languages={installed_codes}"
         )
-
-    translated = [str(translation.translate(text)).strip() for text in texts]
-    return _validate_provider_batch_output(translated, len(texts))
+    return translation
 
 
 def _resolve_web_target_lang(target_lang: str, provider: str) -> str:
@@ -886,11 +924,13 @@ def google_web_translate_batch(
         else requested_or_default_rps
     )
     effective_retries = min(GOOGLE_WEB_MAX_RETRIES, max(0, int(max_retries or 0)))
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-    })
+    session = _thread_http_session("google-web")
+    if not getattr(session, "_echo360_google_headers", False):
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+        })
+        session._echo360_google_headers = True
     out: list[str] = []
     next_request_at = 0.0
     for item_index, text in enumerate(texts):
@@ -1002,7 +1042,12 @@ def deepl_translate_batch(
     attempt = 0
     while True:
         try:
-            resp = requests.post(endpoint, data=req_data, headers=headers, timeout=request_timeout)
+            resp = _thread_http_session("deepl").post(
+                endpoint,
+                data=req_data,
+                headers=headers,
+                timeout=request_timeout,
+            )
             if resp.status_code == 200:
                 j = resp.json()
                 return [item.get("text", "") for item in j.get("translations", [])]
@@ -1129,7 +1174,12 @@ def _openai_call_responses(
     attempt = 0
     while True:
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=request_timeout)
+            resp = _thread_http_session("openai-responses").post(
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=request_timeout,
+            )
             if resp.status_code == 200:
                 return _extract_responses_output_text(resp.json())
             raise _http_error(resp.status_code)
@@ -1175,7 +1225,12 @@ def _openai_call_chat_completions(
     attempt = 0
     while True:
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=request_timeout)
+            resp = _thread_http_session("openai-chat").post(
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=request_timeout,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 choices = data.get("choices", [])
@@ -1208,7 +1263,12 @@ def _gemini_call_generate_content(
     attempt = 0
     while True:
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=request_timeout)
+            resp = _thread_http_session("gemini").post(
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=request_timeout,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 candidates = data.get("candidates", [])
@@ -1485,6 +1545,9 @@ def translate_lines_native(
     total = len(translatable_idx)
     if total == 0:
         raise ValueError("EMPTY_TRANSLATABLE_VTT: VTT 中没有可翻译文本")
+    partial_snapshot_interval = max(1, (total + PROGRESS_SNAPSHOT_TARGETS - 1) // PROGRESS_SNAPSHOT_TARGETS)
+    next_partial_snapshot = 1 if total <= PROGRESS_SNAPSHOT_TARGETS else partial_snapshot_interval
+    last_partial_snapshot = -1
     source_structure = inspect_probable_bilingual_source(lines)
     if target_code in CJK_TARGET_CODES and source_structure["probable"]:
         raise ValueError(
@@ -1833,15 +1896,24 @@ def translate_lines_native(
     completed = 0
     deferred_failures: list[tuple[int, int, list[int], str]] = []
 
-    def report_progress() -> None:
+    def report_progress(force_partial: bool = False) -> None:
+        nonlocal next_partial_snapshot, last_partial_snapshot
         # The local-backend path needs the actual partially translated VTT,
-        # not only a numeric counter.  Keep the callback best-effort so a
-        # progress-file problem never aborts an otherwise healthy translation.
-        if partial_callback:
+        # not only a numeric counter. Rewriting the complete document for each
+        # one-line batch is O(n²) disk I/O, so large tracks emit a bounded set
+        # of snapshots and always emit the final state.
+        should_write_partial = (
+            partial_callback is not None and
+            (force_partial or completed >= next_partial_snapshot or completed == total)
+        )
+        if should_write_partial and completed != last_partial_snapshot:
             try:
                 partial_callback(completed, total, list(out_lines))
             except Exception as exc:
                 print(f"WARNING: partial progress callback failed: {str(exc)[:160]}", file=sys.stderr)
+            last_partial_snapshot = completed
+            while next_partial_snapshot <= completed:
+                next_partial_snapshot += partial_snapshot_interval
         if progress_callback:
             progress_callback(completed, total)
 
@@ -2013,36 +2085,58 @@ def translate_lines_native(
 
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            # Keep only a worker-sized window of futures in memory. Submitting
+            # every batch at once retains one Future and its batch metadata for
+            # the entire track, which is needlessly expensive for long VTTs.
             future_to_batch = {}
+            batch_iterator = iter(batches)
             next_submit_at = time.perf_counter()
             submit_interval = (1.0 / rps) if rps and rps > 0 else 0.0
-            for bstart, bend, batch_ids in batches:
-                if stop_check and not stop_check():
-                    break
-                if submit_interval > 0:
-                    sleep_for = next_submit_at - time.perf_counter()
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                    next_submit_at = max(next_submit_at + submit_interval, time.perf_counter())
-                future = executor.submit(translate_batch, bstart, bend, batch_ids)
-                future_to_batch[future] = (bstart, bend)
+            stopped = False
 
-            for future in concurrent.futures.as_completed(future_to_batch):
-                if stop_check and not stop_check():
-                    break
-                result = future.result()
-                _bstart, _bend, _batch_ids, _translated, _had_fallback, _err_text, _deferred, _fallback_positions = result
-                if _deferred:
-                    deferred_failures.append((_bstart, _bend, _batch_ids, _err_text or "unknown error"))
-                else:
-                    completed += apply_batch_result(
-                        _bstart, _bend, _batch_ids, _translated, _had_fallback, _err_text,
-                        _deferred, _fallback_positions,
-                    )
+            def submit_available() -> None:
+                nonlocal next_submit_at, stopped
+                while len(future_to_batch) < workers and not stopped:
+                    if stop_check and not stop_check():
+                        stopped = True
+                        return
+                    try:
+                        bstart, bend, batch_ids = next(batch_iterator)
+                    except StopIteration:
+                        return
+                    if submit_interval > 0:
+                        sleep_for = next_submit_at - time.perf_counter()
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
+                        next_submit_at = max(next_submit_at + submit_interval, time.perf_counter())
+                    future = executor.submit(translate_batch, bstart, bend, batch_ids)
+                    future_to_batch[future] = (bstart, bend)
 
-                report_progress()
-                if log_progress and ((completed == total) or (completed % every == 0) or completed <= chunk):
-                    print(f"[{completed}/{total}] Translating...", flush=True)
+            submit_available()
+            while future_to_batch:
+                done, _pending = concurrent.futures.wait(
+                    tuple(future_to_batch),
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    bstart, bend = future_to_batch.pop(future)
+                    if stop_check and not stop_check():
+                        stopped = True
+                        continue
+                    result = future.result()
+                    _bstart, _bend, _batch_ids, _translated, _had_fallback, _err_text, _deferred, _fallback_positions = result
+                    if _deferred:
+                        deferred_failures.append((_bstart, _bend, _batch_ids, _err_text or "unknown error"))
+                    else:
+                        completed += apply_batch_result(
+                            _bstart, _bend, _batch_ids, _translated, _had_fallback, _err_text,
+                            _deferred, _fallback_positions,
+                        )
+
+                    report_progress()
+                    if log_progress and ((completed == total) or (completed % every == 0) or completed <= chunk):
+                        print(f"[{completed}/{total}] Translating...", flush=True)
+                submit_available()
 
     # A tripped Google circuit must bypass the existing deferred Google repair
     # phase; it would otherwise issue more Google attempts after the breaker
@@ -2151,6 +2245,9 @@ def translate_lines_native(
                 if log_progress:
                     print(f"[{completed}/{total}] Translating...", flush=True)
 
+    # Ensure a final snapshot exists even when the last batch was handled by a
+    # deferred repair phase or a provider returned no work for the final cue.
+    report_progress(force_partial=True)
     if outcome_callback:
         outcome_callback({
             "total": total,
@@ -2158,6 +2255,7 @@ def translate_lines_native(
             "translated": max(0, provider_results),
             "failed": len(failed_items),
             "failed_items": failed_items[:50],
+            "failed_cues": _failed_cues(failed_items),
             "failed_batches": len({item.get("batch") for item in failed_items if item.get("batch") is not None}),
             "failure_codes": _failure_codes(failed_items),
             "failureCodes": _failure_codes(failed_items),

@@ -44,7 +44,7 @@
   // from a different media subdomain with stricter headers. The service worker
   // fallback uses the declared Instructure host permission while keeping the
   // request target allowlisted; this avoids adding a broad arbitrary proxy.
-  async function fetchTextResource(url, options = {}) {
+  async function fetchTextResourceUncached(url, options = {}) {
     let contentError = null;
     try {
       const parsed = new URL(url, location.href);
@@ -111,6 +111,39 @@
     } catch (err) {
       return { ok: false, error: err?.message || String(err), code: specificErrorCode(err), status: validStatus(err?.status) };
     }
+  }
+
+  function fetchTextResource(url, options = {}) {
+    const requests = options.resourceRequests;
+    if (!(requests instanceof Map)) return fetchTextResourceUncached(url, options);
+    const key = String(url);
+    const previous = requests.get(key);
+    if (previous && previous.expiresAt > Date.now()) return previous.promise;
+    requests.delete(key);
+    // This memo belongs to one source-discovery attempt, never a page/global
+    // cache. Bound both entry count and retained UTF-16 text, including failures.
+    while (requests.size >= 32) requests.delete(requests.keys().next().value);
+    const entry = { expiresAt: Infinity, chars: 0, promise: null };
+    entry.promise = fetchTextResourceUncached(url, options).then((result) => {
+      if (requests.get(key) !== entry) return result;
+      // A successful HTTP response can still be an empty/not-yet-generated
+      // caption file. Recheck after a short window rather than freezing that
+      // response for the entire discovery deadline.
+      entry.expiresAt = Date.now() + 2000;
+      entry.chars = String(result.text || "").length;
+      let chars = [...requests.values()].reduce((sum, item) => sum + item.chars, 0);
+      while (chars > 8 * 1024 * 1024 && requests.size) {
+        const oldest = requests.keys().next().value;
+        chars -= requests.get(oldest).chars;
+        requests.delete(oldest);
+      }
+      return result;
+    }, (error) => {
+      if (requests.get(key) === entry) requests.delete(key);
+      throw error;
+    });
+    requests.set(key, entry);
+    return entry.promise;
   }
 
   function asArray(value) {
@@ -342,10 +375,8 @@
     return m ? m[1] : "";
   }
 
-  function collectTranscriptMediaIdCandidates() {
-    const lessonId = getLessonId();
+  function collectTranscriptHintIds(lessonId, resourceIds) {
     const lessonLower = lessonId.toLowerCase();
-    const resourceIds = [...videoApi.collectInteractiveMediaIdsFromResources()];
     const hintIds = [];
     const seen = new Set(resourceIds);
     for (const v of videoApi.getAllVideos()) {
@@ -359,7 +390,7 @@
         hintIds.push(id);
       }
     }
-    return { lessonId, resourceIds, hintIds };
+    return hintIds;
   }
 
   async function tryTranscriptFileForMediaIds(lessonId, mediaIds, video, options = {}) {
@@ -374,19 +405,13 @@
         break;
       }
       const url = `${location.origin}/api/ui/echoplayer/lessons/${encodeURIComponent(lessonId)}/medias/${encodeURIComponent(mediaId)}/transcript-file?format=vtt`;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const resp = await fetch(url, {
-          credentials: "include",
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (!resp.ok) {
-          attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "fetch-failed", code: `HTTP_${resp.status}`, status: resp.status, error: `HTTP ${resp.status}` });
+        const fetched = await fetchTextResource(url, options);
+        if (!fetched.ok) {
+          attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "fetch-failed", code: fetched.code, status: fetched.status, error: fetched.error });
           continue;
         }
-        const rawText = await ns.errorUtils.readBoundedResponseText(resp, MAX_TEXT_RESOURCE_BYTES);
+        const rawText = fetched.text;
         const text = vttApi.normalizeTimedText
           ? vttApi.normalizeTimedText(rawText)
           : rawText;
@@ -411,8 +436,6 @@
         attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "usable", code: "OK", cueCount: stats.cueCount });
       } catch (error) {
         attempts.push({ strategy: "transcript-file", mediaId, url, outcome: "exception", code: specificErrorCode(error, "RESOURCE_NETWORK_ERROR"), status: validStatus(error?.status), error: error?.message || String(error) });
-      } finally {
-        clearTimeout(timer);
       }
     }
     return { best, attempts };
@@ -441,15 +464,16 @@
   // and the <track>/TextTrack based lookups all come up empty.
   async function fetchTranscriptFileVtt(video, options = {}) {
     const empty = { text: "", sourceId: "", strongMapped: false, sourceMeta: null, diagnostics: { candidateCount: 0, attempts: [] } };
-    const { lessonId, resourceIds, hintIds } = collectTranscriptMediaIdCandidates();
-    if (!lessonId || (resourceIds.length === 0 && hintIds.length === 0)) return empty;
+    const lessonId = getLessonId();
+    if (!lessonId) return empty;
+    const resourceIds = [...videoApi.collectInteractiveMediaIdsFromResources()];
 
     // Interactive-media resource ids map directly to this lesson's transcript.
     // When one of them hits, stop immediately — do not keep probing React-fiber
     // hint UUIDs that mostly 404 and clutter the console.
     let probe = await tryTranscriptFileForMediaIds(lessonId, resourceIds, video, options);
     let best = probe.best;
-    const diagnostics = { candidateCount: resourceIds.length + hintIds.length, attempts: [...probe.attempts] };
+    const diagnostics = { candidateCount: resourceIds.length, attempts: [...probe.attempts] };
     if (best) {
       console.log(
         "[echo360-translator] using Echo360 transcript-file API VTT:",
@@ -462,6 +486,11 @@
       return { ...buildTranscriptFileResult(best), diagnostics };
     }
 
+    // React/Fiber discovery can visit a large object graph. Only pay for it
+    // when the direct resource mapping failed and there is time for a request.
+    if (remainingResourceTimeout(options) <= 0) return { ...empty, diagnostics };
+    const hintIds = collectTranscriptHintIds(lessonId, resourceIds);
+    diagnostics.candidateCount += hintIds.length;
     probe = await tryTranscriptFileForMediaIds(lessonId, hintIds, video, options);
     best = probe.best;
     diagnostics.attempts.push(...probe.attempts);

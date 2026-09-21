@@ -79,6 +79,7 @@ function setupControllerWithRenderer() {
     useNativeSubtitles: false,
   };
   const domMount = vi.fn(() => false);
+  let videoChangeListener = null;
 
   window.Echo360Translator = makeFullNs({
     browserApi: {
@@ -101,6 +102,13 @@ function setupControllerWithRenderer() {
       waitForVideo: vi.fn(async () => video),
       getAllVideos: () => [video],
       getPrimaryVideo: () => video,
+      subscribeToChanges: vi.fn((listener) => {
+        videoChangeListener = listener;
+        return () => {
+          if (videoChangeListener === listener) videoChangeListener = null;
+        };
+      }),
+      destroy: vi.fn(),
       querySelectorAllDeep: (selector) => Array.from(document.querySelectorAll(selector)),
       getVideoHintMediaIds: () => new Set(),
     },
@@ -121,7 +129,12 @@ function setupControllerWithRenderer() {
   evalModule("subtitle_strategy.js");
   evalModule("renderer.js");
   evalModule("controller.js");
-  return { ns: window.Echo360Translator, video, domMount };
+  return {
+    ns: window.Echo360Translator,
+    video,
+    domMount,
+    emitVideoChange: (change = {}) => videoChangeListener?.(change),
+  };
 }
 
 function setupManualController({ quickTranslateAutoExport = true } = {}) {
@@ -179,6 +192,7 @@ describe("controller track sync in Echo360 native CC mode", () => {
   });
 
   afterEach(() => {
+    window.Echo360Translator?.controller?.destroy?.();
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -199,6 +213,117 @@ describe("controller track sync in Echo360 native CC mode", () => {
     // periodic sync should not keep re-attempting the failed native CC mount.
     expect(domMount).toHaveBeenCalledOnce();
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
+  });
+
+  it("coalesces video changes into a prompt sync and keeps only a low-frequency safety pass", async () => {
+    const { ns, emitVideoChange } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(1200);
+    ensureTrack.mockClear();
+
+    // Repeated media/DOM signals must keep the first 100 ms deadline rather
+    // than turning into a trailing debounce.
+    emitVideoChange({ type: "media" });
+    await vi.advanceTimersByTimeAsync(50);
+    emitVideoChange({ type: "dom" });
+    emitVideoChange({ type: "media" });
+    await vi.advanceTimersByTimeAsync(49);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ensureTrack).toHaveBeenCalledOnce();
+
+    ensureTrack.mockClear();
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(ensureTrack).toHaveBeenCalledOnce();
+  });
+
+  it("reuses preferences during maintenance and refreshes only after a storage change", async () => {
+    const { ns } = setupControllerWithRenderer();
+    let onChanged;
+    ns.browserApi.storage.onChanged = {
+      addListener: vi.fn((listener) => { onChanged = listener; }),
+      removeListener: vi.fn(),
+    };
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(1);
+    onChanged({ [ns.constants.PREFS_KEY_PREFIX + "global"]: { newValue: { enabled: false } } }, "local");
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not stack asynchronous maintenance jobs when extension storage stalls", async () => {
+    const { ns } = setupControllerWithRenderer();
+    let onChanged;
+    ns.browserApi.storage.onChanged = { addListener: (listener) => { onChanged = listener; } };
+    await ns.controller.init();
+    let resolvePrefs;
+    ns.storage.getPrefs.mockImplementationOnce(() => new Promise((resolve) => { resolvePrefs = resolve; }));
+    onChanged({ [ns.constants.PREFS_KEY_PREFIX + "global"]: {} }, "local");
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+    resolvePrefs({ enabled: false });
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ns.storage.getPrefs).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops maintenance in hidden pages and during page-cache suspension, then resumes", async () => {
+    const { ns } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await ns.controller.init();
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).not.toHaveBeenCalled();
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new Event("pageshow"));
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(ensureTrack).toHaveBeenCalledTimes(2);
+    ns.controller.destroy();
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps track maintenance available to a visible picture-in-picture video", async () => {
+    const { ns, video } = setupControllerWithRenderer();
+    const ensureTrack = vi.spyOn(ns.renderer, "ensureTrackOnPrimaryVideo");
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await ns.controller.init();
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "pictureInPictureElement", { configurable: true, value: video });
+    try {
+      video.dispatchEvent(new Event("enterpictureinpicture"));
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(ensureTrack).toHaveBeenCalledTimes(1);
+    } finally {
+      delete document.pictureInPictureElement;
+    }
+    video.dispatchEvent(new Event("leavepictureinpicture"));
+    await vi.advanceTimersByTimeAsync(12000);
+    expect(ensureTrack).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds automatic failed-source prefetch retries while allowing an explicit retry", async () => {
+    const { ns, callbacks } = setupManualController();
+    ns.translationService.resolveSourceVtt.mockRejectedValue(Object.assign(new Error("No captions"), { code: "SOURCE_NOT_FOUND" }));
+    await ns.controller.init();
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(ns.translationService.resolveSourceVtt).toHaveBeenCalledTimes(3);
+    await callbacks().onManualPrepare();
+    expect(ns.translationService.resolveSourceVtt).toHaveBeenCalledTimes(4);
   });
 
   it("renders the Transcript panel as an independent surface without changing track mounting", () => {
@@ -763,5 +888,60 @@ describe("controller track sync in Echo360 native CC mode", () => {
     });
     expect(await callbacks().onManualImport()).toBeNull();
     expect(document.querySelector('track[data-echo360-translated="1"]')).toBeNull();
+  });
+
+  it("marks every failed cue for rendering when diagnostic details are sampled", async () => {
+    const { ns, callbacks } = setupManualController();
+    const source = "WEBVTT\n\n" + Array.from({ length: 61 }, (_, i) => (
+      `${ns.vtt.formatVttTime(i * 2)} --> ${ns.vtt.formatVttTime(i * 2 + 1)}\nSource ${i}\n`
+    )).join("\n");
+    const translated = source.replace("Source 60", "已翻译");
+    ns.translationService.resolveSourceVtt.mockResolvedValue({
+      vttText: source,
+      sourceId: "source",
+      sourceMeta: { stats: { cueCount: 61 } },
+    });
+    ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+    ns.storage.getCacheStore = vi.fn(async () => null);
+    ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+    ns.translationService.buildCacheKey = vi.fn(async () => ({
+      sourceKey: "s",
+      configSig: "c",
+      cacheKey: "k",
+    }));
+    ns.translationService.buildTranslatePayload = vi.fn(() => ({
+      vtt_text: source,
+      provider: "google-web",
+      target: "ZH",
+      bilingual: false,
+    }));
+    ns.translationService.translateWithConfig = vi.fn(async () => ({
+      translated_vtt: translated,
+      warnings: [],
+      failed_items: Array.from({ length: 50 }, (_, i) => ({
+        cue: i + 1,
+        code: "HTTP_503",
+        message: "HTTP 503",
+      })),
+      failed_cues: Array.from({ length: 60 }, (_, i) => i + 1),
+      failure_codes: { HTTP_503: 60 },
+      metrics: {
+        total: 61,
+        processed: 61,
+        translated: 1,
+        failed: 60,
+        providerResults: 1,
+        targetResults: 1,
+      },
+    }));
+    ns.backendClient = { validateTranslationResult: vi.fn() };
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+
+    await ns.controller.init();
+    await callbacks().onTranslate();
+
+    const finalOptions = render.mock.calls.at(-1)[7];
+    expect(finalOptions.failedCues).toHaveLength(60);
+    expect(finalOptions.failedCues.at(-1)).toBe(60);
   });
 });

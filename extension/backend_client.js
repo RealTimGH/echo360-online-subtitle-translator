@@ -50,6 +50,47 @@
     return error;
   }
 
+  function throwIfCancelled(options = {}) {
+    if (options.signal?.aborted) {
+      const error = makeClientError("翻译任务已取消", "TRANSLATION_CANCELLED", { phase: "translation" });
+      error.name = "AbortError";
+      error.reason = options.signal.reason;
+      throw error;
+    }
+    if (options.isActive && !options.isActive()) {
+      throw makeClientError("stale job", "STALE_JOB");
+    }
+  }
+
+  function waitForPoll(ms, signal) {
+    if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+    if (signal.aborted) {
+      const error = makeClientError("翻译任务已取消", "TRANSLATION_CANCELLED", { phase: "translation" });
+      error.name = "AbortError";
+      error.reason = signal.reason;
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        signal.removeEventListener?.("abort", onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener?.("abort", onAbort);
+        const error = makeClientError("翻译任务已取消", "TRANSLATION_CANCELLED", { phase: "translation" });
+        error.name = "AbortError";
+        error.reason = signal.reason;
+        reject(error);
+      };
+      signal.addEventListener?.("abort", onAbort, { once: true });
+    });
+  }
+
   function errorFromResponse(response, fallbackMessage, fallbackCode) {
     const problem = response?.problem || response?.error_detail || response?.data?.problem ||
       response?.data?.error_detail ||
@@ -860,7 +901,26 @@
         });
       }
     }
-    return result;
+    const failedCues = [];
+    const seenFailedCues = new Set();
+    const failedCueSources = [
+      result.failed_cues,
+      result.failedCues,
+      metrics.failed_cues,
+      metrics.failedCues,
+    ];
+    for (const source of failedCueSources) {
+      if (!Array.isArray(source)) continue;
+      for (const cue of source) {
+        const number = Number(cue);
+        if (!Number.isInteger(number) || number <= 0 || seenFailedCues.has(number)) continue;
+        seenFailedCues.add(number);
+        failedCues.push(number);
+      }
+    }
+    if (failedCues.length === 0) return result;
+    if (Array.isArray(result.failed_cues) && result.failed_cues.length === failedCues.length) return result;
+    return { ...result, failed_cues: failedCues };
   }
 
   function validateJob(job, phase) {
@@ -938,8 +998,12 @@
       });
   }
 
-  function readDirectTranslateJob(jobId) {
-    return extensionApi.runtime.sendMessage({ type: "direct-translate-job", jobId })
+  function readDirectTranslateJob(jobId, options = {}) {
+    const message = { type: "direct-translate-job", jobId };
+    if (Number.isInteger(options.partialRevision) && options.partialRevision >= 0) {
+      message.partial_revision = options.partialRevision;
+    }
+    return extensionApi.runtime.sendMessage(message)
       .then((response) => {
         if (!response || !response.ok) throw errorFromResponse(response, "读取翻译任务失败", "DIRECT_JOB_READ_FAILED");
         return response.data;
@@ -954,16 +1018,21 @@
     const maxMs = DIRECT_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
+    let lastPartialRevision = null;
     while (Date.now() - start < maxMs) {
-      if (options.isActive && !options.isActive()) {
-        throw makeClientError("stale job", "STALE_JOB");
-      }
-      let rawJob = await readDirectTranslateJob(jobId);
+      throwIfCancelled(options);
+      let rawJob = await readDirectTranslateJob(jobId, { partialRevision: lastPartialRevision });
+      throwIfCancelled(options);
       // A stale caller can accidentally hand the polling function the create
       // envelope. Treat that envelope as malformed-but-recoverable and read
       // the actual job once; never treat it as a completed translation.
-      if (rawJob?.job_id && !rawJob.status) rawJob = await readDirectTranslateJob(rawJob.job_id || jobId);
+      if (rawJob?.job_id && !rawJob.status) {
+        rawJob = await readDirectTranslateJob(rawJob.job_id || jobId, { partialRevision: lastPartialRevision });
+      }
       const job = validateJob(rawJob, "backend");
+      if (Number.isInteger(job.partial_revision) && job.partial_revision >= 0) {
+        lastPartialRevision = job.partial_revision;
+      }
       const p = normalizeProgress(job.progress);
       if (job.partial_vtt && job.partial_vtt !== lastPartialVtt) {
         lastPartialVtt = job.partial_vtt;
@@ -992,7 +1061,7 @@
         });
         throw error;
       }
-      await new Promise((r) => setTimeout(r, 700));
+      await waitForPoll(700, options.signal);
     }
     throw makeClientError("翻译任务超时（超过 8 分钟）", "TRANSLATION_TIMEOUT");
   }
@@ -1001,13 +1070,15 @@
     const maxMs = BACKEND_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
+    let lastPartialRevision = null;
     while (Date.now() - start < maxMs) {
-      if (options.isActive && !options.isActive()) {
-        throw makeClientError("stale job", "STALE_JOB");
-      }
+      throwIfCancelled(options);
       let job;
       try {
-        job = validateJob(await proxyRequest(backendUrl, `/translate-async/${jobId}`), "backend");
+        const statusPath = lastPartialRevision == null
+          ? `/translate-async/${jobId}`
+          : `/translate-async/${jobId}?since_partial_revision=${lastPartialRevision}`;
+        job = validateJob(await proxyRequest(backendUrl, statusPath), "backend");
       } catch (error) {
         // A 404 while polling means this specific job is gone. It is not proof
         // that the async endpoint is unsupported; translation_service.js only
@@ -1020,6 +1091,10 @@
           error.retryable = false;
         }
         throw error;
+      }
+      throwIfCancelled(options);
+      if (Number.isInteger(job.partial_revision) && job.partial_revision >= 0) {
+        lastPartialRevision = job.partial_revision;
       }
       const p = normalizeProgress(job.progress);
       if (job.partial_vtt && job.partial_vtt !== lastPartialVtt) {
@@ -1049,7 +1124,7 @@
         });
         throw error;
       }
-      await new Promise((r) => setTimeout(r, 700));
+      await waitForPoll(700, options.signal);
     }
     throw makeClientError("本地后端任务超时（超过 9 分钟）", "TRANSLATION_TIMEOUT");
   }

@@ -19,6 +19,8 @@ describe("service-worker message contracts", () => {
     expect(contracts.isAllowedProxyRoute("/translate", "POST")).toBe(true);
     expect(contracts.isAllowedProxyRoute("/translate-async", "POST")).toBe(true);
     expect(contracts.isAllowedProxyRoute("/translate-async/abc_123-def", "GET")).toBe(true);
+    expect(contracts.isAllowedProxyRoute("/translate-async/abc_123-def?since_partial_revision=7", "GET")).toBe(true);
+    expect(contracts.isAllowedProxyRoute("/translate-async/abc_123-def?unexpected=7", "GET")).toBe(false);
     expect(contracts.isAllowedProxyRoute("/admin", "GET")).toBe(false);
     expect(contracts.isAllowedProxyRoute("/translate", "DELETE")).toBe(false);
     expect(contracts.isAllowedProxyRoute("/translate-async/../health", "GET")).toBe(false);

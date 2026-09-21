@@ -46,37 +46,59 @@
   }
 
   function parseVttStats(vttText) {
-    const lines = String(vttText || "").split("\n");
+    // Keep timing and text-shape statistics in one scan. The previous
+    // implementation parsed every timing line once, then parsed all cues
+    // again to count text lines; source ranking requests these stats often on
+    // large recordings.
+    const lines = String(vttText || "").replace(/\r/g, "").split("\n");
     let cueCount = 0;
     let maxEnd = 0;
     const ranges = [];
-    for (const line of lines) {
-      // WebVTT permits both MM:SS.mmm and HH:MM:SS.mmm timestamps. Reuse the
-      // strict timing parser so source discovery and rendering count the same
-      // cues regardless of which legal form the site emits.
-      const timing = parseVttTimingLine(line);
+    let textLineCount = 0;
+    let multilineCueCount = 0;
+    let emptyCueCount = 0;
+    for (let i = 0; i < lines.length; i += 1) {
+      const timing = parseVttTimingLine(lines[i]);
       if (!timing) continue;
       cueCount += 1;
       const s = timing.startMs / 1000;
       const e = timing.endMs / 1000;
       if (e > maxEnd) maxEnd = e;
       ranges.push([s, e]);
+      let textLineCountForCue = 0;
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() !== "") {
+        textLineCountForCue += 1;
+        // A malformed block can contain another timing line before its blank
+        // separator. parseVttCues() treats that line as text, while the old
+        // stats loop still counted it as a timing line; preserve both facts
+        // without rescanning the block.
+        const nestedTiming = parseVttTimingLine(lines[j]);
+        if (nestedTiming) {
+          cueCount += 1;
+          const nestedStart = nestedTiming.startMs / 1000;
+          const nestedEnd = nestedTiming.endMs / 1000;
+          if (nestedEnd > maxEnd) maxEnd = nestedEnd;
+          ranges.push([nestedStart, nestedEnd]);
+        }
+        j += 1;
+      }
+      textLineCount += textLineCountForCue;
+      if (textLineCountForCue > 1) multilineCueCount += 1;
+      if (textLineCountForCue === 0) emptyCueCount += 1;
+      i = j;
     }
     // Keep the source identity useful for diagnostics as well as ranking. A
     // clean Echo360 source normally has one text line per cue; a rendered
     // bilingual/accumulated track has two or more. These counters are
     // observational only and do not change the line-based translation model.
-    const cues = parseVttCues(vttText);
-    const textLineCounts = cues.map((cue) => String(cue.text || "")
-      .split("\n")
-      .filter((line) => line.trim()).length);
     return {
       cueCount,
       maxEnd,
       ranges,
-      textLineCount: textLineCounts.reduce((sum, count) => sum + count, 0),
-      multilineCueCount: textLineCounts.filter((count) => count > 1).length,
-      emptyCueCount: textLineCounts.filter((count) => count === 0).length,
+      textLineCount,
+      multilineCueCount,
+      emptyCueCount,
     };
   }
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { evalModule, makeFullNs, PROJECT_ROOT } from "../helpers/load-module.js";
@@ -92,5 +92,30 @@ describe("new-player-v1 transcript adapter", () => {
     document.body.innerHTML = `<div id="transcripts-panel"><input aria-label="Search"><div class="transcript-list"></div></div>`;
     expect(adapter.findPanelRoots()).toEqual([]);
     expect(adapter.supportsLegacy()).toBe(false);
+  });
+
+  it("caches stable panel structure while keeping virtualized cue rows live", () => {
+    const adapter = setup(panel(row(0, "0.00", '<span role="button">Hello</span>', "sec")));
+    const root = document.querySelector("#transcripts-panel");
+    // Prime the weak structural cache before measuring subsequent helper calls.
+    expect(adapter.getPanelDescriptor(root)?.virtualized).toBe(true);
+    const querySelector = vi.spyOn(root, "querySelector");
+    adapter.findSearchInput(root);
+    adapter.findSearchContainer(root);
+    adapter.findListHost(root);
+    adapter.findRowGroup(root);
+    adapter.getPanelDescriptor(root);
+    expect(querySelector).not.toHaveBeenCalled();
+
+    const rowGroup = adapter.findRowGroup(root);
+    rowGroup.innerHTML = row(50, "1.00", '<span role="button">Updated</span>');
+    expect(adapter.findCueCandidates(root)[0].textContent).toContain("Updated");
+  });
+
+  it("does not call a list without a verified rowgroup virtualized", () => {
+    const adapter = setup(panel(""));
+    const root = document.querySelector("#transcripts-panel");
+    root.querySelector('[role="rowgroup"]').remove();
+    expect(adapter.getPanelDescriptor(root)?.virtualized).toBe(false);
   });
 });

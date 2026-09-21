@@ -969,6 +969,7 @@ describe("buildCacheKey", () => {
     expect(key.sourceKey).toBe("https://example.com/sub.vtt");
     expect(key.configSig).toBe("openai|gpt-5-nano");
     expect(key.cacheKey).toBe("https://example.com/sub.vtt::openai|gpt-5-nano");
+    expect(window.Echo360Translator.storage.sha256Text).not.toHaveBeenCalled();
   });
 
   it("falls back to page href + vtt hash when sourceId is empty", async () => {

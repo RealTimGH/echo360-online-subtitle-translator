@@ -661,6 +661,38 @@ Third line
     }
   });
 
+  it("keeps aggregate failure counts while bounding item-level diagnostics", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Load failed"));
+    const cues = Array.from({ length: 60 }, (_, index) => (
+      `00:00:${String(index).padStart(2, "0")}.000 --> 00:00:${String(index + 1).padStart(2, "0")}.000\nline ${index + 1}`
+    )).join("\n\n");
+    try {
+      const error = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "ZH",
+        concurrency: 3,
+        retries: 0,
+        max_paragraphs: 6,
+        max_chars: 1200,
+        vtt_text: `WEBVTT\n\n${cues}\n`,
+      }).catch((caught) => caught);
+      expect(error).toMatchObject({
+        code: "NO_TRANSLATIONS",
+        metrics: expect.objectContaining({ failed: 60, total: 60 }),
+        failed_items: expect.any(Array),
+        failure_codes: expect.any(Object),
+      });
+      expect(error.failed_items).toHaveLength(50);
+      expect(error.failed_cues).toHaveLength(60);
+      expect(error.failed_cues.at(-1)).toBe(60);
+      expect(Object.values(error.failure_codes).reduce((sum, count) => sum + count, 0)).toBe(60);
+    } finally {
+      expect(fetchMock).toHaveBeenCalled();
+      fetchMock.mockRestore();
+    }
+  });
+
   it("honors Retry-After/backoff and exposes a retry event for a transient 429", async () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0);

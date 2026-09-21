@@ -110,6 +110,17 @@ describe("renderer Echo360 native CC mode", () => {
     expect(video.querySelectorAll("track").length).toBe(0);
   });
 
+  it("does no video/track discovery while no translation render is active", () => {
+    const { renderer } = setupRenderer({ domMountResult: false });
+    const getAllVideos = vi.spyOn(window.Echo360Translator.video, "getAllVideos");
+    const queryDeep = vi.spyOn(window.Echo360Translator.video, "querySelectorAllDeep");
+
+    renderer.applySubtitleVisibility(true);
+
+    expect(getAllVideos).not.toHaveBeenCalled();
+    expect(queryDeep).not.toHaveBeenCalled();
+  });
+
   it("removes an existing translated browser track before mounting the DOM renderer", () => {
     const { renderer, video, domMount } = setupRenderer({ domMountResult: true });
     const existingTrack = document.createElement("track");
@@ -423,6 +434,23 @@ Partial
     expect(secondTrack).toBe(firstTrack);
     expect(secondSrc).not.toBe(firstSrc);
     expect(video.querySelectorAll('track[data-echo360-translated="1"]').length).toBe(1);
+  });
+
+  it("cleans superseded blob revocation timers and load listeners on teardown", () => {
+    vi.useFakeTimers();
+    try {
+      const { renderer, video } = setupRenderer();
+      expect(renderer.renderTranslatedTrack(TRANS_VTT, ORIG_VTT, false, "medium", false, null, true)).toBe(true);
+      const firstTrack = video.querySelector('track[data-echo360-translated="1"]');
+      const firstSrc = firstTrack?.getAttribute("src");
+      const updated = `${TRANS_VTT}\n<!-- incremental payload -->`;
+      expect(renderer.renderTranslatedTrack(updated, ORIG_VTT, false, "medium", false, null, true, { incremental: true })).toBe(true);
+      renderer.cleanupTranslatedTracks();
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith(firstSrc);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not inject a guessed WebVTT line coordinate into browser fallback cues", () => {

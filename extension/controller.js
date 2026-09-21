@@ -7,15 +7,29 @@
   let isTranslating = false;
   let loadedCacheKey = "";
   let trackSyncTimer = null;
+  let trackSyncTimerDueAt = 0;
   let trackSyncErrorShown = false;
+  let trackSyncRunning = false;
+  let trackSyncInstalled = false;
+  let trackSyncSuspended = false;
+  let trackSyncPrefs = null;
+  let trackSyncPrefsRevision = 0;
+  let trackSyncRequested = false;
+  let trackSyncVideoUnsubscribe = null;
+  let configWatcher = null;
   let lastKnownConfig = null;
   let manualSession = null;
   let manualPreparationPromise = null;
   let manualPreparationContext = null;
   let manualPrimeRetryAt = 0;
   let manualPrimeFailureKey = "";
+  let manualPrimeFailures = 0;
   let manualGeneration = 0;
   let configWatcherInstalled = false;
+
+  const TRACK_SYNC_INITIAL_DELAY_MS = 1200;
+  const TRACK_SYNC_EVENT_DELAY_MS = 100;
+  const TRACK_SYNC_SAFETY_INTERVAL_MS = 15000;
 
   function manualVideoHint(video) {
     if (!video) return "";
@@ -60,12 +74,18 @@
     manualPreparationPromise = null;
     manualPrimeRetryAt = 0;
     manualPrimeFailureKey = "";
+    manualPrimeFailures = 0;
   }
 
   function installConfigWatcher() {
     if (configWatcherInstalled || typeof extensionApi.storage?.onChanged?.addListener !== "function") return;
-    extensionApi.storage.onChanged.addListener((changes, area) => {
+    configWatcher = (changes, area) => {
       if (area !== "local") return;
+      if (Object.keys(changes).some((key) => key.startsWith(ns.constants.PREFS_KEY_PREFIX))) {
+        trackSyncPrefs = null;
+        trackSyncPrefsRevision += 1;
+        requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
+      }
       const next = changes[ns.constants.STORAGE_KEY]?.newValue;
       if (!next || typeof next !== "object") return;
       const provider = String(next.provider || "google-web").toLowerCase();
@@ -84,7 +104,9 @@
         const video = ns.video.getPrimaryVideo?.();
         if (video) void primeManualSession(video).catch(() => {});
       }
-    });
+      requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
+    };
+    extensionApi.storage.onChanged.addListener(configWatcher);
     configWatcherInstalled = true;
   }
 
@@ -120,6 +142,28 @@
       const cueFromLine = lineToCue.get(line);
       if (Number.isInteger(cueFromLine) && cueFromLine > 0) failedCues.add(cueFromLine);
     }
+    return [...failedCues];
+  }
+
+  function addFailedCueNumbers(target, values) {
+    for (const cue of Array.isArray(values) ? values : []) {
+      const number = Number(cue);
+      if (Number.isInteger(number) && number > 0) target.add(number);
+    }
+    return target;
+  }
+
+  // failed_items is a bounded diagnostic sample. Rendering must also consume
+  // the compact failed_cues list so cues 51+ are still marked failed.
+  function collectFailedCues(source = {}, originalVtt = "") {
+    const failedCues = new Set(failedCuesFromItems(
+      source?.failed_items || source?.failedItems,
+      originalVtt,
+    ));
+    addFailedCueNumbers(failedCues, source?.failed_cues);
+    addFailedCueNumbers(failedCues, source?.failedCues);
+    addFailedCueNumbers(failedCues, source?.metrics?.failed_cues);
+    addFailedCueNumbers(failedCues, source?.metrics?.failedCues);
     return [...failedCues];
   }
 
@@ -230,7 +274,7 @@
   }
 
   function failedCuesFromProgress(progress = {}, originalVtt = "") {
-    return failedCuesFromItems(progress.failed_items, originalVtt);
+    return collectFailedCues(progress, originalVtt);
   }
 
   function addSummaryCounts(target, source) {
@@ -281,12 +325,7 @@
         : Number(parsedStats.textLineCount) || 0,
     };
     const failedItems = Array.isArray(result?.failed_items) ? result.failed_items : [];
-    const failedCueSet = new Set([
-      ...failedCuesFromItems(failedItems, originalVtt),
-      ...(Array.isArray(result?.failed_cues) ? result.failed_cues : [])
-        .map((cue) => Number(cue))
-        .filter((cue) => Number.isInteger(cue) && cue > 0),
-    ]);
+    const failedCueSet = new Set(collectFailedCues(result, originalVtt));
     const totalCues = Math.max(0,
       Number(metrics.totalCues) ||
       Number(metrics.total_cues) ||
@@ -460,6 +499,8 @@
       const oldPrefs = await ns.storage.getPrefs();
       const prefs = ns.ui.readPanelPrefs();
       await ns.storage.savePrefs(prefs);
+      trackSyncPrefs = prefs;
+      trackSyncPrefsRevision += 1;
       ns.renderer.applySubtitleSize(prefs.size);
 
       const renderState = ns.renderer.getRenderState();
@@ -488,6 +529,7 @@
         }
       }
       ns.renderer.applySubtitleVisibility(prefs.enabled);
+      requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
       if (ns.transcriptPanelRenderer && prefs.transcriptPanelEnabled !== true) {
         ns.transcriptPanelRenderer.setVisible(false);
       }
@@ -543,6 +585,11 @@
     manualPreparationContext = context;
     const preparation = (async () => {
       const { vttText, sourceId, sourceMeta } = await ns.translationService.resolveSourceVtt(video);
+      if (!isManualContextCurrent(context)) {
+        throw Object.assign(new Error("课程或播放器已切换，已丢弃旧字幕准备结果"), {
+          code: "MANUAL_SESSION_SOURCE_CHANGED", phase: "source",
+        });
+      }
       const cfg = await ns.storage.getConfig();
       lastKnownConfig = cfg;
       const target = String(cfg.target || "ZH").toUpperCase();
@@ -606,6 +653,7 @@
       manualSession = session;
       manualPrimeRetryAt = 0;
       manualPrimeFailureKey = "";
+      manualPrimeFailures = 0;
       setManualSessionReady(session);
       return session;
     })();
@@ -664,16 +712,26 @@
   }
 
   function maybePrimeManualSession(video) {
-    if (!video || typeof ns.translationService?.resolveSourceVtt !== "function" ||
+    if (document.visibilityState === "hidden" || !video || typeof ns.translationService?.resolveSourceVtt !== "function" ||
       typeof ns.manualTranslation?.buildPrompt !== "function" ||
       typeof ns.manualTranslation?.createTranslationPackage !== "function" || currentManualSession(video)) return;
     const context = { video, location: location.href, videoHint: manualVideoHint(video), generation: manualGeneration };
     const key = `${context.location}::${context.videoHint}`;
-    if (manualPrimeFailureKey === key && Date.now() < manualPrimeRetryAt) return;
+    // One completion handler per prefetch, even when discovery takes minutes.
+    if (manualPreparationPromise && manualPreparationContext &&
+      manualPreparationContext.video === video &&
+      manualPreparationContext.location === context.location &&
+      manualPreparationContext.videoHint === context.videoHint &&
+      manualPreparationContext.generation === context.generation) return;
+    // Unavailable captions must not produce an endless background request loop.
+    // Explicit manual/translate actions can still retry immediately.
+    if (manualPrimeFailureKey === key &&
+      (manualPrimeFailures >= 3 || Date.now() < manualPrimeRetryAt)) return;
     void primeManualSession(video).catch((error) => {
       if (isManualContextCurrent(context)) {
+        manualPrimeFailures = manualPrimeFailureKey === key ? manualPrimeFailures + 1 : 1;
         manualPrimeFailureKey = key;
-        manualPrimeRetryAt = Date.now() + 15000;
+        manualPrimeRetryAt = Date.now() + 15000 * (2 ** (manualPrimeFailures - 1));
       }
       console.info("[echo360-translator][manual] source prefetch deferred", safeErrorForLog(error, { phase: "source" }));
     });
@@ -1362,10 +1420,10 @@
     const showFailedTranslationPreview = (failureError = null) => {
       if (!incrementalPreviewMounted || !previewRenderArgs) return;
       const { vttText, prefs, sourceMeta } = previewRenderArgs;
-      const failedCues = [
-        ...failedCuesFromProgress(lastPreviewMeta, vttText),
-        ...failedCuesFromItems(failureError?.failed_items, vttText),
-      ];
+      const failedCues = [...new Set([
+        ...collectFailedCues(lastPreviewMeta, vttText),
+        ...collectFailedCues(failureError || {}, vttText),
+      ])];
       const mounted = renderTranslationSurfaces({
         // The initial preview also lives in lastPreviewVtt, so prefer the
         // failure snapshot supplied by the background job. Otherwise a run
@@ -1715,8 +1773,12 @@
       }
 
       const failedItems = Array.isArray(result.failed_items) ? result.failed_items : [];
-      const failedCount = Math.max(failedItems.length, Number(result.metrics?.failed) || 0);
-      const finalFailedCues = failedCuesFromItems(result.failed_items, vttText);
+      const failedCount = Math.max(
+        Number(result.metrics?.failed) || 0,
+        Number(result.metrics?.failedCues) || 0,
+        failedItems.length,
+      );
+      const finalFailedCues = collectFailedCues(result, vttText);
       const translationSummary = buildTranslationSummary(result, payload, vttText, panelSourceMeta, {
         cacheHit: result.cache_hit === true,
       });
@@ -1903,6 +1965,131 @@
     }
   }
 
+  async function getTrackSyncPrefs() {
+    if (trackSyncPrefs) return trackSyncPrefs;
+    const revision = trackSyncPrefsRevision;
+    const prefs = await ns.storage.getPrefs();
+    if (revision === trackSyncPrefsRevision) trackSyncPrefs = prefs;
+    return prefs;
+  }
+
+  function isSyncHidden() {
+    return document.visibilityState === "hidden" && !document.pictureInPictureElement;
+  }
+
+  function scheduleTrackSync(delayMs = TRACK_SYNC_INITIAL_DELAY_MS) {
+    if (!trackSyncInstalled || trackSyncSuspended || trackSyncRunning ||
+      trackSyncTimer != null || isSyncHidden()) return;
+    trackSyncTimerDueAt = Date.now() + delayMs;
+    trackSyncTimer = setTimeout(syncTrack, delayMs);
+  }
+
+  function requestTrackSync(delayMs = TRACK_SYNC_EVENT_DELAY_MS) {
+    trackSyncRequested = true;
+    if (!trackSyncInstalled || trackSyncSuspended || trackSyncRunning || isSyncHidden()) return;
+    const nextDueAt = Date.now() + delayMs;
+    // Coalesce bursts without turning the request into a trailing debounce:
+    // once a fast sync is due, later media/DOM events leave that deadline
+    // intact. A safety timer can still be pulled forward by the first event.
+    if (trackSyncTimer != null && trackSyncTimerDueAt <= nextDueAt) return;
+    if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
+    trackSyncTimerDueAt = nextDueAt;
+    trackSyncTimer = setTimeout(syncTrack, delayMs);
+  }
+
+  async function syncTrack() {
+    trackSyncTimer = null;
+    trackSyncTimerDueAt = 0;
+    if (!trackSyncInstalled || trackSyncSuspended || isSyncHidden()) return;
+    trackSyncRunning = true;
+    trackSyncRequested = false;
+    try {
+      const p = await getTrackSyncPrefs();
+      if (!trackSyncInstalled || trackSyncSuspended || isSyncHidden()) return;
+      maybePrimeManualSession(ns.video.getPrimaryVideo?.());
+      if (p.enabled === false) return;
+      ns.renderer.ensureTrackOnPrimaryVideo();
+      ns.renderer.applySubtitleVisibility(true);
+    } catch (error) {
+      console.error("[echo360-translator][controller] subtitle sync failed", safeErrorForLog(error, { phase: "render" }));
+      if (!trackSyncErrorShown) {
+        trackSyncErrorShown = true;
+        const typedError = withFallbackErrorCode(error, "RENDER_SYNC_ERROR", "render");
+        ns.ui.showError?.(typedError, {
+          phase: typedError.phase || "render",
+          onCancel: () => ns.ui.clearError?.(),
+        });
+      }
+    } finally {
+      trackSyncRunning = false;
+      // Slow storage or renderer work must never create overlapping jobs. A
+      // change observed while this run was active gets one quick follow-up;
+      // otherwise keep only the low-frequency safety reconciliation alive.
+      if (trackSyncRequested) scheduleTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
+      else scheduleTrackSync(TRACK_SYNC_SAFETY_INTERVAL_MS);
+    }
+  }
+
+  function onTrackSyncSignal() {
+    requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
+  }
+
+  function onSyncVisibilityChanged() {
+    if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
+    trackSyncTimer = null;
+    trackSyncTimerDueAt = 0;
+    if (!isSyncHidden() && !trackSyncSuspended) {
+      scheduleTrackSync(trackSyncRequested ? TRACK_SYNC_EVENT_DELAY_MS : TRACK_SYNC_INITIAL_DELAY_MS);
+    }
+  }
+
+  function suspendTrackSync() {
+    trackSyncSuspended = true;
+    onSyncVisibilityChanged();
+  }
+
+  function resumeTrackSync() {
+    trackSyncSuspended = false;
+    onSyncVisibilityChanged();
+  }
+
+  function installTrackSync() {
+    if (trackSyncInstalled) return;
+    trackSyncInstalled = true;
+    trackSyncSuspended = false;
+    document.addEventListener("visibilitychange", onSyncVisibilityChanged);
+    document.addEventListener("enterpictureinpicture", onSyncVisibilityChanged, true);
+    document.addEventListener("leavepictureinpicture", onSyncVisibilityChanged, true);
+    window.addEventListener("pagehide", suspendTrackSync);
+    window.addEventListener("pageshow", resumeTrackSync);
+    window.addEventListener("resize", onTrackSyncSignal);
+    trackSyncVideoUnsubscribe = ns.video.subscribeToChanges?.(onTrackSyncSignal) || null;
+    scheduleTrackSync(TRACK_SYNC_INITIAL_DELAY_MS);
+  }
+
+  function destroy() {
+    trackSyncInstalled = false;
+    if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
+    trackSyncTimer = null;
+    trackSyncTimerDueAt = 0;
+    trackSyncRequested = false;
+    document.removeEventListener("visibilitychange", onSyncVisibilityChanged);
+    document.removeEventListener("enterpictureinpicture", onSyncVisibilityChanged, true);
+    document.removeEventListener("leavepictureinpicture", onSyncVisibilityChanged, true);
+    trackSyncPrefs = null;
+    trackSyncPrefsRevision += 1;
+    window.removeEventListener("pagehide", suspendTrackSync);
+    window.removeEventListener("pageshow", resumeTrackSync);
+    window.removeEventListener("resize", onTrackSyncSignal);
+    trackSyncVideoUnsubscribe?.();
+    trackSyncVideoUnsubscribe = null;
+    ns.video.destroy?.();
+    if (configWatcher) extensionApi.storage?.onChanged?.removeListener?.(configWatcher);
+    configWatcher = null;
+    configWatcherInstalled = false;
+    invalidateManualSession();
+  }
+
   async function init() {
     const supportedPlayerDocument = ns.hostSupport?.isSupportedPlayerDocument?.() ||
       location.hostname.includes("echo360.");
@@ -1972,7 +2159,7 @@
       ns.renderer.setLastTranslatedTrack(existing[existing.length - 1]);
     }
 
-    const prefs = await ns.storage.getPrefs();
+    const prefs = await getTrackSyncPrefs();
     try {
       lastKnownConfig = await ns.storage.getConfig();
     } catch (error) {
@@ -1985,27 +2172,7 @@
     ns.transcriptPanelRenderer?.setVisible?.(prefs.transcriptPanelEnabled === true);
     ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
 
-    if (!trackSyncTimer) {
-      trackSyncTimer = setInterval(async () => {
-        try {
-          const p = await ns.storage.getPrefs();
-          maybePrimeManualSession(ns.video.getPrimaryVideo?.());
-          if (p.enabled === false) return;
-          ns.renderer.ensureTrackOnPrimaryVideo();
-          ns.renderer.applySubtitleVisibility(true);
-          } catch (error) {
-            console.error("[echo360-translator][controller] subtitle sync failed", safeErrorForLog(error, { phase: "render" }));
-            if (!trackSyncErrorShown) {
-              trackSyncErrorShown = true;
-              const typedError = withFallbackErrorCode(error, "RENDER_SYNC_ERROR", "render");
-              ns.ui.showError?.(typedError, {
-                phase: typedError.phase || "render",
-                onCancel: () => ns.ui.clearError?.(),
-            });
-          }
-        }
-      }, 1200);
-    }
+    installTrackSync();
 
     const firstRunKey = "echo360TranslatorFirstRunShown";
     const firstRun = await extensionApi.storage.local.get(firstRunKey);
@@ -2017,6 +2184,7 @@
 
   ns.controller = {
     init,
+    destroy,
     renderTranslationSurfaces,
   };
 })();

@@ -7,6 +7,12 @@
   const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig;
   const records = [];
   const CAPTURE_NETWORK_DETAILS = false;
+  const MAX_REACT_HINT_DEPTH = 4;
+  const MAX_REACT_HINT_KEYS = 48;
+  const MAX_REACT_HINT_OBJECTS = 240;
+  const MAX_REACT_HINTS = 120;
+  const REACT_HINT_CACHE_TTL_MS = 2000;
+  const reactHintCache = new WeakMap();
 
   const interestingUrl = (url) =>
     /echo360|captions|caption|subtitle|webvtt|m3u8|mpd|manifest|playlist|interactive-media|transcode|hls|dash|segment|chunk|media/i
@@ -17,8 +23,9 @@
     matches.forEach((id) => out.add(id.toLowerCase()));
   };
 
-  const collectObjectUuids = (value, out, depth = 0, seen = new WeakSet()) => {
-    if (out.size > 120 || depth > 5 || value == null) return;
+  const collectObjectUuids = (value, out, depth = 0, seen = new WeakSet(), budget = { objects: 0 }) => {
+    if (out.size >= MAX_REACT_HINTS || depth > MAX_REACT_HINT_DEPTH || value == null ||
+        budget.objects >= MAX_REACT_HINT_OBJECTS) return;
     if (typeof value === "string" || typeof value === "number") {
       addUuids(value, out);
       return;
@@ -26,10 +33,11 @@
     if (typeof value !== "object" && typeof value !== "function") return;
     if (seen.has(value)) return;
     seen.add(value);
+    budget.objects += 1;
 
     let keys = [];
     try {
-      keys = Reflect.ownKeys(value).slice(0, 120);
+      keys = Reflect.ownKeys(value).slice(0, MAX_REACT_HINT_KEYS);
     } catch (_) {
       return;
     }
@@ -41,18 +49,24 @@
       } catch (_) {
         continue;
       }
-      collectObjectUuids(next, out, depth + 1, seen);
+      collectObjectUuids(next, out, depth + 1, seen, budget);
     }
   };
 
-  const reactHints = (el) => {
+  const reactHints = (el, { fresh = false } = {}) => {
+    if (!el) return [];
+    const now = Date.now();
+    const cached = reactHintCache.get(el);
+    if (!fresh && cached && now - cached.at < REACT_HINT_CACHE_TTL_MS) return cached.ids.slice();
     const out = new Set();
+    const seen = new WeakSet();
+    const budget = { objects: 0 };
     let node = el;
     let depth = 0;
-    while (node && depth < 6) {
+    while (node && depth <= MAX_REACT_HINT_DEPTH && budget.objects < MAX_REACT_HINT_OBJECTS) {
       let keys = [];
       try {
-        keys = Reflect.ownKeys(node);
+        keys = Reflect.ownKeys(node).slice(0, MAX_REACT_HINT_KEYS);
       } catch (_) {
         keys = [];
       }
@@ -60,13 +74,15 @@
         const name = String(key);
         if (!/(react|fiber|props|state|echo|media|player)/i.test(name)) continue;
         try {
-          collectObjectUuids(node[key], out);
+          collectObjectUuids(node[key], out, 0, seen, budget);
         } catch (_) {}
       }
       node = node.parentElement;
       depth += 1;
     }
-    return [...out];
+    const ids = [...out];
+    reactHintCache.set(el, { at: now, ids });
+    return ids.slice();
   };
 
   const push = (record) => {
@@ -86,9 +102,13 @@
       return kind ? records.filter((r) => r.kind === kind) : records.slice();
     },
     resources() {
-      return performance.getEntriesByType("resource")
-        .map((e) => e.name)
-        .filter((name) => interestingUrl(name));
+      const names = new Set();
+      const entries = performance.getEntriesByType("resource") || [];
+      for (let index = Math.max(0, entries.length - 500); index < entries.length; index += 1) {
+        const name = entries[index]?.name;
+        if (interestingUrl(name)) names.add(name);
+      }
+      return [...names];
     },
     videos(options) {
       // reactHints() walks each ancestor's own keys and recursively descends
@@ -107,7 +127,7 @@
         addUuids(v.currentSrc, ids);
         addUuids(v.src, ids);
         [...v.attributes].forEach((a) => addUuids(a.value, ids));
-        if (deep) reactHints(v).forEach((id) => ids.add(id));
+        if (deep) reactHints(v, { fresh: true }).forEach((id) => ids.add(id));
         return {
           i,
           currentTime: Number(v.currentTime || 0).toFixed(2),
@@ -137,9 +157,22 @@
     const videos = window.__echo360Probe.videos();
     if (videos.length > 0) push({ kind: "video-snapshot", videos });
   };
-  window.__echo360Probe.snapshot = postVideoSnapshot;
-  setTimeout(postVideoSnapshot, 0);
-  setInterval(postVideoSnapshot, 1500);
+  let snapshotTimer = null;
+  const scheduleVideoSnapshot = () => {
+    if (snapshotTimer != null) return;
+    snapshotTimer = setTimeout(() => {
+      snapshotTimer = null;
+      postVideoSnapshot();
+    }, 0);
+  };
+  window.__echo360Probe.snapshot = () => {
+    if (snapshotTimer != null) {
+      clearTimeout(snapshotTimer);
+      snapshotTimer = null;
+    }
+    postVideoSnapshot();
+  };
+  scheduleVideoSnapshot();
 
   const originalFetch = window.fetch;
   if (CAPTURE_NETWORK_DETAILS && originalFetch && !originalFetch.__echo360ProbePatched) {
@@ -228,7 +261,11 @@
       const ids = new Set();
       addUuids(target.currentSrc, ids);
       addUuids(target.src, ids);
-      reactHints(target).forEach((id) => ids.add(id));
+      // URL/attribute hints cover the common path. Walk React internals only
+      // when that cheap path produced no ID, and cache the bounded result so
+      // repeated media lifecycle events do not repeatedly traverse the same
+      // component tree.
+      if (ids.size === 0) reactHints(target).forEach((id) => ids.add(id));
       push({
         kind: "media-event",
         event: eventName,
@@ -239,6 +276,7 @@
         src: target.src || "",
         uuidHints: [...ids],
       });
+      scheduleVideoSnapshot();
     }, true);
   }
 })();
@@ -692,6 +730,35 @@
     if (!state) return;
     if (statesByToken.get(state.panelToken) === state) statesByToken.delete(state.panelToken);
     stateByList.delete(state.list);
+    if (statesByToken.size === 0 && lifecycleObserver) {
+      lifecycleObserver.disconnect();
+      lifecycleObserver = null;
+    }
+  }
+
+  function ensureLifecycleObserver() {
+    if (lifecycleObserver || typeof MutationObserver === "undefined") return;
+    lifecycleObserver = new MutationObserver((records) => {
+      // The bridge only needs removal notifications. Watching every child
+      // addition is unnecessary work on React pages that continuously append
+      // transcript rows and controls.
+      const removals = records.filter((record) => record.type === "childList" && record.removedNodes?.length > 0);
+      if (removals.length === 0) return;
+      for (const [token, state] of statesByToken.entries()) {
+        const removedPanel = removals.some((record) => [...record.removedNodes].some((node) =>
+          node === state.panelRoot || node?.contains?.(state.panelRoot)
+        ));
+        if (!removedPanel || state.panelRoot?.isConnected) continue;
+        restoreState(state, false);
+        statesByToken.delete(token);
+        stateByList.delete(state.list);
+      }
+      if (statesByToken.size === 0) {
+        lifecycleObserver.disconnect();
+        lifecycleObserver = null;
+      }
+    });
+    lifecycleObserver.observe(document.documentElement || document, { childList: true, subtree: true });
   }
 
   function releaseState(state) {
@@ -778,6 +845,7 @@
     }
     statesByToken.set(data.panelToken, state);
     stateByList.set(verified.list, state);
+    ensureLifecycleObserver();
     return state;
   }
 
@@ -955,8 +1023,7 @@
     if (data.revision < state.revision) return null;
     if (!restoreState(state, true)) return null;
     state.revision = data.revision;
-    statesByToken.delete(data.panelToken);
-    stateByList.delete(state.list);
+    forgetState(state);
     return response(data, true, {
       capability: CAPABILITY,
       appliedRevision: data.revision,
@@ -994,17 +1061,6 @@
 
   const listener = (event) => { handleMessage(event); };
   window.addEventListener("message", listener, false);
-  if (typeof MutationObserver !== "undefined") {
-    lifecycleObserver = new MutationObserver(() => {
-      for (const [token, state] of statesByToken.entries()) {
-        if (state.panelRoot?.isConnected) continue;
-        restoreState(state, false);
-        statesByToken.delete(token);
-        stateByList.delete(state.list);
-      }
-    });
-    lifecycleObserver.observe(document.documentElement || document, { childList: true, subtree: true });
-  }
   window.__echo360TranscriptPageBridge = {
     installed: true,
     source: RESPONSE_SOURCE,
@@ -1017,8 +1073,7 @@
     restoreAll() {
       for (const [token, state] of statesByToken.entries()) {
         if (restoreState(state, true)) {
-          statesByToken.delete(token);
-          stateByList.delete(state.list);
+          forgetState(state);
         }
       }
     },

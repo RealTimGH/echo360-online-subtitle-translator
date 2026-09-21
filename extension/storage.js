@@ -31,6 +31,12 @@
   // one lesson had no effect on the next lesson opened, since each lesson's
   // unique URL produced its own separate storage entry.
   const GLOBAL_PREFS_KEY = `${PREFS_KEY_PREFIX}global`;
+  // A fresh install has no legacy per-lesson keys, so repeatedly scanning the
+  // complete storage area on every getPrefs() call is unnecessary. Persist a
+  // small completion marker after the first successful scan. The in-flight
+  // promise also coalesces concurrent callers before that marker is visible.
+  const PREFS_MIGRATION_KEY = `${PREFS_KEY_PREFIX}legacy-migration-v1`;
+  let legacyPrefsMigrationPromise = null;
 
   function isLocalBackendEnabled() {
     return ns.buildConfig?.enableLocalBackend !== false;
@@ -48,14 +54,35 @@
   // first as the new global default, so a choice the user already made isn't
   // silently discarded the first time getPrefs() runs under the new scheme.
   async function migrateLegacyPerLessonPrefs() {
-    const all = await extensionApi.storage.local.get(null);
-    for (const [key, value] of Object.entries(all || {})) {
-      if (key === GLOBAL_PREFS_KEY || !key.startsWith(PREFS_KEY_PREFIX)) continue;
-      if (!value || typeof value !== "object") continue;
-      await extensionApi.storage.local.set({ [GLOBAL_PREFS_KEY]: value });
-      return value;
+    if (legacyPrefsMigrationPromise) return legacyPrefsMigrationPromise;
+    const migration = (async () => {
+      const marker = await extensionApi.storage.local.get(PREFS_MIGRATION_KEY);
+      if (marker?.[PREFS_MIGRATION_KEY] === true) return null;
+
+      const all = await extensionApi.storage.local.get(null);
+      for (const [key, value] of Object.entries(all || {})) {
+        if (key === GLOBAL_PREFS_KEY || key === PREFS_MIGRATION_KEY || !key.startsWith(PREFS_KEY_PREFIX)) continue;
+        if (!value || typeof value !== "object") continue;
+        await extensionApi.storage.local.set({
+          [GLOBAL_PREFS_KEY]: value,
+          [PREFS_MIGRATION_KEY]: true,
+        });
+        return value;
+      }
+
+      // Mark an empty scan only after it completes successfully. If storage
+      // rejects, the next call retries instead of permanently skipping a
+      // migration that may not have completed.
+      await extensionApi.storage.local.set({ [PREFS_MIGRATION_KEY]: true });
+      return null;
+    })();
+    legacyPrefsMigrationPromise = migration;
+    try {
+      return await migration;
+    } catch (err) {
+      if (legacyPrefsMigrationPromise === migration) legacyPrefsMigrationPromise = null;
+      throw err;
     }
-    return null;
   }
 
   async function getPrefs() {
@@ -128,6 +155,11 @@
       bilingual: useNativeSubtitles ? browserBilingual : true,
       reverseOrder: useNativeSubtitles ? browserReverseOrder : false,
     };
+    // storage.local.set is asynchronous and relatively expensive. Controller
+    // updates can call savePrefs repeatedly with the same normalized object;
+    // avoid rewriting identical bytes while retaining the existing read-back
+    // semantics for legacy fields.
+    if (JSON.stringify(existing) === JSON.stringify(normalizedPrefs)) return;
     await extensionApi.storage.local.set({ [key]: normalizedPrefs });
   }
 

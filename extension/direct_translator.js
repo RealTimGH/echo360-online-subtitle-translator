@@ -37,6 +37,8 @@ globalThis.Echo360DirectTranslator = (() => {
   const GOOGLE_WEB_RECOVERY_RPS = 1;
   const GOOGLE_WEB_429_CIRCUIT_THRESHOLD = 5;
   const GOOGLE_WEB_429_CIRCUIT_WINDOW_MS = 10000;
+  const MAX_FAILURE_DETAILS = 50;
+  const MAX_TRANSLATION_WARNINGS = 30;
   // The current Azure service limits are higher, but the v3 REST reference
   // retains a conservative 25-item/5000-character contract. Enforce the
   // smaller documented boundary so custom dev settings cannot create a
@@ -523,8 +525,27 @@ globalThis.Echo360DirectTranslator = (() => {
     );
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  function translationDeadlineError() {
+    return makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
+  }
+
+  function hasDeadline(value) {
+    return value != null && Number.isFinite(Number(value));
+  }
+
+  function assertDeadline(deadlineAt) {
+    if (hasDeadline(deadlineAt) && Date.now() >= Number(deadlineAt)) {
+      throw translationDeadlineError();
+    }
+  }
+
+  function sleep(ms, deadlineAt = null) {
+    const requestedMs = Math.max(0, Number(ms) || 0);
+    const remaining = hasDeadline(deadlineAt)
+      ? Math.max(0, Number(deadlineAt) - Date.now())
+      : requestedMs;
+    if (hasDeadline(deadlineAt) && remaining <= 0) return Promise.reject(translationDeadlineError());
+    return new Promise((resolve) => setTimeout(resolve, Math.min(requestedMs, remaining)));
   }
 
   function directLog(level, event, details = {}) {
@@ -584,6 +605,14 @@ globalThis.Echo360DirectTranslator = (() => {
       counts[code] = (counts[code] || 0) + 1;
       return counts;
     }, {});
+  }
+
+  function appendBoundedWarning(warnings, message) {
+    if (!Array.isArray(warnings)) return;
+    if (warnings.length < MAX_TRANSLATION_WARNINGS) warnings.push(String(message).slice(0, 320));
+    else if (warnings.length === MAX_TRANSLATION_WARNINGS) {
+      warnings.push("Additional translation warnings were omitted; see console metrics.");
+    }
   }
 
   function mergeFailureCodeCounts(...maps) {
@@ -709,7 +738,7 @@ globalThis.Echo360DirectTranslator = (() => {
     return Math.min(GOOGLE_WEB_RETRY_MAX_MS, base * (2 ** attempt) + jitter);
   }
 
-  function createRateLimiter(rps, { onQueueWait } = {}) {
+  function createRateLimiter(rps, { onQueueWait, deadlineAt } = {}) {
     const rate = Number(rps) || 0;
     if (rate <= 0) {
       const unlimited = async () => ({ queueWaitMs: 0 });
@@ -725,10 +754,12 @@ globalThis.Echo360DirectTranslator = (() => {
     const waitForRequest = () => {
       const queuedAt = performance.now();
       const run = chain.then(async () => {
+        assertDeadline(deadlineAt);
         const now = Date.now();
         const waitMs = Math.max(0, nextAt - now, cooldownUntil - now);
         nextAt = Math.max(now, nextAt, cooldownUntil) + gapMs;
-        if (waitMs > 0) await sleep(waitMs);
+        if (waitMs > 0) await sleep(waitMs, deadlineAt);
+        assertDeadline(deadlineAt);
         const queueWaitMs = Math.round(performance.now() - queuedAt);
         if (queueWaitMs >= 5000) onQueueWait?.({ queueWaitMs, rps: rate });
         return { queueWaitMs };
@@ -768,7 +799,7 @@ globalThis.Echo360DirectTranslator = (() => {
     observer?.({ phase: "request-start", queueWaitMs });
     const controller = new AbortController();
     const perRequestTimeoutMs = Math.max(1, Number(timeoutSeconds) || 30) * 1000;
-    const remainingTaskMs = Number.isFinite(Number(deadlineAt))
+    const remainingTaskMs = hasDeadline(deadlineAt)
       ? Math.max(0, Number(deadlineAt) - Date.now())
       : perRequestTimeoutMs;
     if (remainingTaskMs <= 0) {
@@ -1051,6 +1082,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 error,
               });
             },
+            deadlineAt: cfg.deadlineAt,
           }
         );
         const translated = extractGoogleWebText(data);
@@ -1131,7 +1163,7 @@ globalThis.Echo360DirectTranslator = (() => {
       return await withRetries(
         () => translateBatchChecked(texts, cfg, { ...options, jsonFallback: true, batchLabel: label }),
         retries,
-        { onRetry: options.onRetry }
+        { onRetry: options.onRetry, deadlineAt: cfg.deadlineAt }
       );
     } catch (err) {
       const message = err?.message || String(err);
@@ -1144,11 +1176,11 @@ globalThis.Echo360DirectTranslator = (() => {
         const mid = Math.floor(texts.length / 2);
         const left = await translateBatchRecursive(texts.slice(0, mid), cfg, retries, warnings, `${label} left`, options, itemOffset);
         const right = await translateBatchRecursive(texts.slice(mid), cfg, retries, warnings, `${label} right`, options, itemOffset + mid);
-        warnings.push(`${label} split fallback: ${message}`);
+        appendBoundedWarning(warnings, `${label} split fallback: ${message}`);
         return [...left, ...right];
       }
       if (supportsRecursiveFallback(cfg.provider) && texts.length === 1) {
-        warnings.push(`${label} single item failed, kept original: ${message}`);
+        appendBoundedWarning(warnings, `${label} single item failed, kept original: ${message}`);
         // Returning the original line is a partial failure, not a successful
         // translation. Report its position so the caller can mark the cue,
         // avoid caching it, and show the actual reason in the UI.
@@ -1163,6 +1195,7 @@ globalThis.Echo360DirectTranslator = (() => {
     const maxRetries = Math.max(0, Number(retries) || 0);
     let lastErr;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      assertDeadline(options.deadlineAt);
       try {
         return await fn(attempt);
       } catch (err) {
@@ -1183,7 +1216,7 @@ globalThis.Echo360DirectTranslator = (() => {
           status: getErrorStatus(err),
           error: err,
         });
-        await sleep(delayMs);
+        await sleep(delayMs, options.deadlineAt);
       }
     }
     throw lastErr;
@@ -1200,7 +1233,7 @@ globalThis.Echo360DirectTranslator = (() => {
     const onPartialVtt = handlers.onPartialVtt || (() => {});
     const partialEmitIntervalMs = Math.max(0, Number(handlers.partialEmitIntervalMs) || 400);
     let lastPartialEmitAt = 0;
-    const deadlineAt = Number.isFinite(Number(handlers.deadlineAt))
+    const deadlineAt = hasDeadline(handlers.deadlineAt)
       ? Number(handlers.deadlineAt)
       : Date.now() + 8 * 60 * 1000;
 
@@ -1214,8 +1247,9 @@ globalThis.Echo360DirectTranslator = (() => {
         total: items.length,
         done: !!force,
         translated: translatedCount,
-        failed: failedItems.length,
-        failed_items: failedItems.slice(0, 50),
+        failed: failedItemCount,
+        failed_items: failedItems.slice(0, MAX_FAILURE_DETAILS),
+        failed_cues: Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1),
         metrics: progressDetails(),
       });
     }
@@ -1278,7 +1312,7 @@ globalThis.Echo360DirectTranslator = (() => {
       concurrency: effectiveConcurrency,
       rps: effectiveRps,
       retries: effectiveRetries,
-      waitForRequest: createRateLimiter(effectiveRps),
+      waitForRequest: createRateLimiter(effectiveRps, { deadlineAt }),
       googleRateLimitCircuit: isGoogleWeb ? createGoogleRateLimitCircuit() : null,
       deadlineAt,
     };
@@ -1335,7 +1369,10 @@ globalThis.Echo360DirectTranslator = (() => {
     const translatedLines = [...lines];
     const warnings = [];
     const failedItems = [];
-    const failedItemKeys = new Set();
+    let failedItemCount = 0;
+    const failureCodeCounts = {};
+    const itemFailureIndexes = new WeakMap(items.map((item, index) => [item, index]));
+    const failureFlags = new Uint8Array(items.length);
     const observedFailureCodes = {};
     const deferredFailures = [];
     const processedCueIndexes = new Set();
@@ -1378,8 +1415,7 @@ globalThis.Echo360DirectTranslator = (() => {
     };
 
     function addWarning(message) {
-      if (warnings.length < 30) warnings.push(String(message).slice(0, 320));
-      else if (warnings.length === 30) warnings.push("Additional translation warnings were omitted; see console metrics.");
+      appendBoundedWarning(warnings, message);
     }
 
     function progressDetails() {
@@ -1394,13 +1430,13 @@ globalThis.Echo360DirectTranslator = (() => {
         ...circuit,
         processed: completed,
         translated: translatedCount,
-        failed: failedItems.length,
+        failed: failedItemCount,
         processedCues: Math.min(translatableCueCount, processedCueCount),
         translatedCues: Math.min(translatableCueCount, Math.max(0, translatedCueCount)),
         failedCues: failedCueCount,
         observedFailureCodes: { ...observedFailureCodes },
         observed_failure_codes: { ...observedFailureCodes },
-        failureCodes: summarizeFailureCodes(failedItems),
+        failureCodes: { ...failureCodeCounts },
         elapsedMs: Math.round(performance.now() - startedAt),
       };
     }
@@ -1412,19 +1448,29 @@ globalThis.Echo360DirectTranslator = (() => {
     }
 
     function recordFailure(batchNo, item, itemIndex, error) {
-      const key = `${batchNo}:${itemIndex}`;
-      if (failedItemKeys.has(key)) return;
-      failedItemKeys.add(key);
+      const itemPosition = itemFailureIndexes.get(item);
+      if (itemPosition != null) {
+        if (failureFlags[itemPosition]) return;
+        failureFlags[itemPosition] = 1;
+      }
       const summary = summarizeError(error);
       observeFailureCode(summary.code);
+      failedItemCount += 1;
+      const failureCode = summary.code && !ns.errorUtils?.isGenericCode?.(summary.code) &&
+        !["ERROR", "UNKNOWN", "UNKNOWN_ERROR", "TRANSLATION_ERROR"].includes(summary.code)
+        ? summary.code
+        : "FAILURE_DETAIL_MISSING";
+      failureCodeCounts[failureCode] = (failureCodeCounts[failureCode] || 0) + 1;
       if (Number.isInteger(item?.cueIndex) && item.cueIndex >= 0) failedCueIndexes.add(item.cueIndex);
-      failedItems.push({
-        batch: batchNo + 1,
-        item: itemIndex + 1,
-        cue: Number.isInteger(item?.cueIndex) && item.cueIndex >= 0 ? item.cueIndex + 1 : null,
-        line: Number.isInteger(item?.index) ? item.index + 1 : null,
-        ...summary,
-      });
+      if (failedItems.length < MAX_FAILURE_DETAILS) {
+        failedItems.push({
+          batch: batchNo + 1,
+          item: itemIndex + 1,
+          cue: Number.isInteger(item?.cueIndex) && item.cueIndex >= 0 ? item.cueIndex + 1 : null,
+          line: Number.isInteger(item?.index) ? item.index + 1 : null,
+          ...summary,
+        });
+      }
       addWarning(`batch ${batchNo + 1}/${batches.length}, item ${itemIndex + 1} failed: ${summary.message}`);
     }
 
@@ -1432,8 +1478,8 @@ globalThis.Echo360DirectTranslator = (() => {
       const targetError = error instanceof Error ? error : new Error(String(error || "翻译失败"));
       targetError.code = getErrorCode(targetError);
       targetError.metrics = { ...progressDetails() };
-      targetError.failed_items = failedItems.slice(0, 50);
-      targetError.failure_codes = summarizeFailureCodes(failedItems);
+      targetError.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
+      targetError.failure_codes = { ...failureCodeCounts };
       targetError.warnings = warnings.slice(0, 30);
       targetError.provider = provider;
       targetError.target = String(payload.target || "ZH").toUpperCase();
@@ -1664,14 +1710,14 @@ globalThis.Echo360DirectTranslator = (() => {
       translatedCount += acceptedCount;
       metrics.processed = completed;
       metrics.translated = translatedCount;
-      metrics.failed = failedItems.length;
+      metrics.failed = failedItemCount;
       directLog("info", "batch completed", {
         batch: batchNo + 1,
         batches: batches.length,
         processed: completed,
         total: items.length,
         translated: translatedCount,
-        failed: failedItems.length,
+        failed: failedItemCount,
       });
       reportProgress();
       emitPartialVtt(false);
@@ -1688,7 +1734,7 @@ globalThis.Echo360DirectTranslator = (() => {
       completed += batch.length;
       metrics.processed = completed;
       metrics.translated = translatedCount;
-      metrics.failed = failedItems.length;
+      metrics.failed = failedItemCount;
       directLog("warn", "batch kept original after failure", {
         batch: batchNo + 1,
         batches: batches.length,
@@ -1736,7 +1782,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 onItemFailure: (failure) => batchFailures.push(failure),
               }),
               retries,
-              { onRetry: (info) => onRetry(info, label) }
+              { onRetry: (info) => onRetry(info, label), deadlineAt }
             );
             applyBatchResult(batch, translated, batchFailures, batchNo);
           }
@@ -1804,7 +1850,7 @@ globalThis.Echo360DirectTranslator = (() => {
                   onItemFailure: (failure) => batchFailures.push(failure),
                 }),
                 retries,
-                { onRetry: (info) => onRetry(info, label) }
+                { onRetry: (info) => onRetry(info, label), deadlineAt }
               );
             } else {
               translated = await translateBatchRecursive(
@@ -1842,13 +1888,13 @@ globalThis.Echo360DirectTranslator = (() => {
     const target = String(payload.target || "ZH").toUpperCase();
     metrics.processed = completed;
     metrics.translated = translatedCount;
-    metrics.failed = failedItems.length;
+    metrics.failed = failedItemCount;
     metrics.elapsedMs = Math.round(performance.now() - startedAt);
     Object.assign(metrics, cfg.googleRateLimitCircuit?.snapshot?.() || {});
     const targetRequiresCjk = CJK_TARGET_CODES.has(target);
-    const allItemsFailed = failedItems.length >= items.length;
+    const allItemsFailed = failedItemCount >= items.length;
     if (allItemsFailed || (targetRequiresCjk && metrics.targetResults === 0)) {
-      const failureCodes = summarizeFailureCodes(failedItems);
+      const failureCodes = { ...failureCodeCounts };
       const noTargetTranslations = isGoogleWeb && metrics.targetResults === 0;
       const firstAttemptVtt = translatedVtt;
 
@@ -1870,7 +1916,7 @@ globalThis.Echo360DirectTranslator = (() => {
           initial: {
             effectiveConcurrency: workers,
             effectiveRps,
-            failed: failedItems.length,
+            failed: failedItemCount,
             providerResults: metrics.providerResults,
             targetResults: metrics.targetResults,
             unchangedResults: metrics.unchangedResults,
@@ -1930,7 +1976,7 @@ globalThis.Echo360DirectTranslator = (() => {
               initialProfile: {
                 effectiveConcurrency: workers,
                 effectiveRps,
-                failed: failedItems.length,
+                failed: failedItemCount,
                 providerResults: metrics.providerResults,
                 targetResults: metrics.targetResults,
                 unchangedResults: metrics.unchangedResults,
@@ -1961,7 +2007,7 @@ globalThis.Echo360DirectTranslator = (() => {
             initialProfile: {
               effectiveConcurrency: workers,
               effectiveRps,
-              failed: failedItems.length,
+              failed: failedItemCount,
               providerResults: metrics.providerResults,
               targetResults: metrics.targetResults,
               unchangedResults: metrics.unchangedResults,
@@ -1983,7 +2029,7 @@ globalThis.Echo360DirectTranslator = (() => {
       const hasTargetLanguageFailures = Number(failureCodes.NO_TARGET_TRANSLATION || 0) > 0;
       const invalidResponseCount = ["INVALID_PROVIDER_RESPONSE", "INVALID_PROVIDER_OUTPUT"]
         .reduce((sum, code) => sum + Number(failureCodes[code] || 0), 0);
-      const allResponsesInvalid = allItemsFailed && invalidResponseCount === failedItems.length && invalidResponseCount > 0;
+      const allResponsesInvalid = allItemsFailed && invalidResponseCount === failedItemCount && invalidResponseCount > 0;
       const code = allItemsFailed
         ? (isGoogleWeb
           ? (allResponsesInvalid
@@ -1992,21 +2038,19 @@ globalThis.Echo360DirectTranslator = (() => {
           : "NO_TRANSLATIONS")
         : (isGoogleWeb ? "GOOGLE_WEB_NO_TARGET_TRANSLATIONS" : "NO_TRANSLATIONS");
       const message = code === "GOOGLE_WEB_NO_TARGET_TRANSLATIONS"
-        ? `Google Web 返回了响应，但未获得可识别的中文结果；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItems.length}, failureCodes=${JSON.stringify(failureCodes)}`
+        ? `Google Web 返回了响应，但未获得可识别的中文结果；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}, failureCodes=${JSON.stringify(failureCodes)}`
         : allItemsFailed
           ? isGoogleWeb
             ? `Google Web 全部 ${items.length} 条请求失败，未获得中文结果；failureCodes=${JSON.stringify(failureCodes)}`
             : `Provider 全部 ${items.length} 条字幕请求失败，未获得可用译文；failureCodes=${JSON.stringify(failureCodes)}`
           : isGoogleWeb
-            ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItems.length}`
+            ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}`
             : "Provider did not return Chinese subtitles";
       const error = new Error(message);
       error.code = code;
       error.metrics = { ...metrics };
-      error.failed_items = failedItems.slice(0, 30);
-      error.failed_cues = Array.from(new Set(
-        failedItems.map((item) => Number(item?.cue)).filter((cue) => Number.isInteger(cue) && cue > 0)
-      ));
+      error.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
+      error.failed_cues = Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1);
       error.failure_codes = failureCodes;
       error.warnings = warnings.slice(0, 30);
       error.provider = provider;
@@ -2022,11 +2066,8 @@ globalThis.Echo360DirectTranslator = (() => {
       emitPartialVtt(true);
       throw error;
     }
-    const finalFailureCodes = summarizeFailureCodes(failedItems);
-    const finalFailedCueSet = new Set(failedItems
-      .map((item) => Number(item?.cue))
-      .filter((cue) => Number.isInteger(cue) && cue > 0)
-    );
+    const finalFailureCodes = { ...failureCodeCounts };
+    const finalFailedCueSet = new Set(Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1));
     // Keep the complete aggregate failure map alongside the capped
     // failed_items sample. Without this, a legitimate partial result with
     // more than 50 failed cues is rejected at the client boundary because
@@ -2061,22 +2102,20 @@ globalThis.Echo360DirectTranslator = (() => {
       // Failure details are a diagnostic sample, not an unbounded transport
       // payload. Metrics/failureCodes retain the complete counts; the UI and
       // validators only promise the first 50 item-level details.
-      failed_items: failedItems.slice(0, 50),
+      failed_items: failedItems.slice(0, MAX_FAILURE_DETAILS),
       // Mixed routing retries whole cues. Keep the complete unique cue list
       // separately from the bounded diagnostic sample so a multi-line cue (or
       // more than 50 failed lines) can still be reassigned without ambiguity.
-      failed_cues: Array.from(new Set(
-        failedItems.map((item) => Number(item?.cue)).filter((cue) => Number.isInteger(cue) && cue > 0)
-      )),
+      failed_cues: Array.from(finalFailedCueSet),
       failure_codes: finalFailureCodes,
       failureCodes: finalFailureCodes,
       metrics: { ...metrics },
       cache_hit: false,
     };
-    if (failedItems.length > 0) {
+    if (failedItemCount > 0) {
       directLog("warn", "translation completed with item failures", {
         ...metrics,
-        failedItems: failedItems.length,
+        failedItems: failedItemCount,
         warnings: warnings.length,
       });
     } else {

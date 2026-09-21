@@ -7,6 +7,7 @@
   const SIZE_MAP = { small: 0.88, medium: 1, large: 1.14 };
   const CAPTION_GAP_PX = 6;
   const LAYOUT_REFRESH_MS = 900;
+  const LAYOUT_REFRESH_INTERVAL_MS = 100;
   // Echo360 inserts/removes the native cue node asynchronously after the
   // media cue has become active.  Do not expose a temporary fallback position
   // during that short interval: it is the source of the visible "jump" before
@@ -152,6 +153,15 @@
   // to the player; walking the whole document on every cue would be needlessly
   // expensive on Canvas pages containing several embeds.
   function queryElementsDeep(root, selector) {
+    const cacheable = state?.player === root;
+    if (cacheable) {
+      if (state.deepQueryCacheDirty) {
+        state.deepQueryCache.clear();
+        state.deepQueryCacheDirty = false;
+      }
+      const cached = state.deepQueryCache.get(selector);
+      if (cached) return cached;
+    }
     const result = [];
     const seen = new Set();
     const visit = (container) => {
@@ -168,6 +178,7 @@
       }
     };
     visit(root);
+    if (cacheable) state.deepQueryCache.set(selector, result);
     return result;
   }
 
@@ -251,13 +262,69 @@
     return [...candidates.values()].sort((left, right) => right.score - left.score)[0]?.rect || null;
   }
 
+  function cachedNativeCaptionMatches(element, cue) {
+    if (!element?.isConnected || element === state.overlay ||
+      element.closest?.(`[${OVERLAY_ATTR}="1"], #echo360-ui-root`)) return false;
+    const tag = String(element.tagName || "").toLowerCase();
+    if (["button", "input", "select", "textarea", "svg"].includes(tag)) return false;
+    const text = String(element.textContent || "").trim();
+    if (!text || text.length > 500 || matchScore(text, cue?.original || "") <= 0) return false;
+    const classText = `${element.id || ""} ${String(element.className || "")} `
+      + `${element.getAttribute?.("part") || ""} ${element.getAttribute?.("data-part") || ""}`;
+    if (/(?:control|timeline|volume|settings|bookmark|transcript|fullscreen)/i.test(classText)) return false;
+    const rect = element.getBoundingClientRect?.();
+    const playerRect = state.player.getBoundingClientRect?.();
+    if (!rect || !playerRect || rect.width < 80 || rect.height < 8 ||
+      rect.top < playerRect.top - 8 || rect.bottom > playerRect.bottom + 8 ||
+      rect.right < playerRect.left || rect.left > playerRect.right) return false;
+    return isVisible(element);
+  }
+
+  function mutationMayAffectNativeCaption(record, cue) {
+    const anchor = state.nativeCaption;
+    const target = record.target?.nodeType === Node.TEXT_NODE
+      ? record.target.parentElement
+      : record.target;
+    if (anchor && (target === anchor || anchor.contains?.(target))) return true;
+    const nodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+    return nodes.some((node) => {
+      if (node === anchor || node.contains?.(anchor) || anchor?.contains?.(node)) return true;
+      const text = node.nodeType === Node.TEXT_NODE ? node.textContent : node.textContent;
+      return matchScore(text || "", cue?.original || "") > 0;
+    }) || (!anchor && matchScore(target?.textContent || "", cue?.original || "") > 0);
+  }
+
   function findNativeCaption(cue, captionState) {
     if (!state?.player) return null;
     // When Echo's CC control is explicitly off there should be no attempt to
     // infer a native caption from arbitrary English text elsewhere in the
     // player.  This also clears the old-position path when the user turns CC
     // off between cues.
-    if (captionState === false) return null;
+    const cueIndex = state.currentCueIndex;
+    const sameCacheKey = state.nativeCaptionCueIndex === cueIndex &&
+      Object.is(state.nativeCaptionToggleState, captionState);
+    if (captionState === false) {
+      state.nativeCaptionCueIndex = cueIndex;
+      state.nativeCaptionToggleState = captionState;
+      state.nativeCaption = null;
+      state.nativeCaptionScanComplete = true;
+      state.nativeCaptionDirty = false;
+      return null;
+    }
+    if (sameCacheKey && !state.nativeCaptionDirty) {
+      // Once a cue has been scanned, keep the stable native anchor (or the
+      // negative result) for subsequent video frames.  DOM mutations that can
+      // introduce/replace a caption explicitly mark the cache dirty below;
+      // geometry-only changes continue through this one-node validation path.
+      if (state.nativeCaptionScanComplete) {
+        return state.nativeCaption && cachedNativeCaptionMatches(state.nativeCaption, cue)
+          ? state.nativeCaption
+          : null;
+      }
+    }
+    state.nativeCaptionCueIndex = cueIndex;
+    state.nativeCaptionToggleState = captionState;
+    state.nativeCaptionDirty = false;
     const player = state.player;
     const playerRect = player.getBoundingClientRect();
     const videoRect = state.video?.getBoundingClientRect?.();
@@ -311,7 +378,9 @@
       }
       return right.rect.bottom - left.rect.bottom;
     });
-    return candidates[0]?.element || null;
+    state.nativeCaption = candidates[0]?.element || null;
+    state.nativeCaptionScanComplete = true;
+    return state.nativeCaption;
   }
 
   function ensurePositionedPlayer() {
@@ -347,14 +416,17 @@
       overlay.setAttribute(OVERLAY_ATTR, "1");
       state.player.appendChild(overlay);
     }
-    overlay.style.inset = "0";
-    overlay.style.width = "100%";
-    overlay.style.height = "100%";
-    overlay.style.overflow = "visible";
-    overlay.style.pointerEvents = "none";
-    overlay.style.zIndex = "2147483000";
-    overlay.style.fontFamily = "inherit";
-    overlay.style.textAlign = "center";
+    if (state.overlay !== overlay || !state.overlayConfigured) {
+      overlay.style.inset = "0";
+      overlay.style.width = "100%";
+      overlay.style.height = "100%";
+      overlay.style.overflow = "visible";
+      overlay.style.pointerEvents = "none";
+      overlay.style.zIndex = "2147483000";
+      overlay.style.fontFamily = "inherit";
+      overlay.style.textAlign = "center";
+      state.overlayConfigured = true;
+    }
     state.overlay = overlay;
     return overlay;
   }
@@ -402,21 +474,61 @@
     return line;
   }
 
-  function ensureStack(overlay, lines) {
-    const stack = document.createElement("div");
-    stack.setAttribute(STACK_ATTR, "1");
-    stack.style.position = "absolute";
-    stack.style.display = "flex";
-    stack.style.flexDirection = "column";
-    stack.style.alignItems = "center";
-    stack.style.gap = `${CAPTION_GAP_PX}px`;
-    stack.style.margin = "0";
-    stack.style.padding = "0";
-    stack.style.boxSizing = "border-box";
-    stack.style.pointerEvents = "none";
-    stack.append(...lines);
-    overlay.replaceChildren(stack);
+  function ensureStack(overlay, specs) {
+    const signature = specs.map((spec) => `${spec.kind}\u0000${spec.text || ""}`).join("\u0001");
+    let stack = state.stack?.isConnected && state.stack.parentElement === overlay
+      ? state.stack
+      : overlay.querySelector(`:scope > [${STACK_ATTR}="1"]`);
+    const cachedLines = stack === state.stack && Array.isArray(state.stackLines) &&
+      state.stackLines.length === specs.length && state.stackLines.every((line) => line.parentElement === stack)
+      ? state.stackLines
+      : null;
+    const existingLines = cachedLines || (stack
+      ? Array.from(stack.querySelectorAll(`:scope > [${LINE_ATTR}]`))
+      : []);
+    let nextLines = existingLines;
+    const reusable = !!stack && existingLines.length === specs.length && specs.every((spec, index) =>
+      existingLines[index].getAttribute(LINE_ATTR) === spec.kind &&
+      existingLines[index].textContent === (spec.text || ""));
+    if (!reusable) {
+      stack = document.createElement("div");
+      stack.setAttribute(STACK_ATTR, "1");
+      stack.style.position = "absolute";
+      stack.style.display = "flex";
+      stack.style.flexDirection = "column";
+      stack.style.alignItems = "center";
+      stack.style.gap = `${CAPTION_GAP_PX}px`;
+      stack.style.margin = "0";
+      stack.style.padding = "0";
+      stack.style.boxSizing = "border-box";
+      stack.style.pointerEvents = "none";
+      const lines = specs.map((spec) => createLine(spec.kind, spec.text, spec.nativeCaption));
+      stack.append(...lines);
+      overlay.replaceChildren(stack);
+      nextLines = lines;
+    } else if (state.lastStackStyleSize !== state.size || state.lastStackNativeCaption !== specs[0]?.nativeCaption) {
+      existingLines.forEach((line, index) => copyNativeStyle(line, specs[index].nativeCaption));
+      existingLines.forEach((line, index) => {
+        if (specs[index].kind === "original") line.style.opacity = "0.88";
+      });
+    }
+    state.stack = stack;
+    state.stackLines = nextLines;
+    state.lastStackSignature = signature;
+    state.lastStackStyleSize = state.size;
+    state.lastStackNativeCaption = specs[0]?.nativeCaption || null;
     return stack;
+  }
+
+  function hideOverlay(overlay) {
+    if (!overlay.hidden) overlay.hidden = true;
+    if (overlay.firstChild) overlay.replaceChildren();
+    state.stack = null;
+    state.stackLines = null;
+  }
+
+  function setStyleValue(element, property, value) {
+    if (element.style[property] !== value) element.style[property] = value;
   }
 
   function measuredStackHeight(stack) {
@@ -437,9 +549,9 @@
   function setStackWidth(stack, left, width, playerRect) {
     const boundedLeft = Math.max(0, Math.min(playerRect.width, left));
     const boundedWidth = Math.max(80, Math.min(playerRect.width - boundedLeft, width));
-    stack.style.left = `${boundedLeft}px`;
-    stack.style.width = `${boundedWidth}px`;
-    stack.style.right = "auto";
+    setStyleValue(stack, "left", `${boundedLeft}px`);
+    setStyleValue(stack, "width", `${boundedWidth}px`);
+    setStyleValue(stack, "right", "auto");
     return { left: boundedLeft, width: boundedWidth };
   }
 
@@ -448,7 +560,6 @@
     const mediaLeft = Math.max(0, media.left - playerRect.left);
     const mediaWidth = Math.max(80, Math.min(playerRect.width - mediaLeft, media.width || playerRect.width));
     setStackWidth(stack, mediaLeft, mediaWidth, playerRect);
-    stack.style.top = "auto";
 
     // The fallback belongs to the lower edge of the player-local video
     // surface. It is intentionally independent of any arbitrary visible text:
@@ -465,8 +576,9 @@
     const topLimit = media.top - playerRect.top + CAPTION_GAP_PX;
     const bottom = Math.max(0, playerRect.bottom - playerRect.top - visibleBottom);
     const maxBottom = Math.max(0, playerRect.height - topLimit - stackHeight);
-    stack.style.bottom = `${Math.min(bottom, maxBottom)}px`;
-    stack.dataset.echo360Placement = "fallback";
+    setStyleValue(stack, "top", "auto");
+    setStyleValue(stack, "bottom", `${Math.min(bottom, maxBottom)}px`);
+    if (stack.dataset.echo360Placement !== "fallback") stack.dataset.echo360Placement = "fallback";
   }
 
   function positionAboveNative(stack, nativeCaption, playerRect) {
@@ -486,29 +598,40 @@
       media.top - playerRect.top + CAPTION_GAP_PX,
       nativeRect.top - playerRect.top - stackHeight - CAPTION_GAP_PX
     );
-    stack.style.left = `${placement.left}px`;
-    stack.style.width = `${placement.width}px`;
-    stack.style.top = `${top}px`;
-    stack.style.bottom = "auto";
-    stack.dataset.echo360Placement = "native-above";
+    setStyleValue(stack, "left", `${placement.left}px`);
+    setStyleValue(stack, "width", `${placement.width}px`);
+    setStyleValue(stack, "top", `${top}px`);
+    setStyleValue(stack, "bottom", "auto");
+    if (stack.dataset.echo360Placement !== "native-above") stack.dataset.echo360Placement = "native-above";
     return { left: placement.left, width: placement.width, top };
   }
 
   function render() {
     if (!state) return;
+    if (!state.video?.isConnected || !state.player?.isConnected) {
+      unmount();
+      return;
+    }
+    state.lastLayoutRenderAt = performance.now();
     const overlay = ensureOverlay();
     if (!overlay) return;
     if (!state.visible) {
-      overlay.hidden = true;
-      overlay.replaceChildren();
+      hideOverlay(overlay);
       return;
+    }
+    // Mutations inside open shadow roots do not cross the observer boundary.
+    // Periodically refresh discovery so a cached miss cannot last forever.
+    if (performance.now() - state.lastDiscoveryAt >= LAYOUT_REFRESH_MS) {
+      state.lastDiscoveryAt = performance.now();
+      state.deepQueryCacheDirty = true;
+      state.nativeCaptionDirty = true;
+      state.lastStackNativeCaption = null;
     }
     const index = findCueIndex(Number(state.video.currentTime || 0));
     state.currentCueIndex = index;
     const cue = index >= 0 ? state.cues[index] : null;
     if (!cue?.translated) {
-      overlay.hidden = true;
-      overlay.replaceChildren();
+      hideOverlay(overlay);
       return;
     }
     const captionState = captionToggleState(state.player, state.video);
@@ -522,6 +645,10 @@
       state.lastNativeRect = null;
       state.nativeMissingSince = performance.now();
       state.nativeLastSeenAt = 0;
+      state.nativeCaptionCueIndex = -1;
+      state.nativeCaption = null;
+      state.nativeCaptionScanComplete = false;
+      state.nativeCaptionDirty = true;
     }
     const nativeCaption = findNativeCaption(cue, captionState);
     const now = performance.now();
@@ -555,20 +682,20 @@
       now - state.nativeLastSeenAt < NATIVE_CUE_GRACE_MS;
     const waitingForNative = !nativeCaption && !sameCueNativeRect && captionState !== false
       && now - state.nativeMissingSince < NATIVE_CUE_GRACE_MS;
-    const lines = [];
+    const specs = [];
     if (!waitingForNative) {
       if (nativeCaption || !state.bilingual) {
-        lines.push(createLine("translated", cue.translated, nativeCaption));
+        specs.push({ kind: "translated", text: cue.translated, nativeCaption });
       } else {
         const ordered = state.reverseOrder
           ? [["original", cue.original], ["translated", cue.translated]]
           : [["translated", cue.translated], ["original", cue.original]];
-        for (const [kind, text] of ordered) if (text) lines.push(createLine(kind, text));
+        for (const [kind, text] of ordered) if (text) specs.push({ kind, text, nativeCaption: null });
       }
     }
-    const stack = lines.length > 0 ? ensureStack(overlay, lines) : null;
+    const stack = specs.length > 0 ? ensureStack(overlay, specs) : null;
     if (!stack) {
-      overlay.hidden = true;
+      hideOverlay(overlay);
       // Do not leave the previous cue visible while waiting for Echo360 to
       // insert the next native English node. Keeping the old child in the DOM
       // made cue-boundary tests (and, visibly, the player) show stale Chinese
@@ -587,30 +714,28 @@
     } else {
       styleFallback(stack, playerRect);
     }
-    overlay.hidden = false;
-  }
-
-  function requestFrame(callback) {
-    return typeof requestAnimationFrame === "function" ? requestAnimationFrame(callback) : setTimeout(callback, 16);
-  }
-
-  function cancelFrame(handle) {
-    if (handle == null) return;
-    if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
-    clearTimeout(handle);
+    if (overlay.hidden) overlay.hidden = false;
   }
 
   function scheduleLayoutRefresh() {
-    if (!state) return;
+    if (!state?.visible) return;
     state.refreshUntil = Math.max(state.refreshUntil, performance.now() + LAYOUT_REFRESH_MS);
     if (state.refreshFrame != null) return;
-    const refresh = () => {
-      if (!state) return;
-      state.refreshFrame = null;
-      render();
-      if (performance.now() < state.refreshUntil) state.refreshFrame = requestFrame(refresh);
+    const mounted = state;
+    const queue = () => {
+      const delay = Math.max(0, LAYOUT_REFRESH_INTERVAL_MS - (performance.now() - state.lastLayoutRenderAt));
+      state.refreshFrame = setTimeout(refresh, delay);
     };
-    state.refreshFrame = requestFrame(refresh);
+    const refresh = () => {
+      if (state !== mounted) return;
+      state.refreshFrame = null;
+      if (!state.visible) return;
+      // Native cue changes render immediately; interactions and animated
+      // controls share this bounded layout refresh, including while paused.
+      if (performance.now() - state.lastLayoutRenderAt >= LAYOUT_REFRESH_INTERVAL_MS) render();
+      if (state === mounted && state.visible && performance.now() < state.refreshUntil) queue();
+    };
+    queue();
   }
 
   function isOwnMutation(record) {
@@ -624,12 +749,22 @@
   }
 
   function scheduleVideoFrame() {
-    if (!state || typeof state.video.requestVideoFrameCallback !== "function") return;
-    state.frameHandle = state.video.requestVideoFrameCallback(() => {
-      if (!state) return;
-      render();
+    if (!state?.visible || state.frameHandle != null || typeof state.video.requestVideoFrameCallback !== "function") return;
+    const mounted = state;
+    const handle = state.video.requestVideoFrameCallback(() => {
+      if (state !== mounted || state.frameHandle !== handle) return;
+      state.frameHandle = null;
+      const now = performance.now();
+      const index = findCueIndex(Number(state.video.currentTime || 0));
+      // Cue boundaries are immediate. Stable cues need only a bounded
+      // fallback for CSS changes not represented by observed mutations.
+      if (index !== state.currentCueIndex || now - state.lastFrameRenderAt >= 200) {
+        state.lastFrameRenderAt = now;
+        render();
+      }
       scheduleVideoFrame();
     });
+    state.frameHandle = handle;
   }
 
   function mount({ video, originalVtt, translatedVtt, size = "medium", bilingual = false, reverseOrder = false } = {}) {
@@ -654,7 +789,10 @@
       observer: null,
       resizeObserver: null,
       frameHandle: null,
+      lastFrameRenderAt: performance.now(),
+      lastDiscoveryAt: performance.now(),
       refreshFrame: null,
+      lastLayoutRenderAt: -Infinity,
       refreshUntil: 0,
       playerPositionSaved: false,
       previousPlayerPosition: null,
@@ -664,6 +802,13 @@
       lastNativeVideo: null,
       lastNativeRect: null,
       nativeLastSeenAt: 0,
+      nativeCaption: null,
+      nativeCaptionCueIndex: -1,
+      nativeCaptionToggleState: null,
+      nativeCaptionScanComplete: false,
+      nativeCaptionDirty: true,
+      deepQueryCache: new Map(),
+      deepQueryCacheDirty: false,
     };
 
     for (const eventName of ["timeupdate", "seeked", "play", "pause", "loadedmetadata"]) {
@@ -681,17 +826,25 @@
     }
     state.observer = new MutationObserver((records) => {
       if (!state || state.handlingMutation || records.length === 0 || records.every(isOwnMutation)) return;
+      state.deepQueryCacheDirty = true;
+      const cue = state.currentCueIndex >= 0 ? state.cues[state.currentCueIndex] : null;
+      const captionChanged = cue && records.some((record) => mutationMayAffectNativeCaption(record, cue));
+      if (captionChanged) {
+        state.nativeCaptionDirty = true;
+        state.nativeCaptionScanComplete = false;
+        state.lastStackNativeCaption = null;
+      }
       state.handlingMutation = true;
       try {
-        render();
+        if (captionChanged && state.visible) render();
         scheduleLayoutRefresh();
       } finally {
-        state.handlingMutation = false;
+        if (state) state.handlingMutation = false;
       }
     });
     state.observer.observe(player, {
       attributes: true,
-      attributeFilter: ["class", "style", "hidden", "aria-hidden"],
+      attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-pressed", "aria-checked"],
       childList: true,
       characterData: true,
       subtree: true,
@@ -712,19 +865,33 @@
     if (bilingual !== undefined) state.bilingual = !!bilingual;
     if (reverseOrder !== undefined) state.reverseOrder = !!reverseOrder;
     state.currentCueIndex = -1;
+    state.lastNativeCueIndex = -1;
+    state.nativeCaptionDirty = true;
+    state.deepQueryCacheDirty = true;
     render();
     return true;
   }
 
   function setVisible(visible) {
     if (!state) return;
-    state.visible = !!visible;
+    const next = !!visible;
+    if (state.visible === next) return;
+    state.visible = next;
+    if (!next) {
+      if (state.frameHandle != null) state.video.cancelVideoFrameCallback?.(state.frameHandle);
+      state.frameHandle = null;
+      clearTimeout(state.refreshFrame);
+      state.refreshFrame = null;
+    }
     render();
+    if (next) scheduleVideoFrame();
   }
 
   function applySize(size) {
     if (!state) return;
-    state.size = SIZE_MAP[size] ? size : "medium";
+    const next = SIZE_MAP[size] ? size : "medium";
+    if (state.size === next) return;
+    state.size = next;
     render();
   }
 
@@ -746,7 +913,7 @@
     if (!state) return;
     for (const [eventName, listener] of state.listeners) state.video.removeEventListener(eventName, listener);
     for (const [eventName, listener] of state.interactionListeners) state.player.removeEventListener(eventName, listener);
-    cancelFrame(state.refreshFrame);
+    clearTimeout(state.refreshFrame);
     if (state.frameHandle !== null && typeof state.video.cancelVideoFrameCallback === "function") {
       state.video.cancelVideoFrameCallback(state.frameHandle);
     }

@@ -28,7 +28,11 @@
     // One shared budget covers candidate scans and transcript-file probes.
     // Individual requests may use less of it, but none may reset the clock.
     const sourceDeadlineAt = Date.now() + 12_000;
-    const sourceOptions = { deadlineAt: sourceDeadlineAt };
+    // Keep request results scoped to this resolution attempt. Candidate scans
+    // repeat while the player is still loading, so sharing this map prevents
+    // the same failed URL from creating another network request every 500 ms
+    // without retaining anything after the attempt settles.
+    const sourceOptions = { deadlineAt: sourceDeadlineAt, resourceRequests: new Map() };
     const isInstructureMedia = (
       ns.hostSupport?.isInstructureMediaHost?.() ||
       ns.hostSupport?.isInstructureMediaDocument?.()
@@ -400,6 +404,7 @@
     // failure and must not be silently converted into a second translation.
     const waitOptions = {
       isActive: options.isActive || (() => true),
+      signal: options.signal,
       onProgress: options.onProgress || (() => {}),
       onPartialVtt: options.onPartialVtt || (() => {}),
       sourceVtt: payload.vtt_text || "",
@@ -415,6 +420,7 @@
     create = validateCreatedJobResponse(create, "backend");
     const waitOptions = {
       isActive: options.isActive || (() => true),
+      signal: options.signal,
       onProgress: options.onProgress || (() => {}),
       onPartialVtt: options.onPartialVtt || (() => {}),
       sourceVtt: payload.vtt_text || "",
@@ -1332,9 +1338,11 @@
   }
 
   async function buildCacheKey(cfg, sourceId, vttText) {
-    const vttHash = await ns.storage.sha256Text(vttText);
-    const stableSourceId = ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId;
-    const sourceKey = stableSourceId || `${location.href}#${vttHash}`;
+    const stableSourceId = String(ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId || "").trim();
+    // A canonical source URL already identifies the subtitle bytes for cache
+    // purposes. Avoid hashing the full VTT (which can be several megabytes)
+    // unless the source adapter could not provide a stable identifier.
+    const sourceKey = stableSourceId || `${location.href}#${await ns.storage.sha256Text(vttText)}`;
     const configSig = ns.storage.buildConfigSignature(cfg);
     return {
       sourceKey,

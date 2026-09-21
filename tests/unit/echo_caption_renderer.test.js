@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { evalModule, makeFullNs } from "../helpers/load-module.js";
 
 const ORIGINAL_VTT = `WEBVTT
@@ -56,6 +56,7 @@ function setupEcho() {
 }
 
 describe("echo_caption_renderer", () => {
+  afterEach(() => window.Echo360Translator?.echoCaptionRenderer?.unmount());
   beforeEach(() => {
     vi.restoreAllMocks();
     document.body.innerHTML = "";
@@ -98,6 +99,41 @@ describe("echo_caption_renderer", () => {
     }, { timeout: 500, interval: 20 });
   });
 
+  it("bounds layout work during pointer and unrelated DOM storms, and stops when hidden", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const { renderer, player, video } = setupEcho();
+    try {
+      renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT });
+      await Promise.resolve();
+      player.getBoundingClientRect.mockClear();
+      player.dispatchEvent(new Event("pointermove"));
+      now = 100;
+      await vi.advanceTimersByTimeAsync(100);
+      const readsPerRefresh = player.getBoundingClientRect.mock.calls.length;
+      expect(readsPerRefresh).toBeGreaterThan(0);
+      player.getBoundingClientRect.mockClear();
+      const progress = document.createElement("div");
+      player.append(progress);
+      for (let i = 0; i < 50; i += 1) {
+        player.dispatchEvent(new Event("pointermove"));
+        progress.style.width = `${i}%`;
+        now += 20;
+        await vi.advanceTimersByTimeAsync(20);
+      }
+      expect(player.getBoundingClientRect.mock.calls.length).toBeLessThanOrEqual(readsPerRefresh * 11);
+      renderer.setVisible(false);
+      player.getBoundingClientRect.mockClear();
+      now += 1000;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(player.getBoundingClientRect).not.toHaveBeenCalled();
+    } finally {
+      renderer.unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it("switches cues at an exact shared boundary without creating a browser track", async () => {
     const { renderer, player, video } = setupEcho();
     renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT });
@@ -128,5 +164,44 @@ describe("echo_caption_renderer", () => {
     expect(stack.dataset.echo360Placement).toBe("fallback");
     expect(stack.querySelector('[data-echo360-echo-caption-line="translated"]').textContent).toBe("你好世界");
     expect(stack.querySelector('[data-echo360-echo-caption-line="original"]').textContent).toBe("Hello world");
+  });
+
+  it("reuses the static cue DOM and cached native anchor across stable renders", () => {
+    const { renderer, player, video } = setupEcho();
+    renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT });
+    const overlay = player.querySelector('[data-echo360-echo-caption="1"]');
+    const stack = overlay.querySelector('[data-echo360-echo-caption-stack="1"]');
+    const replaceChildren = vi.spyOn(overlay, "replaceChildren");
+    const scanSpy = vi.spyOn(player, "querySelectorAll");
+    scanSpy.mockClear();
+
+    for (let i = 0; i < 100; i += 1) renderer.ensureMounted();
+
+    expect(player.querySelector('[data-echo360-echo-caption-stack="1"]')).toBe(stack);
+    expect(replaceChildren).not.toHaveBeenCalled();
+    expect(scanSpy.mock.calls.filter(([selector]) => selector === "*")).toHaveLength(0);
+  });
+
+  it("skips stable video frames and cancels frame work while hidden", () => {
+    const { renderer, player, video } = setupEcho();
+    let callback;
+    let handle = 0;
+    video.requestVideoFrameCallback = vi.fn((fn) => { callback = fn; return ++handle; });
+    video.cancelVideoFrameCallback = vi.fn();
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    renderer.mount({ video, originalVtt: ORIGINAL_VTT, translatedVtt: TRANSLATED_VTT });
+    const rect = vi.mocked(player.getBoundingClientRect);
+    rect.mockClear();
+    for (let index = 0; index < 100; index += 1) callback();
+    expect(rect).not.toHaveBeenCalled();
+    renderer.setVisible(false);
+    expect(video.cancelVideoFrameCallback).toHaveBeenCalledWith(handle);
+    const stale = callback;
+    const requests = video.requestVideoFrameCallback.mock.calls.length;
+    stale();
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requests);
+    renderer.setVisible(true);
+    expect(video.requestVideoFrameCallback).toHaveBeenCalledTimes(requests + 1);
+    expect(player.querySelector('[data-echo360-echo-caption="1"]').hidden).toBe(false);
   });
 });

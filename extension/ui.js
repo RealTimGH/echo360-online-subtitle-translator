@@ -92,21 +92,40 @@
     if (!ns.hostSupport?.isInstructureMediaHost?.()) return null;
 
     let frame = null;
+    let pendingForce = false;
     let resizeObserver = null;
     let mutationObserver = null;
+    let playerMutationObserver = null;
     let player = null;
     let controls = null;
     let anchorInitialized = false;
     let anchorShape = "";
+    let playerDiscoveryAttempted = false;
+
+    const controlSelectors = [
+      '[data-part="controls"]',
+      '[data-media-controls]',
+      "media-controls",
+      '[class*="media-controls"]',
+      '[class*="player-controls"]',
+      '[class*="control-bar"]',
+      '[class*="ControlBar"]',
+    ];
+    const controlSelector = controlSelectors.join(",");
+    const controlNodeSelector = `${controlSelector}, button, [role="button"], input[type="range"]`;
+    const anchorDiscoverySelector = `[data-media-player], #player, video, ${controlSelector}`;
 
     function schedule(force = false) {
+      pendingForce = pendingForce || force === true;
       if (frame != null) return;
       const scheduleFrame = typeof window.requestAnimationFrame === "function"
         ? window.requestAnimationFrame.bind(window)
         : (callback) => window.setTimeout(callback, 0);
       frame = scheduleFrame(() => {
+        const nextForce = pendingForce;
+        pendingForce = false;
         frame = null;
-        sync(force);
+        sync(nextForce);
       });
     }
 
@@ -120,8 +139,13 @@
       return rect;
     }
 
-    function findPlayer() {
+    function findPlayer(force = false) {
       if (player?.isConnected) return player;
+      // Pointer/focus activity is not a player-discovery signal. Once the
+      // initial lookup has failed, wait for the child-list observer to report
+      // a likely media node before walking the page again.
+      if (!force && playerDiscoveryAttempted) return null;
+      playerDiscoveryAttempted = true;
       const video = ns.video?.getPrimaryVideo?.() || ns.video?.getAllVideos?.()[0] || null;
       return ns.hostSupport?.getPlayer?.(video) ||
         video?.closest?.("[data-media-player], #player") ||
@@ -129,24 +153,21 @@
     }
 
     function deepQueryAll(nextPlayer, selector) {
-      const direct = Array.from(nextPlayer?.querySelectorAll?.(selector) || []);
-      const deep = ns.video?.querySelectorAllDeep?.(selector, nextPlayer) || direct;
-      return Array.from(new Set([...direct, ...deep]));
+      const deepQuery = ns.video?.querySelectorAllDeep;
+      if (typeof deepQuery === "function") {
+        return Array.from(new Set(deepQuery(selector, nextPlayer) || []));
+      }
+      return Array.from(nextPlayer?.querySelectorAll?.(selector) || []);
     }
 
     function findControls(nextPlayer) {
       if (!nextPlayer) return null;
       const playerRect = visibleRect(nextPlayer);
       if (!playerRect) return null;
-      const candidates = [
-        '[data-part="controls"]',
-        '[data-media-controls]',
-        "media-controls",
-        '[class*="media-controls"]',
-        '[class*="player-controls"]',
-        '[class*="control-bar"]',
-        '[class*="ControlBar"]',
-      ].flatMap((selector) => deepQueryAll(nextPlayer, selector));
+      // querySelectorAllDeep already includes the light DOM. Query the
+      // complete candidate set once; the old per-selector scans repeatedly
+      // walked every shadow root in the player during pointer interactions.
+      const candidates = deepQueryAll(nextPlayer, controlSelector);
       const controls = deepQueryAll(nextPlayer, 'button,[role="button"],input[type="range"]');
       const scored = new Map();
 
@@ -182,15 +203,28 @@
     }
 
     function sync(force = false) {
-      const nextPlayer = findPlayer();
-      const nextControls = findControls(nextPlayer);
+      const nextPlayer = findPlayer(force);
+      // The anchor is viewport-fixed after it is established. Pointer and
+      // focus activity therefore only needs to inspect cached geometry; a
+      // deep control scan is reserved for an explicit layout/DOM change.
+      const shouldFindControls = force || nextPlayer !== player || !controls?.isConnected;
+      const nextControls = shouldFindControls ? findControls(nextPlayer) : controls;
       if (nextPlayer !== player || nextControls !== controls) {
         resizeObserver?.disconnect();
+        playerMutationObserver?.disconnect();
         player = nextPlayer;
         controls = nextControls;
         if (resizeObserver) {
           if (player) resizeObserver.observe(player);
           if (controls && controls !== player) resizeObserver.observe(controls);
+        }
+        if (playerMutationObserver && player) {
+          playerMutationObserver.observe(player, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["class", "style", "data-part", "data-media-controls"],
+          });
         }
         anchorInitialized = false;
         anchorShape = "";
@@ -227,10 +261,8 @@
       const margin = 8;
       // Instructure Media embeds have their own player-local controls and the
       // surrounding Canvas page remains unobstructed. Keep the compact group
-      // at its final player-local position and let hover/focus reveal the
-      // secondary actions in place. The legacy Echo360 page still uses the
-      // generic fixed, half-hidden group CSS because this anchor is installed
-      // only for Instructure Media.
+      // at its final player-local position. Auto-retract is currently off for
+      // every host; this anchor still must not reserve the old 28px dock offset.
       const dockOffset = 0;
       // The player rectangle is the ownership boundary.  Instructure wraps
       // each media player in a much larger lesson/scroll shell; using the
@@ -275,23 +307,61 @@
     }
 
     const onResize = () => schedule(true);
-    const onPlayerInteraction = () => schedule(true);
     window.addEventListener("resize", onResize, false);
     window.addEventListener("orientationchange", onResize, false);
     document.addEventListener("fullscreenchange", onResize, true);
-    document.addEventListener("pointermove", onPlayerInteraction, true);
-    document.addEventListener("mouseenter", onPlayerInteraction, true);
-    document.addEventListener("mouseleave", onPlayerInteraction, true);
-    document.addEventListener("focusin", onPlayerInteraction, true);
-    document.addEventListener("focusout", onPlayerInteraction, true);
     if (typeof ResizeObserver === "function") resizeObserver = new ResizeObserver(schedule);
     if (typeof MutationObserver === "function") {
-      mutationObserver = new MutationObserver(() => schedule(true));
+      // Keep page discovery cheap: child-list changes are enough to notice a
+      // player being mounted/replaced. Attribute churn in the whole Canvas
+      // document is intentionally excluded; the selected player gets its own
+      // narrow observer below once it is known.
+      mutationObserver = new MutationObserver((records) => {
+        const selectedPlayerRemoved = player && !player.isConnected;
+        const likelyAnchorAdded = records.some((record) => {
+          if (record.type !== "childList") return false;
+          if (selectedPlayerRemoved) return true;
+          return [...record.addedNodes, ...record.removedNodes].some((node) =>
+            node?.nodeType === 1 && (node.matches?.(anchorDiscoverySelector) || node.querySelector?.(anchorDiscoverySelector))
+          );
+        });
+        if (selectedPlayerRemoved || (!player && likelyAnchorAdded)) schedule(true);
+      });
       mutationObserver.observe(document.documentElement, {
         childList: true,
         subtree: true,
-        attributes: true,
-        attributeFilter: ["class", "style", "data-part", "data-media-controls"],
+      });
+      const isControlNode = (node) => node?.nodeType === 1 && node.matches?.(controlNodeSelector);
+      const containsControlNode = (node) => isControlNode(node) || node?.querySelector?.(controlNodeSelector);
+      playerMutationObserver = new MutationObserver((records) => {
+        let rescan = false;
+        let geometryOnly = false;
+        for (const record of records) {
+          if (record.type === "childList") {
+            // Caption/progress DOM churn is common inside the player. Only a
+            // structural change that adds/removes a control candidate can
+            // change the selected anchor and require a deep scan.
+            if ([...record.addedNodes, ...record.removedNodes].some(containsControlNode)) {
+              rescan = true;
+              break;
+            }
+            continue;
+          }
+          const target = record.target;
+          if (record.attributeName === "data-part" || record.attributeName === "data-media-controls") {
+            if (isControlNode(target) || target === player || target === controls) {
+              rescan = true;
+              break;
+            }
+            continue;
+          }
+          // A class/style change on the selected player or control bar can
+          // move/resize it, but class/style churn on descendants (for example
+          // a progress indicator) should not rediscover every control.
+          if (target === player || target === controls) geometryOnly = true;
+        }
+        if (rescan) schedule(true);
+        else if (geometryOnly) schedule(false);
       });
     }
     sync();
@@ -304,13 +374,9 @@
       window.removeEventListener("resize", onResize, false);
       window.removeEventListener("orientationchange", onResize, false);
       document.removeEventListener("fullscreenchange", onResize, true);
-      document.removeEventListener("pointermove", onPlayerInteraction, true);
-      document.removeEventListener("mouseenter", onPlayerInteraction, true);
-      document.removeEventListener("mouseleave", onPlayerInteraction, true);
-      document.removeEventListener("focusin", onPlayerInteraction, true);
-      document.removeEventListener("focusout", onPlayerInteraction, true);
       resizeObserver?.disconnect();
       mutationObserver?.disconnect();
+      playerMutationObserver?.disconnect();
       root.classList.remove("echo360-media-anchored");
     };
   }

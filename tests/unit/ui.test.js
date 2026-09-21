@@ -335,10 +335,131 @@ describe("manual AI workflow controls", () => {
     expect(root.style.getPropertyValue("--echo360-floating-left")).toBe("616px");
   });
 
+  it("does not rescan the player on pointer activity or unrelated document mutations", async () => {
+    document.getElementById("echo360-ui-root")?.remove();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    Object.defineProperty(window, "location", {
+      value: { hostname: "sydney.instructuremedia.com", pathname: "/lti-app/embed/player" },
+      configurable: true,
+      writable: true,
+    });
+
+    const player = document.createElement("div");
+    player.setAttribute("data-media-player", "");
+    const video = document.createElement("video");
+    const controls = document.createElement("div");
+    controls.setAttribute("data-part", "controls");
+    player.append(video, controls);
+    document.body.appendChild(player);
+    const rect = (left, top, width, height) => ({
+      x: left,
+      y: top,
+      left,
+      top,
+      width,
+      height,
+      right: left + width,
+      bottom: top + height,
+    });
+    vi.spyOn(player, "getBoundingClientRect").mockReturnValue(rect(100, 100, 600, 400));
+    vi.spyOn(controls, "getBoundingClientRect").mockReturnValue(rect(100, 450, 600, 50));
+
+    const deepQuery = vi.fn((selector, scope) => Array.from((scope || player).querySelectorAll(selector)));
+    window.Echo360Translator = makeFullNs({
+      hostSupport: {
+        isSupportedPlayerDocument: vi.fn(() => true),
+        isInstructureMediaHost: vi.fn(() => true),
+      },
+      video: {
+        getPrimaryVideo: vi.fn(() => video),
+        querySelectorAllDeep: deepQuery,
+      },
+      storage: {
+        getPrefs: vi.fn(async () => ({ enabled: true, size: "medium" })),
+        getConfig: vi.fn(async () => ({ target: "ZH" })),
+        getOnboardingSeen: vi.fn(async () => true),
+        setOnboardingSeen: vi.fn(async () => {}),
+      },
+    });
+    loadUiModules();
+    window.Echo360Translator.ui.ensurePanel();
+    deepQuery.mockClear();
+
+    for (let index = 0; index < 20; index += 1) {
+      document.dispatchEvent(new Event("pointermove", { bubbles: true }));
+    }
+    const unrelated = document.createElement("div");
+    unrelated.className = "unrelated-page-churn";
+    document.body.appendChild(unrelated);
+    unrelated.setAttribute("class", "unrelated-page-churn-updated");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(deepQuery).not.toHaveBeenCalled();
+  });
+
+  it("rescans only after a mutation inside the selected player", async () => {
+    document.getElementById("echo360-ui-root")?.remove();
+    document.body.innerHTML = "";
+    document.head.innerHTML = "";
+    Object.defineProperty(window, "location", {
+      value: { hostname: "sydney.instructuremedia.com", pathname: "/lti-app/embed/player" },
+      configurable: true,
+      writable: true,
+    });
+
+    const player = document.createElement("div");
+    player.setAttribute("data-media-player", "");
+    const video = document.createElement("video");
+    const controls = document.createElement("div");
+    controls.setAttribute("data-part", "controls");
+    player.append(video, controls);
+    document.body.appendChild(player);
+    const rect = (left, top, width, height) => ({
+      x: left,
+      y: top,
+      left,
+      top,
+      width,
+      height,
+      right: left + width,
+      bottom: top + height,
+    });
+    vi.spyOn(player, "getBoundingClientRect").mockReturnValue(rect(100, 100, 600, 400));
+    vi.spyOn(controls, "getBoundingClientRect").mockReturnValue(rect(100, 450, 600, 50));
+    const deepQuery = vi.fn((selector, scope) => Array.from((scope || player).querySelectorAll(selector)));
+    window.Echo360Translator = makeFullNs({
+      hostSupport: {
+        isSupportedPlayerDocument: vi.fn(() => true),
+        isInstructureMediaHost: vi.fn(() => true),
+      },
+      video: {
+        getPrimaryVideo: vi.fn(() => video),
+        querySelectorAllDeep: deepQuery,
+      },
+      storage: {
+        getPrefs: vi.fn(async () => ({ enabled: true, size: "medium" })),
+        getConfig: vi.fn(async () => ({ target: "ZH" })),
+        getOnboardingSeen: vi.fn(async () => true),
+        setOnboardingSeen: vi.fn(async () => {}),
+      },
+    });
+    loadUiModules();
+    window.Echo360Translator.ui.ensurePanel();
+    deepQuery.mockClear();
+
+    controls.appendChild(document.createElement("button"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(deepQuery).toHaveBeenCalled();
+  });
+
   it("keeps each floating surface independently fixed to the player viewport", () => {
     setupUi({ enabled: true, size: "medium" });
     const styles = document.getElementById("echo360-ui-styles").textContent;
     expect(styles).toContain("#echo360-translator-ball-group {\n        position: fixed;");
+    expect(styles).toContain("transform: translateX(0);");
+    expect(styles).not.toContain("transform: translateX(28px);");
     expect(styles).toContain("#echo360-translator-panel {\n        position: fixed;");
     expect(styles).toContain("#echo360-translator-popover {\n        position: fixed;");
     expect(styles).toContain("#echo360-onboarding-bubble {\n        position: fixed;");
