@@ -2,8 +2,9 @@
   // Sentence merging deliberately lives beside the VTT parser instead of in
   // the translation service.  It is a small, deterministic source transform:
   // a provider sees sentence-sized units and the renderer projects complete
-  // translations back onto the original cue timeline without guessing word
-  // timings. A source cue may belong to two adjacent sentence groups.
+  // translations back onto the original cue timeline. A source cue may belong
+  // to two adjacent sentence groups; display then splits that cue's time
+  // window by source-character ratio instead of stacking both sentences.
   const root = typeof window !== "undefined" ? window : globalThis;
   const ns = root.Echo360Translator || (root.Echo360Translator = {});
 
@@ -13,6 +14,10 @@
   const SOFT_WORDS = 28;
   const MAX_WORDS = 48;
   const MAX_GAP_MS = 1500;
+  // Netflix's finished-subtitle floor is about 833 ms. Lecture ASR cues are
+  // often 1 s, so a 400 ms slice is the shortest event we will invent. A cue
+  // shorter than 800 ms keeps the stacked fallback.
+  const MIN_SLICE_MS = 400;
 
   const TAG_RE = /<\/?(?:v|c|i|b|u|ruby|rt|lang)(?=[\s.>])[^>]*>|<(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}>/g;
   const ABBREVIATIONS = new Set([
@@ -280,7 +285,6 @@
       return cursor;
     });
     return { raw, spans, cueEnds, ...visible };
-
   }
 
   function groupFromRange(run, start, end) {
@@ -291,11 +295,14 @@
     if (!members.length) return createGroup(run.spans[0].cue);
     const first = members[0].cue;
     const last = members[members.length - 1].cue;
+    const fragments = members.map(({ cue, start: cueStart, end: cueEnd }) => ({
+      sourceIndex: cue.index,
+      text: sourceSlice(cue.text, Math.max(rawStart, cueStart) - cueStart, Math.min(rawEnd, cueEnd) - cueStart),
+    }));
     return {
       sourceIndices: members.map((span) => span.cue.index),
-      text: members.map(({ cue, start: cueStart, end: cueEnd }) =>
-        sourceSlice(cue.text, Math.max(rawStart, cueStart) - cueStart, Math.min(rawEnd, cueEnd) - cueStart)
-      ).join(" "),
+      text: fragments.map((fragment) => fragment.text).join(" "),
+      fragments,
       startMs: first.startMs,
       endMs: last.endMs,
       ...(!first.valid ? { time: first.time } : {}),
@@ -423,13 +430,120 @@
   }
 
   function createGroup(cue) {
+    const text = asText(cue.text);
     return {
       sourceIndices: [cue.index],
-      text: asText(cue.text),
+      text,
+      fragments: [{ sourceIndex: cue.index, text }],
       startMs: cue.valid ? cue.startMs : null,
       endMs: cue.valid ? cue.endMs : null,
       ...(!cue.valid ? { time: cue.time } : {}),
     };
+  }
+
+  function timingSettings(time) {
+    const match = asText(time).match(/^\s*\S+\s+-->\s+\S+(.*)$/);
+    return match ? match[1].trim() : "";
+  }
+
+  function cueTimingLine(startMs, endMs, settings) {
+    return `${formatTimestamp(startMs)} --> ${formatTimestamp(endMs)}${settings ? ` ${settings}` : ""}`;
+  }
+
+  function fragmentWeight(text) {
+    return Math.max(1, normalizeWhitespace(stripTags(text)).length);
+  }
+
+  function fragmentForCue(group, sourceIndex) {
+    const fragments = Array.isArray(group?.fragments) ? group.fragments : [];
+    const hit = fragments.find((fragment) => Number(fragment?.sourceIndex) === sourceIndex);
+    if (hit) return asText(hit.text);
+    if (Array.isArray(group?.sourceIndices) && group.sourceIndices.length === 1 &&
+      Number(group.sourceIndices[0]) === sourceIndex) {
+      return asText(group.text);
+    }
+    return "";
+  }
+
+  // AppTek IWSLT 2023 and common subtitle splitters interpolate extra block
+  // boundaries by source character ratio when word timestamps are absent.
+  // Netflix-style minimum duration then merges a slice that would flash.
+  function allocateDisplaySlices(cue, cueGroups) {
+    if (!cue?.valid || !Array.isArray(cueGroups) || cueGroups.length <= 1) return null;
+    const duration = cue.endMs - cue.startMs;
+    if (!(duration >= MIN_SLICE_MS * 2)) return null;
+
+    const units = cueGroups.map((group) => ({
+      groups: [group],
+      weight: fragmentWeight(fragmentForCue(group, cue.index)),
+    }));
+    const totalWeight = units.reduce((sum, unit) => sum + unit.weight, 0);
+    if (totalWeight <= 0) return null;
+
+    const durations = units.map((unit, index) => (
+      index === units.length - 1 ? 0 : Math.max(1, Math.round(duration * unit.weight / totalWeight))
+    ));
+    durations[durations.length - 1] = duration - durations.slice(0, -1).reduce((sum, value) => sum + value, 0);
+    for (let index = durations.length - 2; index >= 0 && durations[durations.length - 1] <= 0; index -= 1) {
+      if (durations[index] > 1) {
+        durations[index] -= 1;
+        durations[durations.length - 1] += 1;
+      }
+    }
+    if (durations.some((value) => value <= 0)) return null;
+
+    let guard = 0;
+    while (guard < 24) {
+      guard += 1;
+      const short = durations.findIndex((value) => value < MIN_SLICE_MS);
+      if (short < 0) break;
+      let donor = -1;
+      let donorSpare = 0;
+      durations.forEach((value, index) => {
+        const extra = value - MIN_SLICE_MS;
+        if (extra > donorSpare) {
+          donorSpare = extra;
+          donor = index;
+        }
+      });
+      if (donor < 0 || donorSpare <= 0) break;
+      const take = Math.min(MIN_SLICE_MS - durations[short], donorSpare);
+      durations[donor] -= take;
+      durations[short] += take;
+    }
+
+    while (durations.some((value) => value < MIN_SLICE_MS) && durations.length > 1) {
+      const short = durations.findIndex((value) => value < MIN_SLICE_MS);
+      const neighbor = short === 0
+        ? 1
+        : short === durations.length - 1
+          ? short - 1
+          : durations[short - 1] >= durations[short + 1] ? short - 1 : short + 1;
+      const keep = Math.min(short, neighbor);
+      const drop = Math.max(short, neighbor);
+      durations[keep] += durations[drop];
+      units[keep] = {
+        groups: units[keep].groups.concat(units[drop].groups),
+        weight: units[keep].weight + units[drop].weight,
+      };
+      durations.splice(drop, 1);
+      units.splice(drop, 1);
+    }
+    if (durations.length <= 1) return null;
+
+    const settings = timingSettings(cue.time);
+    let cursor = cue.startMs;
+    return units.map((unit, index) => {
+      const startMs = cursor;
+      const endMs = index === units.length - 1 ? cue.endMs : cursor + durations[index];
+      cursor = endMs;
+      return {
+        groups: unit.groups,
+        startMs,
+        endMs,
+        time: cueTimingLine(startMs, endMs, settings),
+      };
+    });
   }
 
   function serializeBlocks(blocks, { grouped = false } = {}) {
@@ -562,11 +676,70 @@
     return { vtt: serializeGroupVtt(groups), groups };
   }
 
+  function stackedOriginalText(cue, cueGroups, mergeEnglish) {
+    if (!mergeEnglish) return cue.text;
+    return cueGroups.length ? cueGroups.map((group) => asText(group.text)).join(" ") : cue.text;
+  }
+
+  function displayIdentity(originalText, translatedText) {
+    return `${normalizeWhitespace(stripTags(originalText))}\u0000${normalizeWhitespace(stripTags(translatedText))}`;
+  }
+
+  // dash.js and Netflix both treat a cue change with unchanged text as a
+  // flicker: identical events should be extended, and gaps under about half a
+  // second should be closed. Overlay display is the only track we coalesce;
+  // native player English and the Transcript rows stay on the source cues.
+  function coalesceIdenticalDisplay(originalBlocks, translatedBlocks) {
+    if (originalBlocks.length !== translatedBlocks.length || !originalBlocks.length) {
+      return { originalBlocks, translatedBlocks };
+    }
+    const originals = [];
+    const translated = [];
+    for (let index = 0; index < originalBlocks.length; index += 1) {
+      const original = originalBlocks[index];
+      const nextTranslated = translatedBlocks[index];
+      const previousOriginal = originals[originals.length - 1];
+      const previousTranslated = translated[translated.length - 1];
+      const canChain = previousOriginal?.valid && original.valid &&
+        previousTranslated &&
+        original.startMs >= previousOriginal.startMs &&
+        original.startMs - previousOriginal.endMs <= MAX_GAP_MS &&
+        displayIdentity(previousOriginal.text, previousTranslated.text) ===
+          displayIdentity(original.text, nextTranslated.text);
+      if (canChain) {
+        const endMs = Math.max(previousOriginal.endMs, original.endMs);
+        const time = cueTimingLine(previousOriginal.startMs, endMs, timingSettings(previousOriginal.time));
+        previousOriginal.endMs = endMs;
+        previousOriginal.time = time;
+        previousTranslated.endMs = endMs;
+        previousTranslated.time = time;
+        continue;
+      }
+      const id = String(originals.length + 1);
+      originals.push({ ...original, id });
+      translated.push({ ...nextTranslated, id });
+    }
+    return { originalBlocks: originals, translatedBlocks: translated };
+  }
+
+  function sliceTexts(event, cue, mergeEnglish, groupTexts) {
+    const translated = event.groups.map((group) => groupTexts.get(group) || "").filter(Boolean).join("\n");
+    const original = mergeEnglish
+      ? (event.groups.map((group) => asText(group.text)).filter(Boolean).join(" ") || cue.text)
+      : cue.text;
+    return { translated, original };
+  }
+
   function project(originalVtt, translatedGroupedVtt, plan, mergeEnglish = false) {
     const sourceRecords = parseVttRecords(originalVtt);
     const groups = planGroups(plan);
     if (!sourceRecords.length || !groups.length) {
-      return { originalVtt, translatedVtt: translatedGroupedVtt };
+      return {
+        originalVtt,
+        translatedVtt: translatedGroupedVtt,
+        sourceOriginalVtt: originalVtt,
+        sourceTranslatedVtt: translatedGroupedVtt,
+      };
     }
 
     const byTiming = indexedTranslatedRecords(translatedGroupedVtt);
@@ -582,25 +755,61 @@
     }
 
     const groupsBySourceIndex = sourceIndexToGroups(plan);
-    const projectedTranslations = sourceRecords.map((cue) => {
+    const stackedTranslations = sourceRecords.map((cue) => {
       const cueGroups = groupsBySourceIndex.get(cue.index) || [];
       return cueGroups.map((group) => groupTexts.get(group) || "").filter(Boolean).join("\n");
     });
-    const translatedBlocks = sourceRecords.map((cue, index) => ({
+    const stackedTranslatedVtt = serializeBlocks(sourceRecords.map((cue, index) => ({
       ...cue,
-      text: projectedTranslations[index],
-    }));
-    const projectedTranslatedVtt = serializeBlocks(translatedBlocks);
+      text: stackedTranslations[index],
+    })));
+    const stackedOriginalVtt = mergeEnglish
+      ? serializeBlocks(sourceRecords.map((cue) => {
+        const cueGroups = groupsBySourceIndex.get(cue.index) || [];
+        return { ...cue, text: stackedOriginalText(cue, cueGroups, true) };
+      }))
+      : originalVtt;
 
-    if (!mergeEnglish) return { originalVtt, translatedVtt: projectedTranslatedVtt };
-
-    const projectedOriginalBlocks = sourceRecords.map((cue) => {
+    const displayOriginal = [];
+    const displayTranslated = [];
+    sourceRecords.forEach((cue, index) => {
       const cueGroups = groupsBySourceIndex.get(cue.index) || [];
-      return { ...cue, text: cueGroups.length ? cueGroups.map((group) => asText(group.text)).join(" ") : cue.text };
+      const slices = allocateDisplaySlices(cue, cueGroups);
+      const events = slices && slices.length > 1
+        ? slices
+        : [{
+          groups: cueGroups,
+          startMs: cue.startMs,
+          endMs: cue.endMs,
+          time: cue.time,
+        }];
+      events.forEach((event) => {
+        const texts = sliceTexts(event, cue, mergeEnglish, groupTexts);
+        const block = {
+          ...cue,
+          id: String(displayTranslated.length + 1),
+          startMs: event.startMs,
+          endMs: event.endMs,
+          time: event.time || cue.time,
+          valid: cue.valid,
+        };
+        displayTranslated.push({ ...block, text: texts.translated || stackedTranslations[index] });
+        displayOriginal.push({ ...block, text: texts.original });
+      });
     });
+
+    const coalesced = coalesceIdenticalDisplay(displayOriginal, displayTranslated);
+    const overlayOriginal = coalesced.originalBlocks;
+    const overlayTranslated = coalesced.translatedBlocks;
+    const displayChanged = overlayTranslated.length !== sourceRecords.length ||
+      overlayTranslated.some((block, index) => block.startMs !== sourceRecords[index]?.startMs ||
+        block.endMs !== sourceRecords[index]?.endMs);
     return {
-      originalVtt: serializeBlocks(projectedOriginalBlocks),
-      translatedVtt: projectedTranslatedVtt,
+      originalVtt: mergeEnglish || displayChanged ? serializeBlocks(overlayOriginal) : originalVtt,
+      translatedVtt: displayChanged ? serializeBlocks(overlayTranslated) : stackedTranslatedVtt,
+      sourceOriginalVtt: originalVtt,
+      sourceTranslatedVtt: stackedTranslatedVtt,
+      stackedOriginalVtt,
     };
   }
 

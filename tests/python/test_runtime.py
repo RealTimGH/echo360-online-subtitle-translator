@@ -444,11 +444,16 @@ class BackendRuntimeTests(unittest.TestCase):
                 backend._jobs.update(original_jobs)
 
     def test_target_coverage_accepts_neutral_unchanged_caption_but_not_ordinary_english(self):
-        self.assertTrue(backend.is_target_neutral_text("F.", "F.", "ZH"))
-        self.assertTrue(backend.is_target_neutral_text("2026", "2026", "ZH"))
-        self.assertTrue(backend.is_target_neutral_text("ITLS6111", "ITLS6111", "ZH"))
-        self.assertFalse(backend.is_target_neutral_text("unchanged", "unchanged", "ZH"))
-        self.assertFalse(backend.is_target_neutral_text("F.", "F.", "EN"))
+        for is_neutral in (backend.is_target_neutral_text, translator.is_target_neutral_text):
+            self.assertTrue(is_neutral("F.", "F.", "ZH"))
+            self.assertTrue(is_neutral("p.", "p.", "ZH"))
+            self.assertFalse(is_neutral("I.", "I.", "ZH"))
+            self.assertFalse(is_neutral("a.", "a.", "ZH"))
+            self.assertFalse(is_neutral("p", "p", "ZH"))
+            self.assertTrue(is_neutral("2026", "2026", "ZH"))
+            self.assertTrue(is_neutral("ITLS6111", "ITLS6111", "ZH"))
+            self.assertFalse(is_neutral("unchanged", "unchanged", "ZH"))
+            self.assertFalse(is_neutral("F.", "F.", "EN"))
         neutral_vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nF.\n"
         self.assertTrue(backend.has_cjk_in_every_timed_cue(
             neutral_vtt,
@@ -798,6 +803,52 @@ class TranslatorRuntimeTests(unittest.TestCase):
         self.assertEqual(outcome["target_results"], 1)
         self.assertEqual(outcome["unchanged_results"], 1)
 
+    def test_failed_items_include_exact_source_and_cue_timing_context(self):
+        lines = [
+            "WEBVTT",
+            "",
+            "01:02:03.456 --> 02:03:04.567 position:10%",
+            "<v Lecturer>caption text</v>",
+            "",
+        ]
+        outcome = {}
+        with mock.patch.object(
+            translator,
+            "argos_translate_batch",
+            side_effect=RuntimeError("HTTP 503 upstream unavailable"),
+        ):
+            translator.translate_lines_native(
+                lines,
+                api_key="",
+                provider="argos",
+                target_lang="ZH",
+                concurrency=1,
+                max_paragraphs=1,
+                max_chars=1200,
+                max_retries=0,
+                outcome_callback=outcome.update,
+                log_progress=False,
+            )
+
+        self.assertEqual(outcome["failed"], 1)
+        self.assertEqual(outcome["failed_cues"], [1])
+        self.assertEqual(outcome["failed_lines"], [4])
+        self.assertEqual(
+            outcome["failed_items"][0],
+            {
+                "batch": 1,
+                "line": 4,
+                "cue": 1,
+                "source_text": "caption text",
+                "timecode": "01:02:03.456 --> 02:03:04.567",
+                "start_time": "01:02:03.456",
+                "end_time": "02:03:04.567",
+                "code": "HTTP_503",
+                "message": "HTTP 503 upstream unavailable",
+                "status": 503,
+            },
+        )
+
     def test_argos_batch_uses_an_installed_translation_without_network(self):
         class FakeTranslation:
             def translate(self, text):
@@ -1038,6 +1089,7 @@ class GoogleArgosFallbackTests(unittest.TestCase):
         self.assertEqual(outcome["failed"], 60)
         self.assertEqual(len(outcome["failed_items"]), 50)
         self.assertEqual(outcome["failed_cues"], list(range(1, 61)))
+        self.assertEqual(outcome["failed_lines"], list(range(4, 4 + 3 * 60, 3)))
 
     def test_unsupported_argos_target_does_not_trigger_fallback(self):
         google_calls = []

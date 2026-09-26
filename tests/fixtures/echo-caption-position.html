@@ -40,7 +40,7 @@
     native.style.fontSize = '18px';
     await wait(0);
     const acquiredLine = player.querySelector('[data-echo360-echo-caption-line]');
-    assert(acquiredLine.style.fontSize === '24px', 'native width/font changes do not change Chinese typography');
+    assert(acquiredLine.style.fontSize === '21.12px', 'native width/font changes do not change Chinese typography');
     const before = player.getBoundingClientRect().height;
     const stack = player.querySelector('[data-echo360-echo-caption-stack]');
     stack.style.width = '120px';

@@ -8,7 +8,7 @@
  *   getConfig          – provider-owned backend routing and legacy migration
  *   getPrefs           – useNativeSubtitles true/false, size "tiny", unknown size
  *   savePrefs          – bilingual/reverseOrder normalization
- *   getCacheStore      – valid object vs null/non-object
+ *   getCacheStore      – keyed slots, legacy single-entry migration
  *   sha256Text         – deterministic hash
  */
 
@@ -570,8 +570,11 @@ describe("getPrefs normalization", () => {
     const prefs = await storage.getPrefs();
     expect(prefs.enabled).toBe(true);
     expect(prefs.useNativeSubtitles).toBe(true);
-    expect(prefs.bilingual).toBe(false);
+    expect(prefs.bilingual).toBe(true);
+    expect(prefs.sentenceMergeEnabled).toBe(true);
+    expect(prefs.sentenceMergeEnglish).toBe(true);
     expect(prefs.transcriptPanelEnabled).toBe(false);
+    expect(prefs.renderModeVersion).toBe(4);
   });
 
   it("persists an empty migration marker so fresh installs do not rescan storage", async () => {
@@ -645,7 +648,7 @@ describe("getPrefs normalization", () => {
     });
     const prefs = await storage.getPrefs();
     expect(prefs.useNativeSubtitles).toBe(true);
-    expect(prefs.renderModeVersion).toBe(3);
+    expect(prefs.renderModeVersion).toBe(4);
   });
 
   it("migrates schema v2 native-CC-default prefs onto the browser track", async () => {
@@ -663,7 +666,49 @@ describe("getPrefs normalization", () => {
     });
     const prefs = await storage.getPrefs();
     expect(prefs.useNativeSubtitles).toBe(true);
-    expect(prefs.renderModeVersion).toBe(3);
+    expect(prefs.renderModeVersion).toBe(4);
+  });
+
+  it("adopts v4 display defaults only for fields the user never stored", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        [prefsKey()]: {
+          enabled: true,
+          size: "medium",
+          bilingual: false,
+          useNativeSubtitles: true,
+          renderModeVersion: 3,
+        },
+      },
+    });
+    const prefs = await storage.getPrefs();
+    expect(prefs).toMatchObject({
+      bilingual: false,
+      sentenceMergeEnabled: true,
+      sentenceMergeEnglish: true,
+      renderModeVersion: 4,
+    });
+  });
+
+  it("preserves explicit v3 sentence-merge opt-outs during v4 migration", async () => {
+    const { storage } = setupStorage({
+      storageData: {
+        [prefsKey()]: {
+          enabled: true,
+          browserBilingual: true,
+          useNativeSubtitles: true,
+          sentenceMergeEnabled: false,
+          sentenceMergeEnglish: false,
+          renderModeVersion: 3,
+        },
+      },
+    });
+    expect(await storage.getPrefs()).toMatchObject({
+      browserBilingual: true,
+      sentenceMergeEnabled: false,
+      sentenceMergeEnglish: false,
+      renderModeVersion: 4,
+    });
   });
 });
 
@@ -729,7 +774,9 @@ describe("prefs persistence across lessons", () => {
     const prefs = await storage.getPrefs();
     // Falls through to hardcoded defaults since no legacy prefs entry exists.
     expect(prefs.useNativeSubtitles).toBe(true);
-    expect(prefs.bilingual).toBe(false);
+    expect(prefs.bilingual).toBe(true);
+    expect(prefs.sentenceMergeEnabled).toBe(true);
+    expect(prefs.sentenceMergeEnglish).toBe(true);
   });
 
   it("does not re-migrate once a global prefs entry already exists", async () => {
@@ -754,7 +801,7 @@ describe("prefs persistence across lessons", () => {
     // migrated onto the browser-track default in the same getPrefs() pass.
     expect(prefs.size).toBe("medium");
     expect(prefs.useNativeSubtitles).toBe(true);
-    expect(prefs.renderModeVersion).toBe(3);
+    expect(prefs.renderModeVersion).toBe(4);
   });
 });
 
@@ -776,7 +823,7 @@ describe("savePrefs", () => {
     expect(localMock.set).toHaveBeenCalledOnce();
     const saved = localMock._store[prefsKey()];
     expect(saved.size).toBe("large");
-    expect(saved.renderModeVersion).toBe(3);
+    expect(saved.renderModeVersion).toBe(4);
   });
 
   it("normalizes bilingual=true when useNativeSubtitles=true", async () => {
@@ -898,23 +945,58 @@ describe("savePrefs", () => {
 // setCacheStore (error handling path)
 // ---------------------------------------------------------------------------
 describe("setCacheStore", () => {
-  it("writes entry to cache key", async () => {
+  it("stores independent slots for different cache keys", async () => {
     const { storage, localMock } = setupStorage();
-    const entry = { translatedVtt: "WEBVTT\n\n", cacheKey: "abc" };
-    await storage.setCacheStore(entry);
-    expect(localMock.set).toHaveBeenCalledWith({ echo360TranslatedVttCache: entry });
+    const raw = { cacheKey: "lesson::plain", translatedVtt: "WEBVTT\n\nraw", createdAt: 10 };
+    const merged = { cacheKey: "lesson::plain::sentence-merge-v2", translatedVtt: "WEBVTT\n\nmerged", createdAt: 20 };
+    await storage.setCacheStore(raw);
+    await storage.setCacheStore(merged);
+    const stored = localMock._store.echo360TranslatedVttCache;
+    expect(stored.schema).toBe("subtitle-cache-v2");
+    expect(stored.entries["lesson::plain"].translatedVtt).toBe("WEBVTT\n\nraw");
+    expect(stored.entries["lesson::plain::sentence-merge-v2"].translatedVtt).toBe("WEBVTT\n\nmerged");
   });
 
-  it("writes null when called with null", async () => {
+  it("clears only the requested slot", async () => {
+    const { storage } = setupStorage();
+    await storage.setCacheStore({ cacheKey: "keep", translatedVtt: "WEBVTT\n\nkeep", createdAt: 1 });
+    await storage.setCacheStore({ cacheKey: "drop", translatedVtt: "WEBVTT\n\ndrop", createdAt: 2 });
+    await storage.setCacheStore(null, "drop");
+    expect(await storage.getCacheStore("keep")).toEqual(expect.objectContaining({ translatedVtt: "WEBVTT\n\nkeep" }));
+    expect(await storage.getCacheStore("drop")).toBeNull();
+  });
+
+  it("clears every slot when called with null", async () => {
     const { storage, localMock } = setupStorage();
+    await storage.setCacheStore({ cacheKey: "abc", translatedVtt: "WEBVTT\n\n", createdAt: 1 });
     await storage.setCacheStore(null);
-    expect(localMock.set).toHaveBeenCalledWith({ echo360TranslatedVttCache: null });
+    expect(localMock._store.echo360TranslatedVttCache).toEqual({
+      schema: "subtitle-cache-v2",
+      entries: {},
+    });
+  });
+
+  it("does not cap the number of slots", async () => {
+    const { storage } = setupStorage();
+    for (let index = 0; index < 9; index += 1) {
+      await storage.setCacheStore({
+        cacheKey: `slot-${index}`,
+        translatedVtt: `WEBVTT\n\n${index}`,
+        createdAt: index + 1,
+      });
+    }
+    expect(await storage.getCacheStore("slot-0")).toEqual(expect.objectContaining({
+      translatedVtt: "WEBVTT\n\n0",
+    }));
+    expect(await storage.getCacheStore("slot-8")).toEqual(expect.objectContaining({
+      translatedVtt: "WEBVTT\n\n8",
+    }));
   });
 
   it("returns a typed warning when storage.set rejects", async () => {
     const { storage, localMock } = setupStorage();
-    localMock.set.mockRejectedValueOnce(new Error("quota exceeded"));
-    await expect(storage.setCacheStore({ x: 1 })).resolves.toEqual(expect.objectContaining({
+    localMock.set.mockRejectedValue(new Error("quota exceeded"));
+    await expect(storage.setCacheStore({ cacheKey: "abc", translatedVtt: "WEBVTT\n\n" })).resolves.toEqual(expect.objectContaining({
       ok: false,
       error: expect.objectContaining({ code: "CACHE_WRITE_FAILED" }),
     }));
@@ -927,6 +1009,13 @@ describe("setCacheStore", () => {
 describe("getCacheStore", () => {
   it("returns null when cache storage is empty", async () => {
     const { storage } = setupStorage({ storageData: {} });
+    expect(await storage.getCacheStore("abc")).toBeNull();
+  });
+
+  it("returns null without a cache key", async () => {
+    const { storage } = setupStorage({
+      storageData: { echo360TranslatedVttCache: { cacheKey: "abc", translatedVtt: "WEBVTT\n\n" } },
+    });
     expect(await storage.getCacheStore()).toBeNull();
   });
 
@@ -934,15 +1023,15 @@ describe("getCacheStore", () => {
     const { storage } = setupStorage({
       storageData: { echo360TranslatedVttCache: "not-an-object" },
     });
-    expect(await storage.getCacheStore()).toBeNull();
+    expect(await storage.getCacheStore("abc")).toBeNull();
   });
 
-  it("returns the stored object when it is valid", async () => {
+  it("migrates a legacy single-slot entry", async () => {
     const entry = { cacheKey: "abc", translatedVtt: "WEBVTT\n\n" };
     const { storage } = setupStorage({
       storageData: { echo360TranslatedVttCache: entry },
     });
-    expect(await storage.getCacheStore()).toEqual(entry);
+    expect(await storage.getCacheStore("abc")).toEqual(expect.objectContaining(entry));
   });
 });
 
@@ -974,7 +1063,11 @@ describe("sha256Text", () => {
 describe("sentence merging preferences", () => {
   it("defaults off, persists both choices, and preserves them when unrelated fields are saved", async () => {
     const { storage } = setupStorage();
-    expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: false, sentenceMergeEnglish: false });
+    expect(await storage.getPrefs()).toMatchObject({
+      browserBilingual: true,
+      sentenceMergeEnabled: true,
+      sentenceMergeEnglish: true,
+    });
     await storage.savePrefs({ useNativeSubtitles: true, browserBilingual: true, sentenceMergeEnabled: true, sentenceMergeEnglish: true });
     expect(await storage.getPrefs()).toMatchObject({ sentenceMergeEnabled: true, sentenceMergeEnglish: true });
     await storage.savePrefs({ useNativeSubtitles: false, size: "small" });

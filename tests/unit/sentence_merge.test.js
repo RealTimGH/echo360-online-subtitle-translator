@@ -40,9 +40,18 @@ describe("sentence merge", () => {
     ]);
     const plan = merge.build(source);
 
-    expect(plan.groups).toEqual([
-      { sourceIndices: [0, 1], text: "The first line continues.", startMs: 0, endMs: 2000 },
-      { sourceIndices: [2], text: "Next cue", startMs: 2000, endMs: 3000 },
+    expect(plan.groups).toMatchObject([
+      {
+        sourceIndices: [0, 1],
+        text: "The first line continues.",
+        fragments: [
+          { sourceIndex: 0, text: "The first" },
+          { sourceIndex: 1, text: "line continues." },
+        ],
+        startMs: 0,
+        endMs: 2000,
+      },
+      { sourceIndices: [2], text: "Next cue", fragments: [{ sourceIndex: 2, text: "Next cue" }], startMs: 2000, endMs: 3000 },
     ]);
     expect(vtt.parseVttCues(plan.vtt).map((cue) => cue.text)).toEqual([
       "The first line continues.",
@@ -169,7 +178,9 @@ describe("sentence merge", () => {
     ]);
     const plan = merge.build(original);
     const projected = merge.project(original, makeVtt([{ start: 0, end: 2, text: "翻译" }]), plan, true);
-    expect(vtt.parseVttCues(projected.originalVtt).map((cue) => cue.text)).toEqual(["first continues", "first continues"]);
+    expect(vtt.parseVttCues(projected.originalVtt).map((cue) => cue.text)).toEqual(["first continues"]);
+    expect(vtt.parseVttCues(projected.originalVtt)[0]).toMatchObject({ startMs: 0, endMs: 2000 });
+    expect(vtt.parseVttCues(projected.sourceTranslatedVtt).map((cue) => cue.text)).toEqual(["翻译", "翻译"]);
   });
 
   it("builds a complete sparse preview in plan order and marks failed groups", () => {
@@ -225,7 +236,7 @@ it("preserves source wording and flattens only line breaks in service input", ()
   expect(plan.groups.map(group => group.text)).toEqual(["This is\nvery very useful.", "The next sentence ends here."]);
   expect(vtt.parseVttCues(plan.vtt)[0].text).toBe("This is very very useful.");
   expect(vtt.parseVttStats(plan.vtt).textLineCount).toBe(2);
-  expect(merge.project(original, plan.vtt, plan).originalVtt).toBe(original);
+  expect(merge.project(original, plan.vtt, plan).sourceOriginalVtt).toBe(original);
   expect(vtt.parseVttCues(merge.preview(plan.vtt, plan))[0].text).toBe("正在翻译中...");
 });
 
@@ -268,30 +279,86 @@ describe("sentence-first segmentation regressions", () => {
     ({ sentenceMerge: merge, vtt } = window.Echo360Translator);
   });
 
-  it("projects both complete translations only on a cue straddling two sentences", () => {
+  it("splits a straddling cue's display window instead of stacking both complete sentences", () => {
     const original = makeVtt([{ text: "This is" }, { text: "a sentence. The next" }, { text: "one continues." }]);
     const plan = merge.build(original);
     expect(plan.groups.map(group => group.text)).toEqual(["This is a sentence.", "The next one continues."]);
     const result = makeVtt([{ start: 0, end: 2, text: "这是一个句子。" }, { start: 1, end: 3, text: "下一句继续。" }]);
     const projected = merge.project(original, result, plan, true);
-    expect(vtt.parseVttCues(projected.translatedVtt).map(c => c.text)).toEqual([
+    const translated = vtt.parseVttCues(projected.translatedVtt);
+    const english = vtt.parseVttCues(projected.originalVtt);
+    expect(translated.map(c => c.text)).toEqual(["这是一个句子。", "下一句继续。"]);
+    expect(english.map(c => c.text)).toEqual(["This is a sentence.", "The next one continues."]);
+    expect(translated.map(c => [c.startMs, c.endMs])).toEqual(english.map(c => [c.startMs, c.endMs]));
+    expect(translated[0].startMs).toBe(0);
+    expect(translated[1].endMs).toBe(3000);
+    expect(translated[0].endMs).toBe(translated[1].startMs);
+    expect(translated[0].endMs).toBeGreaterThan(1000);
+    expect(translated[0].endMs).toBeLessThan(2000);
+    expect(vtt.parseVttCues(projected.sourceTranslatedVtt).map(c => c.text)).toEqual([
       "这是一个句子。", "这是一个句子。\n下一句继续。", "下一句继续。",
     ]);
-    expect(vtt.parseVttCues(projected.originalVtt).map(c => c.text)).toEqual([
-      "This is a sentence.", "This is a sentence. The next one continues.", "The next one continues.",
+    const unmerged = merge.project(original, result, plan, false);
+    expect(unmerged.sourceOriginalVtt).toBe(original);
+    expect(vtt.parseVttCues(unmerged.originalVtt).map(c => c.text)).toEqual([
+      "This is", "a sentence. The next", "a sentence. The next", "one continues.",
     ]);
-    expect(merge.project(original, result, plan, false).originalVtt).toBe(original);
     expect(merge.remapFailedCues([2], plan)).toEqual([2, 3]);
   });
 
-  it("disambiguates multiple sentences sharing one timing range during sparse preview", () => {
-    const original = makeVtt([{ text: "One. Two. Three." }]);
+  it("chains identical merged bilingual events across source cues and short ASR gaps", () => {
+    const original = makeVtt([
+      { start: 0, end: 1, text: "This is" },
+      { start: 1.2, end: 2, text: "a sentence." },
+      { start: 2, end: 3, text: "Next." },
+    ]);
     const plan = merge.build(original);
-    const sparse = makeVtt([{ id: "3", text: "第三句。" }]);
+    const result = makeVtt([
+      { start: 0, end: 2, text: "这是一个句子。" },
+      { start: 2, end: 3, text: "下一句。" },
+    ]);
+    const projected = merge.project(original, result, plan, true);
+    const overlay = vtt.parseVttCues(projected.translatedVtt);
+    expect(overlay.map(c => c.text)).toEqual(["这是一个句子。", "下一句。"]);
+    expect(overlay.map(c => [c.startMs, c.endMs])).toEqual([[0, 2000], [2000, 3000]]);
+    expect(vtt.parseVttCues(projected.originalVtt).map(c => c.text)).toEqual(["This is a sentence.", "Next."]);
+    expect(vtt.parseVttCues(projected.sourceTranslatedVtt).map(c => c.text)).toEqual([
+      "这是一个句子。", "这是一个句子。", "下一句。",
+    ]);
+    const unmerged = merge.project(original, result, plan, false);
+    expect(unmerged.sourceOriginalVtt).toBe(original);
+    expect(vtt.parseVttCues(unmerged.translatedVtt).map(c => c.text)).toEqual([
+      "这是一个句子。", "这是一个句子。", "下一句。",
+    ]);
+  });
+
+  it("keeps stacked display when a shared cue is too short to split readably", () => {
+    const original = makeVtt([
+      { start: 0, end: 0.3, text: "This is" },
+      { start: 0.3, end: 0.6, text: "a sentence. The next" },
+      { start: 0.6, end: 0.9, text: "one continues." },
+    ]);
+    const plan = merge.build(original);
+    const result = makeVtt([{ start: 0, end: 0.6, text: "这是一个句子。" }, { start: 0.3, end: 0.9, text: "下一句继续。" }]);
+    const projected = merge.project(original, result, plan, true);
+    expect(vtt.parseVttCues(projected.translatedVtt).map(c => c.text)).toEqual([
+      "这是一个句子。", "这是一个句子。\n下一句继续。", "下一句继续。",
+    ]);
+    expect(projected.originalVtt).toBe(projected.stackedOriginalVtt);
+  });
+
+  it("disambiguates multiple sentences sharing one timing range during sparse preview", () => {
+    const original = makeVtt([{ start: 0, end: 3, text: "One. Two. Three." }]);
+    const plan = merge.build(original);
+    const sparse = makeVtt([{ id: "3", start: 0, end: 3, text: "第三句。" }]);
     const pending = merge.preview(sparse, plan, { failedCues: [2] });
     expect(vtt.parseVttCues(pending).map(c => c.text)).toEqual(["正在翻译中...", "[翻译失败]", "第三句。"]);
-    expect(vtt.parseVttCues(merge.project(original, pending, plan).translatedVtt)[0].text)
+    const projected = merge.project(original, pending, plan);
+    expect(vtt.parseVttCues(projected.sourceTranslatedVtt)[0].text)
       .toBe("正在翻译中...\n[翻译失败]\n第三句。");
+    expect(vtt.parseVttCues(projected.translatedVtt).map(c => c.text)).toEqual([
+      "正在翻译中...", "[翻译失败]", "第三句。",
+    ]);
   });
 
   it("preserves every spoken character and balances styling across a sentence cut", () => {

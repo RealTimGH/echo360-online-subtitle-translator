@@ -139,6 +139,22 @@ globalThis.Echo360DirectTranslator = (() => {
     return /^\s*(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}\s*-->\s*(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}/.test(line);
   }
 
+  // Keep the original cue timing beside each provider item.  A failed item is
+  // later surfaced outside the VTT parser (in the popup/error panel), so the
+  // physical line number alone is not enough to find it in a long caption
+  // file.  Match the same short and long WebVTT timestamp forms accepted by
+  // isTimecode(), while intentionally dropping cue settings from the display
+  // value.
+  function parseCueTiming(line) {
+    const match = String(line || "").match(/^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$/);
+    if (!match) return null;
+    return {
+      timecode: `${match[1]} --> ${match[2]}`,
+      startTime: match[1],
+      endTime: match[2],
+    };
+  }
+
   function shouldTranslate(line) {
     const trimmed = String(line || "").trim();
     if (!trimmed) return false;
@@ -209,6 +225,7 @@ globalThis.Echo360DirectTranslator = (() => {
     if (CJK_RE.test(source) || !LETTER_RE.test(source)) return true;
     if (/^(?:(?:https?|ftp):\/\/|www\.)\S+$/i.test(source) ||
       /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(source)) return true;
+    if (/^[B-HJ-Zb-hj-z]\.$/.test(source)) return true;
     if (/^[A-Z0-9][A-Z0-9._:/+#&()'’-]*$/.test(source)) {
       const upper = source.toUpperCase();
       const hasDigit = /\d/.test(source);
@@ -1250,6 +1267,7 @@ globalThis.Echo360DirectTranslator = (() => {
         failed: failedItemCount,
         failed_items: failedItems.slice(0, MAX_FAILURE_DETAILS),
         failed_cues: Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1),
+        failed_lines: collectFailedLines(),
         metrics: progressDetails(),
       });
     }
@@ -1323,15 +1341,18 @@ globalThis.Echo360DirectTranslator = (() => {
     // a single cue can contain multiple text lines; all of those lines must
     // report the same one-based WebVTT cue number in `failed_items`.
     let currentCueIndex = -1;
+    let currentCueTiming = null;
     let inCue = false;
     lines.forEach((line, index) => {
       if (isTimecode(line)) {
         currentCueIndex += 1;
+        currentCueTiming = parseCueTiming(line);
         inCue = true;
         return;
       }
       if (!line.trim()) {
         inCue = false;
+        currentCueTiming = null;
         return;
       }
       if (!inCue || !shouldTranslate(line)) return;
@@ -1340,7 +1361,14 @@ globalThis.Echo360DirectTranslator = (() => {
       // `items` counts translatable text lines, while failure diagnostics and
       // the renderer need the actual WebVTT cue number. A multiline cue must
       // therefore keep the same cue index for all of its text lines.
-      items.push({ index, text: body, cueIndex: currentCueIndex });
+      items.push({
+        index,
+        text: body,
+        cueIndex: currentCueIndex,
+        timecode: currentCueTiming?.timecode || null,
+        startTime: currentCueTiming?.startTime || null,
+        endTime: currentCueTiming?.endTime || null,
+      });
     });
     if (items.length === 0) throw makeTranslationError("EMPTY_TRANSLATABLE_VTT", "VTT 中没有可翻译文本");
     const translatableCueCount = new Set(items
@@ -1386,6 +1414,22 @@ globalThis.Echo360DirectTranslator = (() => {
     const retries = Math.max(0, Number(cfg.retries) || 0);
     const repairConcurrency = Math.max(1, Math.min(Number(cfg.repair_concurrency ?? cfg.repairConcurrency) || 1, 96));
     const startedAt = performance.now();
+
+    // `failed_items` is deliberately capped for diagnostics. Keep the
+    // complete physical source-line locations separately, derived from the
+    // authoritative item-position flags rather than from that capped sample.
+    // `items` is in source order and each item.index is a zero-based physical
+    // VTT line index, so the returned values are stable one-based locations.
+    function collectFailedLines() {
+      const failedLines = [];
+      for (let itemPosition = 0; itemPosition < items.length; itemPosition += 1) {
+        if (!failureFlags[itemPosition]) continue;
+        const lineIndex = items[itemPosition]?.index;
+        if (Number.isInteger(lineIndex) && lineIndex >= 0) failedLines.push(lineIndex + 1);
+      }
+      return failedLines;
+    }
+
     const metrics = {
       provider,
       total: items.length,
@@ -1412,6 +1456,7 @@ globalThis.Echo360DirectTranslator = (() => {
       processedCues: 0,
       translatedCues: 0,
       failedCues: 0,
+      failed_lines: [],
     };
 
     function addWarning(message) {
@@ -1434,6 +1479,7 @@ globalThis.Echo360DirectTranslator = (() => {
         processedCues: Math.min(translatableCueCount, processedCueCount),
         translatedCues: Math.min(translatableCueCount, Math.max(0, translatedCueCount)),
         failedCues: failedCueCount,
+        failed_lines: collectFailedLines(),
         observedFailureCodes: { ...observedFailureCodes },
         observed_failure_codes: { ...observedFailureCodes },
         failureCodes: { ...failureCodeCounts },
@@ -1468,6 +1514,13 @@ globalThis.Echo360DirectTranslator = (() => {
           item: itemIndex + 1,
           cue: Number.isInteger(item?.cueIndex) && item.cueIndex >= 0 ? item.cueIndex + 1 : null,
           line: Number.isInteger(item?.index) ? item.index + 1 : null,
+          // Preserve enough source context for the UI to identify the exact
+          // failed subtitle without reopening/parsing the full VTT.  These
+          // fields are bounded later by the shared error formatter.
+          source_text: item?.text || "",
+          timecode: item?.timecode || null,
+          start_time: item?.startTime || null,
+          end_time: item?.endTime || null,
           ...summary,
         });
       }
@@ -1479,6 +1532,8 @@ globalThis.Echo360DirectTranslator = (() => {
       targetError.code = getErrorCode(targetError);
       targetError.metrics = { ...progressDetails() };
       targetError.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
+      targetError.failed_cues = Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1);
+      targetError.failed_lines = collectFailedLines();
       targetError.failure_codes = { ...failureCodeCounts };
       targetError.warnings = warnings.slice(0, 30);
       targetError.provider = provider;
@@ -2043,14 +2098,19 @@ globalThis.Echo360DirectTranslator = (() => {
           ? isGoogleWeb
             ? `Google Web 全部 ${items.length} 条请求失败，未获得中文结果；failureCodes=${JSON.stringify(failureCodes)}`
             : `Provider 全部 ${items.length} 条字幕请求失败，未获得可用译文；failureCodes=${JSON.stringify(failureCodes)}`
-          : isGoogleWeb
-            ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}`
-            : "Provider did not return Chinese subtitles";
+            : isGoogleWeb
+              ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}`
+              : "Provider did not return Chinese subtitles";
+      // The normal completion path fills cue counters after this branch, but
+      // terminal all-failed/no-target errors return here first. Snapshot the
+      // live item flags so their metrics and line locations are consistent.
+      Object.assign(metrics, progressDetails());
       const error = new Error(message);
       error.code = code;
       error.metrics = { ...metrics };
       error.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
       error.failed_cues = Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1);
+      error.failed_lines = collectFailedLines();
       error.failure_codes = failureCodes;
       error.warnings = warnings.slice(0, 30);
       error.provider = provider;
@@ -2079,6 +2139,8 @@ globalThis.Echo360DirectTranslator = (() => {
     metrics.translatableCues = translatableCueCount;
     metrics.translatedCues = Math.max(0, translatableCueCount - finalFailedCueSet.size);
     metrics.failedCues = finalFailedCueSet.size;
+    const finalFailedLines = collectFailedLines();
+    metrics.failed_lines = finalFailedLines;
     metrics.observedFailureCodes = { ...observedFailureCodes };
     metrics.observed_failure_codes = { ...observedFailureCodes };
     metrics.providerBreakdown = {
@@ -2107,6 +2169,7 @@ globalThis.Echo360DirectTranslator = (() => {
       // separately from the bounded diagnostic sample so a multi-line cue (or
       // more than 50 failed lines) can still be reassigned without ambiguity.
       failed_cues: Array.from(finalFailedCueSet),
+      failed_lines: finalFailedLines,
       failure_codes: finalFailureCodes,
       failureCodes: finalFailureCodes,
       metrics: { ...metrics },

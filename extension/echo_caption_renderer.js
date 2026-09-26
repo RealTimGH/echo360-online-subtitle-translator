@@ -4,8 +4,9 @@
   const OVERLAY_ATTR = "data-echo360-echo-caption";
   const LINE_ATTR = "data-echo360-echo-caption-line";
   const STACK_ATTR = "data-echo360-echo-caption-stack";
-  const SIZE_MAP = { small: 0.88, medium: 1, large: 1.14 };
+  const SIZE_MAP = { small: 0.78, medium: 0.88, large: 1 };
   const CAPTION_GAP_PX = 6;
+  const IDENTICAL_CUE_HOLD_S = 1.5;
   const LAYOUT_REFRESH_MS = 900;
   const LAYOUT_REFRESH_INTERVAL_MS = 100;
   const MUTATION_OPTIONS = {
@@ -62,6 +63,20 @@
       maxEnd = Math.max(maxEnd, cue.end);
       return maxEnd;
     });
+  }
+
+  function sameOverlayText(left, right) {
+    return !!left && !!right && left.original === right.original && left.translated === right.translated;
+  }
+
+  function stickyIdenticalCueIndex(time, previousIndex) {
+    if (previousIndex < 0) return -1;
+    const previous = state.cues[previousIndex];
+    const next = state.cues[previousIndex + 1];
+    if (!previous || !next || !sameOverlayText(previous, next)) return -1;
+    if (time < previous.end || time >= next.start) return -1;
+    if (next.start - previous.end > IDENTICAL_CUE_HOLD_S) return -1;
+    return previousIndex;
   }
 
   function findCueIndex(time) {
@@ -473,7 +488,7 @@
     const scale = SIZE_MAP[state?.size] || SIZE_MAP.medium;
     line.style.fontFamily = "sans-serif";
     line.style.fontSize = `${baseSize * scale}px`;
-    line.style.fontWeight = "600";
+    line.style.fontWeight = "normal";
     line.style.fontStyle = "normal";
     line.style.lineHeight = "1.2";
     // Echo360 lessons do not use one caption theme consistently: some
@@ -673,9 +688,11 @@
     state.timelineCueIndex = timelineIndex;
     let index = timelineIndex;
     const previous = state.currentCueIndex;
+    const mediaTime = captionTime();
+    if (index < 0) index = stickyIdenticalCueIndex(mediaTime, previous);
     // Echo's visible English DOM is authoritative during asynchronous cue
     // hand-off. Inspect only the confirmed node, never scan on each frame.
-    if (timelineIndex >= 0 && previous >= 0 && previous !== timelineIndex && captionState !== false && state.followNativeCaption &&
+    if (index >= 0 && previous >= 0 && previous !== index && captionState !== false && state.followNativeCaption &&
       !state.video.seeking && state.nativeCaption &&
       normalizeForMatch(state.nativeCaption.textContent) === normalizeForMatch(state.cues[previous]?.original) &&
       cachedNativeCaptionMatches(state.nativeCaption, state.cues[previous])) index = previous;
@@ -691,16 +708,19 @@
       hideOverlay(overlay);
       return;
     }
+    const previousCue = previous >= 0 ? state.cues[previous] : null;
     const cueChanged = state.lastNativeCueIndex !== index || state.lastNativeVideo !== state.video;
     if (cueChanged) {
       // Match the new cue's node afresh, but retain the player's virtual
       // anchor. Translation text follows media time even during a DOM hand-off.
       state.lastNativeCueIndex = index;
       state.lastNativeVideo = state.video;
-      state.nativeCaptionCueIndex = -1;
-      state.nativeCaption = null;
-      state.nativeCaptionScanComplete = false;
-      state.nativeCaptionDirty = true;
+      if (!sameOverlayText(previousCue, cue)) {
+        state.nativeCaptionCueIndex = -1;
+        state.nativeCaption = null;
+        state.nativeCaptionScanComplete = false;
+        state.nativeCaptionDirty = true;
+      }
     }
     let nativeCaption = findNativeCaption(cue, captionState);
     const now = performance.now();

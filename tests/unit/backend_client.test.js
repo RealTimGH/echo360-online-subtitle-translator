@@ -231,9 +231,91 @@ describe("formatJobError (via waitDirectJob)", () => {
         providerResults: 1,
         targetResults: 1,
         failed_cues: Array.from({ length: 60 }, (_, index) => index + 1),
+        failed_lines: Array.from({ length: 60 }, (_, index) => index * 3 + 4),
       },
     }, "translation", { sourceVtt, target: "ZH" });
     expect(result.failed_cues).toEqual(Array.from({ length: 60 }, (_, index) => index + 1));
+    expect(result.failed_lines).toEqual(Array.from({ length: 60 }, (_, index) => index * 3 + 4));
+  });
+
+  it("forwards exhaustive failed lines through direct job progress", async () => {
+    const onProgress = vi.fn();
+    let calls = 0;
+    runtimeSendMessage.mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.resolve({
+          ok: true,
+          data: {
+            status: "running",
+            progress: {
+              current: 51,
+              total: 61,
+              line: "[51/61] Translating",
+              failed_cues: Array.from({ length: 51 }, (_, index) => index + 1),
+              failed_lines: Array.from({ length: 51 }, (_, index) => index * 3 + 4),
+            },
+          },
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        data: {
+          status: "completed",
+          result: {
+            translated_vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n完成\n",
+            warnings: [],
+            cache_hit: false,
+            metrics: { total: 1, processed: 1, translated: 1, failed: 0, providerResults: 1, targetResults: 1 },
+          },
+          progress: { current: 61, total: 61 },
+        },
+      });
+    });
+
+    await client.waitDirectJob("job-1", { isActive: () => true, onProgress });
+    expect(onProgress).toHaveBeenCalledWith(
+      51,
+      61,
+      "[51/61] Translating",
+      expect.objectContaining({
+        failed_cues: Array.from({ length: 51 }, (_, index) => index + 1),
+        failed_lines: Array.from({ length: 51 }, (_, index) => index * 3 + 4),
+      }),
+    );
+  });
+
+  it("restores failed_cues and failed_lines when a direct job terminates with an error", async () => {
+    let thrown;
+    try {
+      await runDirectJobWith({
+        status: "failed",
+        error: "partial translation failed",
+        error_code: "NO_TRANSLATIONS",
+        failed_cues: [2, 7],
+        failed_lines: [7, 22],
+        progress: {
+          current: 7,
+          total: 7,
+          failed_cues: [1],
+          failed_lines: [4],
+        },
+        error_detail: {
+          code: "NO_TRANSLATIONS",
+          failed_cues: [1],
+          failed_lines: [4],
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({
+      code: "NO_TRANSLATIONS",
+      failed_cues: [2, 7],
+      failed_lines: [7, 22],
+      progress: expect.objectContaining({ failed_lines: [7, 22] }),
+    });
+    expect(thrown.metrics).toMatchObject({ failed_lines: [7, 22] });
   });
 
   it("does not accept a completed job with a header-only VTT as success", async () => {

@@ -43,7 +43,7 @@ Instructure Media 返回的 SRT 字幕（没有 `WEBVTT` 头、使用逗号毫�
 
 翻译期间仍可打开字幕设置和查看诊断信息；启动另一轮翻译等冲突操作会暂时禁用。
 
-设置页的「一键翻译时自动下载字幕并复制提示词」默认关闭。新安装和升级时，如果用户没有设置过该选项，一键按钮只启动字幕翻译，不自动下载 AI 翻译 JSON 材料或写入剪贴板；已明确开启的用户设置会保留。仍可在「AI 手动翻译」中按需导出。
+设置页的「一键翻译时自动下载字幕并复制提示词」默认关闭。新安装和升级时，如果用户没有设置过该选项，一键按钮只启动字幕翻译，不自动下载 AI 翻译 JSON 材料或写入剪贴板，浮窗也不显示快捷导入按钮；已明确开启的用户设置会保留。仍可在「AI 手动翻译」中按需导出。
 
 **限制：**
 
@@ -107,7 +107,7 @@ Instructure Media 返回的 SRT 字幕（没有 `WEBVTT` 头、使用逗号毫�
 - **整句合并翻译**：先按英文句末标点、缩写及时间轴边界，把连续字幕合为翻译单元，再发送到当前选择的服务（包括混合翻译与本地后端）。关闭时保持原有逐条/逐行翻译流程。已有字幕时切换会重新加载或翻译；正在翻译时会在当前任务结束后按新设置重跑。
 - **英文也显示合并整句**：只在整句翻译已开启、插件负责双语显示时生效。关闭时英文仍按原字幕逐条显示，中文显示对应组的完整译文；开启时英文也显示该组的原文。播放器自行显示英文或使用原生 CC 注入时此选项不可用。切换此选项不重新请求翻译。
 
-合并只连接原文，不补词、不纠错、不补标点。字幕块内部同时含上一句结尾和下一句开头时，会把两句分别交给服务翻译。长口语优先在有语法依据的分句处结束，不再一直累积到八条。中文不按字数强行拆分，同组字幕显示同一份完整译文；一条原字幕跨两个分组时，该条同时显示两份完整译文，以免猜测句内时间；原有时间点和静音间隙保留，Transcript 面板仍使用原字幕行对应译文。AI 手动导入/导出协议保持原样，该选项用于自动翻译服务流程。
+合并只连接原文，不补词、不纠错、不补标点。字幕块内部同时含上一句结尾和下一句开头时，会把两句分别交给服务翻译。长口语优先在有语法依据的分句处结束，不再一直累积到八条。中文不按字数强行拆分，同组字幕显示同一份完整译文；一条原字幕跨两个分组时，会按该条内部的英文字符比例切开显示时间，前后各只显示一句完整译文，译文本身仍不切割。过短的时间窗保持叠显示，以免字幕闪一下就消失。Transcript 面板仍使用原字幕行，并在该行保留各句译文。AI 手动导入/导出协议保持原样，该选项用于自动翻译服务流程。
 
 长停顿、说话人变化、音效标记及异常时间轴会阻止合并；无标点长段落采用条数、时长、字数上限兜底。录音开头或结尾缺失的半句无法自动补全。没有词级时间戳或语言模型时，规则也无法保证每次都得到严格的单个完整句子。规则、取舍、来源与验证方法见 [整句合并设计说明](docs/sentence-merge-translation.md)。
 
@@ -246,7 +246,7 @@ python scripts\smoke-backend.py --check-argos
 3. 点击 `加载已解压的扩展程序`。
 4. 选择当前仓库下的 `extension/` 目录。
 
-进入 Echo360 classroom 页面后，右下角会出现**分体收纳球**：点击大按钮会检查缓存并加载或启动默认翻译；只有在设置中开启「一键翻译时自动下载字幕并复制提示词」后，它才会同时复制 AI 提示词并下载完整 `.translate.json`。旁边的箭头打开滑出式面板，导入图标在字幕会话准备好后可读取 AI 返回的 `.translated.json` 或完整 `.vtt`。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。如需清除当前缓存并重新翻译，在面板中点击 `重新翻译`。
+进入 Echo360 classroom 页面后，右下角会出现**分体收纳球**：点击大按钮会检查缓存并加载或启动默认翻译；只有在设置中开启「一键翻译时自动下载字幕并复制提示词」后，它才会同时复制 AI 提示词并下载完整 `.translate.json`，浮窗左侧才会显示快捷导入按钮。旁边的箭头打开滑出式面板；导入图标仅在该选项开启且字幕会话准备好后，可读取 AI 返回的 `.translated.json` 或完整 `.vtt`。首次安装会显示一次性引导气泡。也可通过扩展图标弹窗（`popup.html`）或选项页（`options.html`）配置 provider 与 API Key（各 provider 的 Key 分别保存，切换 provider 时自动切换）。如需清除当前缓存并重新翻译，在面板中点击 `重新翻译`。
 
 ## 发布构建
 
@@ -363,7 +363,7 @@ Google Translate provider：
 - 该接口非官方，稳定性、可用性和翻译质量不保证
 - 如果重视字幕翻译质量和接口稳定性，建议改用官方 API provider（如 `azure`/`deepl`）或 AI provider，并填写自己的 API Key
 
-`google-web` 的直接扩展和 Python 路径默认使用共享 `6 RPS / 3 并发`；即使旧配置为 `rps=0`，也会应用这一安全基线，较低的显式 RPS 值仍会保留。每条字幕独立处理；零星 `HTTP 429` 会遵循 `Retry-After` 或带抖动的指数退避，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试，并自动拉起本地后端改用 Argos；在混合模式中则把失败分片转交给其余健康 provider。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`，部分结果不会写入缓存。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。调研依据：[Google 开发者社区关于该非官方端点的说明](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639)、[Google Cloud Translation 官方配额（仅作正式 API 对照）](https://docs.cloud.google.com/translate/quotas)。
+`google-web` 的直接扩展和 Python 路径默认使用共享 `6 RPS / 3 并发`；即使旧配置为 `rps=0`，也会应用这一安全基线，较低的显式 RPS 值仍会保留。每条字幕独立处理；零星 `HTTP 429` 会遵循 `Retry-After` 或带抖动的指数退避，但若 10 秒内累计 5 个 429 就立即熔断：停止新的 Google 请求和重试，并自动拉起本地后端改用 Argos；在混合模式中则把失败分片转交给其余健康 provider。Python 本地后端路径使用同一阈值，并保留已经成功的 Google 译文，只让 Argos 补齐未完成字幕。最终仍失败的字幕保留原文、列入 `failed_items`；可验证的部分结果会保存为本地补译进度。再次进入页面点击一键翻译，或在错误卡片点击“重试失败字幕”，会复用成功译文、只补失败字幕；面板“重新翻译”仍用于清除当前结果并整段重做。源字幕内容或翻译配置不匹配时不会复用部分进度，详见 [部分翻译补译与诊断](docs/partial-translation-resume.md)。扩展 Console 会打印有效并发/RPS、批次进度、熔断和备份摘要。该端点没有公开、稳定的官方 QPS 承诺，因此不要把正式 Google Cloud Translation 的配额直接套用到它。调研依据：[Google 开发者社区关于该非官方端点的说明](https://discuss.google.dev/t/translate-googleapis-com-translate-a/126639)、[Google Cloud Translation 官方配额（仅作正式 API 对照）](https://docs.cloud.google.com/translate/quotas)。
 
 混合路由的设计参考了成熟网关的加权分流、重试/故障转移和异常实例摘除模式，而不是把同一字幕重复发送给所有服务：[Envoy Gateway 负载均衡](https://gateway.envoyproxy.io/docs/concepts/load-balancing/)、[Envoy 异常检测](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier)、[Azure Circuit Breaker pattern](https://learn.microsoft.com/azure/architecture/patterns/circuit-breaker)、[Azure Bulkhead pattern](https://learn.microsoft.com/azure/architecture/patterns/bulkhead)。
 
@@ -436,7 +436,7 @@ export TRANSLATOR_TASK_TIMEOUT_SECONDS=480
 
 并发数、RPS、重试次数、timeout 这类只影响性能的参数不参与内容缓存键。
 
-扩展端只保留一个本地翻译字幕缓存。双语显示在前端渲染，因此切换双语显示不需要重新翻译。
+扩展端按 cacheKey 分槽保存多条翻译字幕，合并与未合并可以同时保留，没有固定条数上限。浏览器本地配额不足时才会丢掉较旧的槽；强制重新翻译只清当前槽。双语显示在前端渲染，因此切换双语显示不需要重新翻译。
 
 ## 说明
 

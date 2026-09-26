@@ -22,7 +22,10 @@
   //        reliable browser <track> renderer (useNativeSubtitles=true). Note
   //        the flag name is historical: true means "use browser track", false
   //        means "try native CC injection".
-  const PREFS_SCHEMA_VERSION = 3;
+  //   v4 – fresh installs default bilingual + sentence-merge options on.
+  //        Upgrades only adopt the new defaults for fields the user never
+  //        stored explicitly.
+  const PREFS_SCHEMA_VERSION = 4;
   // Display/render prefs (enabled, bilingual, size, useNativeSubtitles, ...)
   // are a personal, browser-wide habit - not something tied to one specific
   // lesson - so they are stored under a single fixed key rather than scoped
@@ -91,16 +94,16 @@
     const prefs = stored || {
       enabled: true,
       size: DEFAULT_SUBTITLE_SIZE,
-      bilingual: false,
+      bilingual: true,
       reverseOrder: false,
-      browserBilingual: false,
+      browserBilingual: true,
       browserReverseOrder: false,
       // Sentence merging changes the source cue grouping used for a
-      // translation request. Keep both sentence options opt-in on fresh
-      // installs; sentenceMergeEnglish is intentionally stored independently
-      // so a user's display choice survives while its prerequisites are off.
-      sentenceMergeEnabled: false,
-      sentenceMergeEnglish: false,
+      // translation request. Fresh installs default both options on;
+      // sentenceMergeEnglish is intentionally stored independently so a
+      // user's display choice survives while its prerequisites are off.
+      sentenceMergeEnabled: true,
+      sentenceMergeEnglish: true,
       // Transcript panel enhancement is an independent surface.  Keep it
       // opt-in on fresh installs; an explicit stored choice is preserved by
       // the normalization below so upgrades do not overwrite user settings.
@@ -112,14 +115,29 @@
       useNativeSubtitles: true,
       renderModeVersion: PREFS_SCHEMA_VERSION,
     };
-    if (prefs.renderModeVersion !== PREFS_SCHEMA_VERSION) {
+    const storedVersion = Number(prefs.renderModeVersion) || 0;
+    if (storedVersion < 3) {
       // One-shot migration off the v2 "native CC preferred" default onto the
       // reliable browser track. Users who want the Beta native look can
       // re-enable it in the settings popover after upgrading.
       prefs.useNativeSubtitles = true;
-      prefs.renderModeVersion = PREFS_SCHEMA_VERSION;
     } else {
       prefs.useNativeSubtitles = prefs.useNativeSubtitles === true;
+    }
+    if (stored && storedVersion < 4) {
+      if (!Object.prototype.hasOwnProperty.call(stored, "browserBilingual") &&
+        !Object.prototype.hasOwnProperty.call(stored, "bilingual")) {
+        prefs.browserBilingual = true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(stored, "sentenceMergeEnabled")) {
+        prefs.sentenceMergeEnabled = true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(stored, "sentenceMergeEnglish")) {
+        prefs.sentenceMergeEnglish = true;
+      }
+    }
+    if (storedVersion !== PREFS_SCHEMA_VERSION) {
+      prefs.renderModeVersion = PREFS_SCHEMA_VERSION;
     }
     prefs.browserBilingual = typeof prefs.browserBilingual === "boolean" ? prefs.browserBilingual : prefs.bilingual === true;
     prefs.browserReverseOrder = typeof prefs.browserReverseOrder === "boolean" ? prefs.browserReverseOrder : prefs.reverseOrder === true;
@@ -192,24 +210,150 @@
     return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  async function getCacheStore() {
-    const obj = await extensionApi.storage.local.get(CACHE_KEY);
-    return obj[CACHE_KEY] && typeof obj[CACHE_KEY] === "object" ? obj[CACHE_KEY] : null;
+  // Subtitle results are stored as a keyed map: one slot per cacheKey
+  // (source URL + translation config + sentence-merge version). Writes are
+  // serialized. There is no fixed entry cap; Chrome quota is the only bound.
+  const SUBTITLE_CACHE_SCHEMA = "subtitle-cache-v2";
+  const SUBTITLE_CACHE_TOUCH_INTERVAL_MS = 60_000;
+  let subtitleCacheMutation = Promise.resolve();
+
+  function enqueueSubtitleCacheMutation(operation) {
+    const next = subtitleCacheMutation.catch(() => {}).then(operation);
+    subtitleCacheMutation = next.catch(() => {});
+    return next;
   }
 
-  async function setCacheStore(entryOrNull) {
-    try {
-      await extensionApi.storage.local.set({ [CACHE_KEY]: entryOrNull || null });
-      return { ok: true };
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err || "缓存写入失败"));
-      error.code = error.code || "CACHE_WRITE_FAILED";
-      console.error("[echo360-translator][storage] subtitle cache write failed", ns.errorUtils?.serializeError?.(error, { phase: "cache" }) || {
-        code: error.code,
-        message: error.message,
-      });
-      return { ok: false, error };
+  function emptySubtitleCache() {
+    return { schema: SUBTITLE_CACHE_SCHEMA, entries: {} };
+  }
+
+  function isLegacySubtitleCacheEntry(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && value.schema !== SUBTITLE_CACHE_SCHEMA
+      && typeof value.translatedVtt === "string"
+      && typeof value.cacheKey === "string");
+  }
+
+  function normalizeSubtitleCache(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptySubtitleCache();
+    if (raw.schema === SUBTITLE_CACHE_SCHEMA && raw.entries && typeof raw.entries === "object" && !Array.isArray(raw.entries)) {
+      return { schema: SUBTITLE_CACHE_SCHEMA, entries: { ...raw.entries } };
     }
+    if (isLegacySubtitleCacheEntry(raw)) {
+      return { schema: SUBTITLE_CACHE_SCHEMA, entries: { [raw.cacheKey]: { ...raw } } };
+    }
+    return emptySubtitleCache();
+  }
+
+  function sanitizeSubtitleCache(store) {
+    const entries = {};
+    for (const [key, entry] of Object.entries(store?.entries || {})) {
+      if (entry && typeof entry === "object" && typeof entry.translatedVtt === "string") {
+        entries[key] = entry;
+      }
+    }
+    return { schema: SUBTITLE_CACHE_SCHEMA, entries };
+  }
+
+  function oldestSubtitleCacheKey(store, keepKey) {
+    let oldestKey = "";
+    let oldestAt = Infinity;
+    for (const [key, entry] of Object.entries(store?.entries || {})) {
+      if (key === keepKey) continue;
+      const at = Number(entry?.usedAt || entry?.createdAt || 0);
+      if (!oldestKey || at < oldestAt || (at === oldestAt && key < oldestKey)) {
+        oldestKey = key;
+        oldestAt = at;
+      }
+    }
+    return oldestKey;
+  }
+
+  async function readSubtitleCache() {
+    const obj = await extensionApi.storage.local.get(CACHE_KEY);
+    return normalizeSubtitleCache(obj[CACHE_KEY]);
+  }
+
+  async function persistSubtitleCache(store, keepKey = "") {
+    const next = sanitizeSubtitleCache(store);
+    while (true) {
+      try {
+        await extensionApi.storage.local.set({ [CACHE_KEY]: next });
+        return;
+      } catch (err) {
+        const dropKey = oldestSubtitleCacheKey(next, keepKey);
+        if (!dropKey) throw err;
+        delete next.entries[dropKey];
+      }
+    }
+  }
+
+  function cacheWriteError(err) {
+    const error = err instanceof Error ? err : new Error(String(err || "缓存写入失败"));
+    error.code = error.code || "CACHE_WRITE_FAILED";
+    console.error("[echo360-translator][storage] subtitle cache write failed", ns.errorUtils?.serializeError?.(error, { phase: "cache" }) || {
+      code: error.code,
+      message: error.message,
+    });
+    return { ok: false, error };
+  }
+
+  async function getCacheStore(cacheKey) {
+    const key = String(cacheKey || "").trim();
+    if (!key) return null;
+    return enqueueSubtitleCacheMutation(async () => {
+      const store = await readSubtitleCache();
+      const entry = store.entries[key];
+      if (!entry || typeof entry !== "object" || typeof entry.translatedVtt !== "string") return null;
+      const now = Date.now();
+      if (now - Number(entry.usedAt || entry.createdAt || 0) >= SUBTITLE_CACHE_TOUCH_INTERVAL_MS) {
+        store.entries[key] = { ...entry, usedAt: now };
+        try {
+          await persistSubtitleCache(store);
+        } catch {
+          // A failed recency write must not hide a valid cache hit.
+        }
+      }
+      return store.entries[key];
+    });
+  }
+
+  async function setCacheStore(entryOrNull, cacheKey = "") {
+    return enqueueSubtitleCacheMutation(async () => {
+      try {
+        const deleteKey = String(cacheKey || "").trim();
+        if (entryOrNull == null) {
+          if (!deleteKey) {
+            await persistSubtitleCache(emptySubtitleCache());
+            return { ok: true };
+          }
+          const store = await readSubtitleCache();
+          if (!Object.prototype.hasOwnProperty.call(store.entries, deleteKey)) return { ok: true };
+          delete store.entries[deleteKey];
+          await persistSubtitleCache(store);
+          return { ok: true };
+        }
+        if (!entryOrNull || typeof entryOrNull !== "object" || Array.isArray(entryOrNull)) {
+          return cacheWriteError(Object.assign(new Error("字幕缓存条目无效"), { code: "CACHE_WRITE_FAILED" }));
+        }
+        const key = String(entryOrNull.cacheKey || deleteKey).trim();
+        if (!key || typeof entryOrNull.translatedVtt !== "string") {
+          return cacheWriteError(Object.assign(new Error("字幕缓存缺少 cacheKey 或译文"), { code: "CACHE_WRITE_FAILED" }));
+        }
+        const now = Date.now();
+        const store = await readSubtitleCache();
+        store.entries[key] = {
+          ...entryOrNull,
+          cacheKey: key,
+          createdAt: Number(entryOrNull.createdAt) || now,
+          usedAt: now,
+        };
+        await persistSubtitleCache(store, key);
+        return { ok: true };
+      } catch (err) {
+        return cacheWriteError(err);
+      }
+    });
   }
 
   function buildConfigSignature(cfg) {

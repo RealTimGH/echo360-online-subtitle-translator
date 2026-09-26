@@ -529,11 +529,20 @@ def exception_problem(exc: Exception, *, phase: str = "backend", instance: str =
         extensions = {
             key: raw_detail.get(key)
             for key in (
-                "metrics", "failure_codes", "failed_items", "warnings", "retryable",
+                "metrics", "failure_codes", "failed_items", "failed_cues", "failed_lines", "warnings", "retryable",
                 "details", "provider", "target", "sourceMeta", "sourceDiagnostics",
                 "boundary_code",
             )
         }
+        # Translation failures often pass the complete diagnostics inside the
+        # metrics extension while the outer problem only carries the sampled
+        # failed_items list.  Keep the complete cue/line coordinates available
+        # to async callers when wrapping that problem for transport.
+        raw_metrics = raw_detail.get("metrics")
+        if isinstance(raw_metrics, dict):
+            for key in ("failed_cues", "failed_lines"):
+                if extensions.get(key) is None and isinstance(raw_metrics.get(key), list):
+                    extensions[key] = raw_metrics[key]
         if upstream_statuses:
             extensions["upstream_status"] = upstream_statuses[0]
         return problem_payload(
@@ -1139,6 +1148,13 @@ def is_target_neutral_text(source_value: object, translated_value: object, targe
         re.fullmatch(r"(?:(?:https?|ftp)://|www\.)\S+", source, re.IGNORECASE)
         or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
     ):
+        return True
+    # A lone punctuated initial such as ``p.`` is a legitimate caption token,
+    # but the period is essential to this exception.  Requiring the
+    # punctuation keeps ordinary short English words (``p``, ``a``, ``ok``)
+    # on the strict NO_TARGET_TRANSLATION path.  A/I remain words even with a
+    # dot, matching the extension's target-coverage contract.
+    if re.fullmatch(r"[B-HJ-Zb-hj-z]\.", source):
         return True
     # Uppercase abbreviations, course codes, file names and software tokens
     # are commonly preserved by subtitle translation. Exclude common English
@@ -1787,6 +1803,11 @@ def run_translation(
                     "providerResults": total_lines,
                     "target_results": total_lines if target_code in CJK_TARGET_CODES else None,
                     "targetResults": total_lines if target_code in CJK_TARGET_CODES else None,
+                    "failed_items": [],
+                    "failed_cues": [],
+                    "failed_lines": [],
+                    "failure_codes": {},
+                    "failureCodes": {},
                     "provider": provider_name,
                 }
                 try:
@@ -2200,6 +2221,7 @@ def run_translation(
             "targetResults": target_results,
             "failed_items": failed_items,
             "failed_cues": metrics.get("failed_cues") if isinstance(metrics.get("failed_cues"), list) else [],
+            "failed_lines": metrics.get("failed_lines") if isinstance(metrics.get("failed_lines"), list) else [],
             "failure_codes": failure_codes,
             "failureCodes": failure_codes,
         })
@@ -2419,7 +2441,14 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             if not job:
                 return
             job["status"] = "running"
-            job["progress"] = {"current": current, "total": total, "line": line}
+            job["progress"] = {
+                "current": current,
+                "total": total,
+                "line": line,
+                "failed_items": job.get("failed_items", []),
+                "failed_cues": job.get("failed_cues", []),
+                "failed_lines": job.get("failed_lines", []),
+            }
             if partial_vtt:
                 if partial_vtt != job.get("partial_vtt"):
                     job["partial_vtt"] = partial_vtt
@@ -2458,12 +2487,23 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
                 "cache_hit": cache_hit,
                 "failed_items": metrics.get("failed_items") or [],
                 "failed_cues": metrics.get("failed_cues") or [],
+                "failed_lines": metrics.get("failed_lines") or [],
                 "failure_codes": metrics.get("failureCodes") or metrics.get("failure_codes") or {},
             }
             job["metrics"] = metrics
             job["warnings"] = warnings
             job["failed_items"] = metrics.get("failed_items") or []
             job["failed_cues"] = metrics.get("failed_cues") or []
+            job["failed_lines"] = metrics.get("failed_lines") or []
+            existing_progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+            job["progress"] = {
+                **existing_progress,
+                "current": metrics.get("processed", existing_progress.get("current", 0)),
+                "total": metrics.get("total", existing_progress.get("total", 0)),
+                "failed_items": job["failed_items"],
+                "failed_cues": job["failed_cues"],
+                "failed_lines": job["failed_lines"],
+            }
             job["failure_codes"] = metrics.get("failureCodes") or {}
             job["updated_at"] = int(time.time())
             trim_completed_job_memory_locked(protected_job_id=job_id)
@@ -2494,6 +2534,14 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             job["metrics"] = problem.get("metrics") or job.get("metrics")
             job["failure_codes"] = problem.get("failure_codes") or job.get("failure_codes")
             job["failed_items"] = problem.get("failed_items") or job.get("failed_items", [])
+            job["failed_cues"] = problem.get("failed_cues") or job.get("failed_cues", [])
+            job["failed_lines"] = problem.get("failed_lines") or job.get("failed_lines", [])
+            job["progress"] = {
+                **(job.get("progress") if isinstance(job.get("progress"), dict) else {}),
+                "failed_items": job["failed_items"],
+                "failed_cues": job["failed_cues"],
+                "failed_lines": job["failed_lines"],
+            }
             job["warnings"] = problem.get("warnings") or job.get("warnings", [])
             job["updated_at"] = int(time.time())
             trim_completed_job_memory_locked(protected_job_id=job_id)
@@ -2541,6 +2589,9 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
                 "total": initial_total,
                 "line": "正在准备本地翻译…" if initial_total > 0 else "",
                 "stage": "preparing",
+                "failed_items": [],
+                "failed_cues": [],
+                "failed_lines": [],
             },
             "partial_vtt": "",
             "partial_revision": 0,
@@ -2551,6 +2602,8 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
             "metrics": None,
             "failure_codes": {},
             "failed_items": [],
+            "failed_cues": [],
+            "failed_lines": [],
             "warnings": [],
             "error_detail": None,
             "created_at": int(time.time()),

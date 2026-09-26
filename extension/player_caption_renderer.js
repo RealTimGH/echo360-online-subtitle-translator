@@ -3,10 +3,11 @@
 
   const OVERLAY_ATTR = "data-echo360-instructure-caption";
   const LINE_ATTR = "data-echo360-instructure-caption-line";
-  const SIZE_MAP = { small: "0.88em", medium: "1em", large: "1.14em" };
+  const SIZE_MAP = { small: "0.94em", medium: "1.06em", large: "1.2em" };
   const DEFAULT_BOTTOM_PADDING = "calc(var(--media-controls-height, 48px) + 2%)";
   const NATIVE_CAPTION_GAP_PX = 8;
   const GEOMETRY_RECHECK_MS = 200;
+  const IDENTICAL_CUE_HOLD_S = 1.5;
 
   let state = null;
 
@@ -73,6 +74,20 @@
     return ns.hostSupport?.getPlayer?.(video) ||
       video?.closest?.("[data-media-player]") ||
       null;
+  }
+
+  function sameOverlayText(left, right) {
+    return !!left && !!right && left.original === right.original && left.translated === right.translated;
+  }
+
+  function stickyIdenticalCueIndex(time, previousIndex) {
+    if (previousIndex < 0) return -1;
+    const previous = state.cues[previousIndex];
+    const next = state.cues[previousIndex + 1];
+    if (!previous || !next || !sameOverlayText(previous, next)) return -1;
+    if (time < previous.end || time >= next.start) return -1;
+    if (next.start - previous.end > IDENTICAL_CUE_HOLD_S) return -1;
+    return previousIndex;
   }
 
   function findCueIndex(time) {
@@ -283,7 +298,10 @@
       return;
     }
     if (!state.video?.isConnected) { unmount(); return; }
-    const index = findCueIndex(Number(state.video.currentTime || 0));
+    const index = (() => {
+      const found = findCueIndex(Number(state.video.currentTime || 0));
+      return found >= 0 ? found : stickyIdenticalCueIndex(Number(state.video.currentTime || 0), state.currentCueIndex);
+    })();
     const now = performance.now();
     if (index === state.currentCueIndex && !state.geometryDirty &&
       state.overlay?.isConnected && state.player?.isConnected &&

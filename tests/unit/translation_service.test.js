@@ -339,6 +339,138 @@ describe("buildTranslatePayload", () => {
 });
 
 describe("translateWithConfig (store build)", () => {
+  function checkpointSource() {
+    return [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "Hello 1", "",
+      "00:00:01.000 --> 00:00:02.000", "Hello 2", "",
+      "00:00:02.000 --> 00:00:03.000", "Hello 3", "",
+    ].join("\n");
+  }
+
+  it("builds a serializable checkpoint and maps physical failure lines to cues", () => {
+    const source = [
+      "WEBVTT", "",
+      "00:00:00.000 --> 00:00:01.000", "Hello 1", "",
+      "00:00:01.000 --> 00:00:02.000", "First line", "Second line", "",
+      "00:00:02.000 --> 00:00:03.000", "Hello 3", "",
+    ].join("\n");
+    const translated = source.replace("Hello 1", "中文1").replace("Hello 3", "中文3");
+    const result = {
+      translated_vtt: translated,
+      failed_items: [
+        { cue: 2, line: 7, code: "NO_TARGET_TRANSLATION", message: "no target" },
+        { cue: 2, line: 8, code: "NO_TARGET_TRANSLATION", message: "no target" },
+      ],
+      failed_cues: [2],
+      failure_codes: { NO_TARGET_TRANSLATION: 2 },
+      metrics: { total: 4, processed: 4, translated: 2, failed: 2, providerResults: 2, targetResults: 2 },
+    };
+    const checkpoint = svc.buildTranslationCheckpoint(result, source);
+    expect(checkpoint).toMatchObject({ sourceVtt: source, translatedVtt: translated, version: 1 });
+    expect(JSON.parse(JSON.stringify(checkpoint))).toEqual(checkpoint);
+    const validated = svc.validateTranslationCheckpoint(checkpoint, source, { target: "ZH", provider: "google-web" });
+    expect(validated.failedCueIndexes).toEqual([1]);
+    expect(svc.validateTranslationCheckpoint(checkpoint, `${source}\n`, { target: "ZH" })).toBeNull();
+  });
+
+  it("resumes a partial translation by sending only the failed cue and merges it back", async () => {
+    const source = checkpointSource();
+    const partial = source.replace("Hello 1", "中文1").replace("Hello 3", "中文3");
+    const checkpoint = svc.buildTranslationCheckpoint({
+      translated_vtt: partial,
+      warnings: ["old failed cue warning"],
+      failed_items: [{ cue: 2, line: 7, code: "NO_TARGET_TRANSLATION", message: "no target" }],
+      failed_cues: [2],
+      failure_codes: { NO_TARGET_TRANSLATION: 1 },
+      metrics: { total: 3, processed: 3, translated: 2, failed: 1, providerResults: 2, targetResults: 2 },
+    }, source);
+    backendClientMock.createDirectTranslateJob.mockResolvedValue({ job_id: "resume-job" });
+    backendClientMock.waitDirectJob.mockImplementation(async (_jobId, options = {}) => ({
+      translated_vtt: options.sourceVtt.replace("Hello 2", "中文2"),
+      failed_items: [],
+      failed_cues: [],
+      failure_codes: {},
+      metrics: { total: 1, processed: 1, translated: 1, failed: 0, providerResults: 1, targetResults: 1 },
+    }));
+
+    const result = await svc.translateWithConfig(
+      { provider: "google-web" },
+      "",
+      { provider: "google-web", target: "ZH", vtt_text: source },
+      { resumeCheckpoint: checkpoint }
+    );
+
+    expect(backendClientMock.createDirectTranslateJob).toHaveBeenCalledTimes(1);
+    const retryPayload = backendClientMock.createDirectTranslateJob.mock.calls[0][0];
+    expect(retryPayload.vtt_text).toContain("Hello 2");
+    expect(retryPayload.vtt_text).not.toContain("Hello 1");
+    expect(retryPayload.vtt_text).not.toContain("Hello 3");
+    expect(result.translated_vtt).toContain("中文1");
+    expect(result.translated_vtt).toContain("中文2");
+    expect(result.translated_vtt).toContain("中文3");
+    expect(result.failed_cues).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(result.metrics).toMatchObject({ total: 3, translated: 3, failed: 0, providerResults: 3, targetResults: 3 });
+  });
+
+  it("keeps the previous successful cues when a resumed retry fails all of its cues", async () => {
+    const source = checkpointSource();
+    const partial = source.replace("Hello 1", "中文1").replace("Hello 3", "中文3");
+    const checkpoint = svc.buildTranslationCheckpoint({
+      translated_vtt: partial,
+      failed_items: [{ cue: 2, line: 7, code: "NO_TARGET_TRANSLATION", message: "no target" }],
+      failed_cues: [2],
+      failure_codes: { NO_TARGET_TRANSLATION: 1 },
+      metrics: { total: 3, processed: 3, translated: 2, failed: 1, providerResults: 2, targetResults: 2 },
+    }, source);
+    backendClientMock.createDirectTranslateJob.mockResolvedValue({ job_id: "resume-fail-job" });
+    backendClientMock.waitDirectJob.mockRejectedValue(Object.assign(new Error("upstream unavailable"), {
+      code: "HTTP_503",
+      status: 503,
+      metrics: { total: 1, processed: 1, translated: 0, failed: 1, providerResults: 0, targetResults: 0 },
+      failed_items: [{ cue: 1, line: 4, code: "HTTP_503", status: 503, message: "upstream unavailable" }],
+      failed_cues: [1],
+      failure_codes: { HTTP_503: 1 },
+    }));
+
+    const result = await svc.translateWithConfig(
+      { provider: "google-web" },
+      "",
+      { provider: "google-web", target: "ZH", vtt_text: source },
+      { resumeCheckpoint: checkpoint }
+    );
+
+    expect(result.translated_vtt).toContain("中文1");
+    expect(result.translated_vtt).toContain("中文3");
+    expect(result.translated_vtt).toContain("Hello 2");
+    expect(result.failed_cues).toEqual([2]);
+    expect(result.failed_items[0]).toMatchObject({ cue: 2, code: "HTTP_503" });
+    expect(result.metrics).toMatchObject({ total: 3, translated: 2, failed: 1, providerResults: 2, targetResults: 2 });
+  });
+
+  it("falls back to a full translation when a checkpoint source does not match", async () => {
+    const source = checkpointSource();
+    const stale = svc.buildTranslationCheckpoint({
+      translated_vtt: source.replace("Hello 1", "中文1"),
+      failed_items: [{ cue: 2, line: 7, code: "NO_TARGET_TRANSLATION", message: "no target" }],
+      failed_cues: [2],
+      failure_codes: { NO_TARGET_TRANSLATION: 1 },
+      metrics: { total: 3, processed: 3, translated: 2, failed: 1, providerResults: 2, targetResults: 2 },
+    }, source);
+    backendClientMock.createDirectTranslateJob.mockResolvedValue({ job_id: "full-job" });
+    backendClientMock.waitDirectJob.mockResolvedValue({ translated_vtt: source, metrics: {} });
+
+    await svc.translateWithConfig(
+      { provider: "google-web" },
+      "",
+      { provider: "google-web", target: "ZH", vtt_text: `${source}\n` },
+      { resumeCheckpoint: stale }
+    );
+
+    expect(backendClientMock.createDirectTranslateJob.mock.calls[0][0].vtt_text).toBe(`${source}\n`);
+  });
+
   it("calls translateInExtension and never hits backend proxy", async () => {
     backendClientMock.createDirectTranslateJob.mockResolvedValue({ job_id: "job-42" });
     backendClientMock.waitDirectJob.mockResolvedValue({
@@ -985,15 +1117,16 @@ describe("buildCacheKey", () => {
 });
 
 describe("sentence merging cache identity", () => {
-  it("separates merged sources by mode/version/content but ignores English display", async () => {
+  it("separates merged sources by mode and version, not by grouped VTT bytes", async () => {
     const cfg = { provider: "google-web", model: "" };
     const raw = await svc.buildCacheKey(cfg, "same-url", "original");
     const merged = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true });
     const changed = await svc.buildCacheKey(cfg, "same-url", "changed content", { sentenceMergeEnabled: true });
     const english = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true, sentenceMergeEnglish: true });
     expect(merged.cacheKey).not.toBe(raw.cacheKey);
-    expect(merged.configSig).toContain("sentence-merge-v2:");
-    expect(changed.cacheKey).not.toBe(merged.cacheKey);
+    expect(merged.configSig).toMatch(/::sentence-merge-v2$/);
+    expect(changed.cacheKey).toBe(merged.cacheKey);
     expect(english.cacheKey).toBe(merged.cacheKey);
+    expect(window.Echo360Translator.storage.sha256Text).not.toHaveBeenCalled();
   });
 });

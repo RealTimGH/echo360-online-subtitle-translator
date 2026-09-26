@@ -226,6 +226,28 @@ function deriveFailureCodes(failedItems) {
   }, {});
 }
 
+function normalizeFailedLocations(...sources) {
+  const locations = [];
+  const seen = new Set();
+  for (const source of sources) {
+    if (!Array.isArray(source)) continue;
+    for (const value of source) {
+      const line = Number(value);
+      if (!Number.isSafeInteger(line) || line <= 0 || seen.has(line)) continue;
+      seen.add(line);
+      locations.push(line);
+    }
+  }
+  return locations;
+}
+
+function selectFailedLocations(...sources) {
+  for (const source of sources) {
+    if (Array.isArray(source)) return normalizeFailedLocations(source);
+  }
+  return [];
+}
+
 function normalizeFailureCodes(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const normalized = {};
@@ -1017,6 +1039,8 @@ function createDirectJob(payload) {
       total: initialTotal,
       line: initialTotal > 0 ? "正在准备翻译…" : "",
       stage: "preparing",
+      failed_cues: [],
+      failed_lines: [],
     },
     partial_vtt: "",
     partial_revision: 0,
@@ -1028,6 +1052,8 @@ function createDirectJob(payload) {
     failure_codes: null,
     warnings: [],
     failed_items: [],
+    failed_cues: [],
+    failed_lines: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -1110,6 +1136,8 @@ function createDirectJob(payload) {
             failure_codes: {},
             failureCodes: {},
             failed_items: [],
+            failed_cues: [],
+            failed_lines: [],
           };
           const cachedWarnings = cached.cache_warning
             ? [`[${cached.cache_warning.code}] ${cached.cache_warning.message}`]
@@ -1120,6 +1148,8 @@ function createDirectJob(payload) {
             failed_items: [],
             failure_codes: {},
             failureCodes: {},
+            failed_cues: [],
+            failed_lines: [],
             provider: cachedMetrics.provider,
             target: cachedTarget,
             metrics: cachedMetrics,
@@ -1129,6 +1159,8 @@ function createDirectJob(payload) {
           job.warnings = cachedWarnings;
           job.failure_codes = {};
           job.failed_items = [];
+          job.failed_cues = [];
+          job.failed_lines = [];
           job.partial_vtt = "";
           job.status = "completed";
           job.updatedAt = Date.now();
@@ -1141,6 +1173,14 @@ function createDirectJob(payload) {
         onProgress: (current, total, line = "", details = {}) => {
           job.status = "running";
           job.progress = { current, total, line, ...details };
+          job.progress.failed_cues = normalizeFailedLocations(
+            details.failed_cues,
+            details.failedCues,
+          );
+          job.progress.failed_lines = normalizeFailedLocations(
+            details.failed_lines,
+            details.failedLines,
+          );
           job.metrics = details;
           job.updatedAt = Date.now();
         },
@@ -1157,7 +1197,12 @@ function createDirectJob(payload) {
             translated: Number(meta.translated || 0),
             failed: Number(meta.failed || 0),
             failed_items: Array.isArray(meta.failed_items) ? meta.failed_items : (job.progress?.failed_items || []),
-            failed_cues: Array.isArray(meta.failed_cues) ? meta.failed_cues : (job.progress?.failed_cues || []),
+            failed_cues: Array.isArray(meta.failed_cues)
+              ? normalizeFailedLocations(meta.failed_cues)
+              : (Array.isArray(meta.failedCues) ? normalizeFailedLocations(meta.failedCues) : (job.progress?.failed_cues || [])),
+            failed_lines: Array.isArray(meta.failed_lines)
+              ? normalizeFailedLocations(meta.failed_lines)
+              : (Array.isArray(meta.failedLines) ? normalizeFailedLocations(meta.failedLines) : (job.progress?.failed_lines || [])),
             ...(meta.metrics || {}),
           };
           job.metrics = meta.metrics || job.metrics;
@@ -1173,7 +1218,20 @@ function createDirectJob(payload) {
       job.metrics = result.metrics || null;
       job.warnings = combinedWarnings;
       job.failed_items = Array.isArray(result.failed_items) ? result.failed_items : [];
-      job.failed_cues = Array.isArray(result.failed_cues) ? result.failed_cues : [];
+      job.failed_cues = selectFailedLocations(
+        result.failed_cues,
+        result.failedCues,
+        result.metrics?.failed_cues,
+        result.metrics?.failedCues,
+      );
+      job.failed_lines = selectFailedLocations(
+        result.failed_lines,
+        result.failedLines,
+        result.metrics?.failed_lines,
+        result.metrics?.failedLines,
+      );
+      job.result.failed_cues = job.failed_cues;
+      job.result.failed_lines = job.failed_lines;
       job.failure_codes = result.failure_codes || result.failureCodes || result.metrics?.failure_codes || result.metrics?.failureCodes || {};
       job.status = "completed";
       job.updatedAt = Date.now();
@@ -1235,6 +1293,24 @@ function createDirectJob(payload) {
           : "翻译任务失败");
       job.failure_codes = errorDetail.failure_codes || err?.failure_codes || job.metrics?.failureCodes || null;
       job.failed_items = Array.isArray(err?.failed_items) ? err.failed_items : job.failed_items;
+      job.failed_cues = selectFailedLocations(
+        err?.failed_cues,
+        err?.failedCues,
+        err?.metrics?.failed_cues,
+        err?.metrics?.failedCues,
+        job.progress?.failed_cues,
+        job.failed_cues,
+      );
+      job.failed_lines = selectFailedLocations(
+        err?.failed_lines,
+        err?.failedLines,
+        err?.metrics?.failed_lines,
+        err?.metrics?.failedLines,
+        job.progress?.failed_lines,
+        job.failed_lines,
+      );
+      errorDetail.failed_cues = job.failed_cues;
+      errorDetail.failed_lines = job.failed_lines;
       job.warnings = Array.isArray(err?.warnings) ? err.warnings : job.warnings;
       job.error_detail = {
         ...errorDetail,
@@ -1243,6 +1319,11 @@ function createDirectJob(payload) {
         provider: job.provider,
         target: job.target,
         phase: errorDetail.phase || err?.phase || "translation",
+      };
+      job.progress = {
+        ...(job.progress || {}),
+        failed_cues: job.failed_cues,
+        failed_lines: job.failed_lines,
       };
       if (err?.partial_vtt && err.partial_vtt !== job.partial_vtt) {
         job.partial_vtt = err.partial_vtt;

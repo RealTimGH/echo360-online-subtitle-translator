@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { loadUiModules, makeFullNs } from "../helpers/load-module.js";
 
-function setupUi(initialPrefs) {
+function setupUi(initialPrefs, config = { target: "ZH" }) {
   Object.defineProperty(window, "location", {
     value: { hostname: "echo360.org", pathname: "/lesson/test-id" },
     configurable: true,
@@ -14,13 +14,18 @@ function setupUi(initialPrefs) {
   window.Echo360Translator = makeFullNs({
     storage: {
       getPrefs: vi.fn(async () => initialPrefs),
-      getConfig: vi.fn(async () => ({ target: "ZH" })),
+      getConfig: vi.fn(async () => config),
       getOnboardingSeen: vi.fn(async () => false),
       setOnboardingSeen: vi.fn(async () => {}),
     },
   });
   loadUiModules();
   window.Echo360Translator.ui.ensurePanel({ onPrefsChanged: vi.fn() });
+}
+
+async function flushUiConfig() {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 async function openSettings() {
@@ -181,19 +186,24 @@ describe("manual AI workflow controls", () => {
       browserReverseOrder: false,
       useNativeSubtitles: true,
       size: "medium",
-    });
+    }, { target: "ZH", quickTranslateAutoExport: true });
     const quick = vi.fn(async () => {});
     const importResult = vi.fn(async () => true);
     window.Echo360Translator.ui.ensurePanel({ onQuickTranslate: quick, onManualImport: importResult });
+    await flushUiConfig();
 
     const primary = document.getElementById("echo360-translator-ball");
     const disclosure = document.getElementById("echo360-translator-ball-panel");
     const quickImport = document.getElementById("echo360-translator-ball-import");
+    const secondary = document.querySelector(".echo360-ball-secondary");
     expect(primary.getAttribute("aria-label")).toContain("一键加载翻译字幕");
     expect(disclosure.querySelector('svg[data-icon="controls"]')).not.toBeNull();
     expect(quickImport.querySelector('svg[data-icon="import"]')).not.toBeNull();
     expect(quickImport.querySelector("rect")).not.toBeNull();
     expect(disclosure.getAttribute("aria-controls")).toBe("echo360-translator-panel");
+    expect(quickImport.hidden).toBe(false);
+    expect(quickImport.getAttribute("aria-hidden")).toBe("false");
+    expect(secondary.classList.contains("echo360-ball-quick-import-hidden")).toBe(false);
     expect(quickImport.disabled).toBe(true);
 
     primary.click();
@@ -220,6 +230,55 @@ describe("manual AI workflow controls", () => {
     expect(document.activeElement.textContent).toBe("从文件导入");
   });
 
+  it("hides the dock quick-import button until one-click AI export is enabled", async () => {
+    setupUi({
+      enabled: true,
+      bilingual: false,
+      reverseOrder: false,
+      browserBilingual: false,
+      browserReverseOrder: false,
+      useNativeSubtitles: true,
+      size: "medium",
+    });
+    await flushUiConfig();
+
+    const quickImport = document.getElementById("echo360-translator-ball-import");
+    const secondary = document.querySelector(".echo360-ball-secondary");
+    expect(quickImport.hidden).toBe(true);
+    expect(quickImport.getAttribute("aria-hidden")).toBe("true");
+    expect(quickImport.tabIndex).toBe(-1);
+    expect(secondary.classList.contains("echo360-ball-quick-import-hidden")).toBe(true);
+    expect(document.getElementById("echo360-ui-styles").textContent)
+      .toContain(".echo360-ball-secondary.echo360-ball-quick-import-hidden {\n        height: 36px;");
+    expect(document.getElementById("echo360-ui-styles").textContent)
+      .toContain(".echo360-ball-secondary.echo360-ball-quick-import-hidden #echo360-translator-ball-import");
+
+    window.Echo360Translator.ui.setQuickImportVisible(true);
+    expect(quickImport.hidden).toBe(false);
+    expect(quickImport.getAttribute("aria-hidden")).toBe("false");
+    expect(quickImport.hasAttribute("tabindex")).toBe(false);
+    expect(secondary.classList.contains("echo360-ball-quick-import-hidden")).toBe(false);
+
+    window.Echo360Translator.ui.setQuickImportVisible(false);
+    expect(quickImport.hidden).toBe(true);
+    expect(secondary.classList.contains("echo360-ball-quick-import-hidden")).toBe(true);
+  });
+
+  it("dims the Echo360 dock only after translation has started", () => {
+    setupUi({ enabled: true, size: "medium" });
+    const root = document.getElementById("echo360-ui-root");
+    expect(root.dataset.echo360Host).toBe("echo360");
+    expect(root.classList.contains("echo360-idle-dim-enabled")).toBe(false);
+    expect(document.getElementById("echo360-ui-styles").textContent)
+      .toContain('[data-echo360-host="echo360"].echo360-idle-dim-enabled');
+
+    window.Echo360Translator.ui.setIdleDimEnabled(true);
+    expect(root.classList.contains("echo360-idle-dim-enabled")).toBe(true);
+
+    window.Echo360Translator.ui.setIdleDimEnabled(false);
+    expect(root.classList.contains("echo360-idle-dim-enabled")).toBe(false);
+  });
+
   it("gives cache hits their own blue result state and replays the ring", () => {
     setupUi({ enabled: true, size: "medium" });
     const ball = document.getElementById("echo360-translator-ball");
@@ -234,6 +293,26 @@ describe("manual AI workflow controls", () => {
     expect(group.classList.contains("echo360-ball-result-ring")).toBe(true);
     expect(document.getElementById("echo360-status-text").classList.contains("echo360-status-cache")).toBe(true);
     expect(ball.title).toBe("命中本地缓存");
+
+    window.Echo360Translator.ui.setStatusText("强制重新翻译...", "info");
+    expect(group.dataset.kind).toBe("info");
+    expect(group.classList.contains("echo360-ball-result-ring")).toBe(false);
+  });
+
+  it("dims the Echo360 dock after translation even with a success ring", () => {
+    setupUi({ enabled: true, size: "medium" });
+    const root = document.getElementById("echo360-ui-root");
+    const group = document.getElementById("echo360-translator-ball-group");
+    const styles = document.getElementById("echo360-ui-styles").textContent;
+
+    window.Echo360Translator.ui.setIdleDimEnabled(true);
+    window.Echo360Translator.ui.setStatusText("翻译完成", "success");
+    expect(group.classList.contains("echo360-ball-result-ring")).toBe(true);
+    expect(styles).not.toContain(":not(.echo360-ball-result-ring)");
+    expect(styles).toContain(
+      '[data-echo360-host="echo360"].echo360-idle-dim-enabled #echo360-translator-ball-group:not(:hover)'
+    );
+    expect(root.classList.contains("echo360-idle-dim-enabled")).toBe(true);
   });
 
   it("raises the floating surfaces in an Instructure Media frame", () => {
@@ -269,6 +348,10 @@ describe("manual AI workflow controls", () => {
     expect(document.getElementById("echo360-translator-panel")).not.toBeNull();
     expect(document.getElementById("echo360-ui-styles").textContent)
       .toContain("#echo360-ui-root.echo360-media-anchored #echo360-translator-ball-group");
+    expect(document.getElementById("echo360-ui-styles").textContent)
+      .not.toContain('[data-echo360-host="instructure-media"].echo360-idle-dim-enabled');
+    window.Echo360Translator.ui.setIdleDimEnabled(true);
+    expect(root.classList.contains("echo360-idle-dim-enabled")).toBe(false);
     expect(document.getElementById("echo360-ui-styles").textContent)
       .toContain("transform: translateX(0);");
     expect(document.getElementById("echo360-ui-styles").textContent)
@@ -900,6 +983,16 @@ describe("translation failure actions", () => {
     expect(extension.hidden).toBe(true);
     expect(panel.style.display).toBe("none");
     expect(logs.querySelectorAll(".echo360-runtime-log-item")).toHaveLength(2);
+  });
+
+  it("labels partial-result retry separately from a full retranslation", () => {
+    setupUi({ enabled: true, bilingual: false, useNativeSubtitles: true, size: "medium" });
+    const ui = window.Echo360Translator.ui;
+    ui.showError({ code: "PARTIAL_TRANSLATION", message: "部分失败", metrics: { failed: 1 } }, { onRetry: vi.fn() });
+    const retry = document.querySelector('.echo360-failure-link[data-action="retry"]');
+    expect(retry.textContent).toBe("重试失败字幕");
+    ui.showError({ code: "HTTP_503", message: "HTTP 503" }, { onRetry: vi.fn() });
+    expect(retry.textContent).toBe("重新翻译");
   });
 
   it("shows the completed translation summary above runtime diagnostics", () => {

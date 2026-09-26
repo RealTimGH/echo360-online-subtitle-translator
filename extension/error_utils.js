@@ -145,6 +145,12 @@
       return true;
     }
 
+    // A lone initial/abbreviation such as "p." is a legitimate caption
+    // token, but the period is essential to this exception.  Requiring the
+    // punctuation keeps ordinary short English words ("p", "a", "ok") on
+    // the strict NO_TARGET_TRANSLATION path. A/I remain words even with a dot.
+    if (/^[B-HJ-Zb-hj-z]\.$/.test(source)) return true;
+
     // Uppercase abbreviations, course codes, file names and software tokens
     // are routinely kept verbatim by subtitle translators. Exclude common
     // English words so an unchanged "NO"/"OK" is not silently accepted.
@@ -975,6 +981,7 @@
     ];
     const value = candidates.find((item) => Array.isArray(item) && item.length > 0) ||
       candidates.find((item) => Array.isArray(item)) || [];
+    const mergedGroups = context?.sourceMeta?.sentenceMerge?.plan?.groups;
     return value.slice(0, 50).map((item) => {
       const itemMessage = clean(item?.message || item?.error || "字幕请求失败", 240);
       const itemStatus = readStatus(item);
@@ -985,17 +992,39 @@
           ? (isGenericCode(readCode(item, itemStatus, itemMessage))
             ? "FAILURE_DETAIL_MISSING"
             : normalizeCodeValue(readCode(item, itemStatus, itemMessage)))
-          : normalizeCodeValue(rawItemCode) || "FAILURE_DETAIL_MISSING";
+            : normalizeCodeValue(rawItemCode) || "FAILURE_DETAIL_MISSING";
+      const mergedCue = positiveInteger(item?.cue, null);
+      const originalCues = Array.isArray(mergedGroups) && mergedCue != null
+        ? Array.from(new Set(
+          (Array.isArray(mergedGroups[mergedCue - 1]?.sourceIndices)
+            ? mergedGroups[mergedCue - 1].sourceIndices
+            : [])
+            .map((index) => Number(index))
+            .filter((index) => Number.isInteger(index) && index >= 0 && index < 1_000_000)
+            .slice(0, 24)
+            .map((index) => index + 1)
+        ))
+        : (Array.isArray(item?.original_cues)
+          ? [...new Set(item.original_cues.map(Number).filter(index => Number.isInteger(index) && index > 0 && index <= 1_000_000))].slice(0, 24)
+          : []);
       return {
-      cue: positiveInteger(item?.cue, null),
-      line: positiveInteger(item?.line, null),
-      // An item without its own provider diagnosis is a missing diagnostic,
-      // not a generic translation error. The top-level validator normally
-      // rejects such a result, but old jobs can still reach this formatter.
-      code: clean(itemCode, 80),
-      status: itemStatus,
-      message: itemMessage,
-    };
+        cue: mergedCue,
+        line: positiveInteger(item?.line, null),
+        // Keep the source context and timing when a direct translator has
+        // supplied it. Older jobs do not have these fields, so empty values
+        // remain omitted from the rendered detail row below.
+        source_text: clean(item?.source_text ?? item?.sourceText ?? item?.source ?? item?.text ?? "", 240),
+        timecode: clean(item?.timecode ?? item?.timestamp ?? "", 80),
+        start_time: clean(item?.start_time ?? item?.startTime ?? item?.start ?? "", 32),
+        end_time: clean(item?.end_time ?? item?.endTime ?? item?.end ?? "", 32),
+        original_cues: originalCues,
+        // An item without its own provider diagnosis is a missing diagnostic,
+        // not a generic translation error. The top-level validator normally
+        // rejects such a result, but old jobs can still reach this formatter.
+        code: clean(itemCode, 80),
+        status: itemStatus,
+        message: itemMessage,
+      };
     });
   }
 
@@ -1511,8 +1540,8 @@
       title = "翻译完成，但有字幕失败";
       summary = `${failed ?? 0} 条字幕没有获得译文，已成功的字幕仍然保留。`;
       recommendation = rateLimited
-        ? "失败原因包含限流：等待几分钟后降低 RPS/并发，再点击“重新翻译”。"
-        : "展开诊断详情查看失败字幕和错误码，再点击“重新翻译”。";
+        ? "失败原因包含限流：等待几分钟后降低 RPS/并发，再点击“重试失败字幕”；如果需要整段重做，再点击“重新翻译”。"
+        : "展开诊断详情查看失败字幕和错误码，再点击“重试失败字幕”；如果需要整段重做，再点击“重新翻译”。";
     } else if (code === "RENDER_FAILED") {
       title = "译文已生成，但字幕显示失败";
       summary = "翻译服务已经返回结果，但扩展在更新视频字幕层或 Transcript 面板时发生错误；结果没有被当作已显示。";
@@ -1694,8 +1723,22 @@
     }
     if (model.failedItems.length > 0) {
       const sample = model.failedItems.slice(0, 6).map((item) => {
-        const where = item.cue != null ? `第 ${item.cue} 条` : item.line != null ? `第 ${item.line} 行` : "某条字幕";
-        return `${where}: ${item.code}${item.status ? `/HTTP ${item.status}` : ""} ${item.message}`;
+        const locations = [];
+        if (item.cue != null) {
+          locations.push(Array.isArray(item.original_cues) && item.original_cues.length > 0
+            ? `翻译第 ${item.cue} 条`
+            : `第 ${item.cue} 条`);
+        }
+        if (item.line != null) locations.push(`VTT 第 ${item.line} 行`);
+        if (Array.isArray(item.original_cues) && item.original_cues.length > 0) {
+          locations.push(`原字幕第 ${item.original_cues.join("、")} 条`);
+        }
+        const where = locations.length > 0 ? locations.join("，") : "某条字幕";
+        const timing = item.timecode || (item.start_time && item.end_time
+          ? `${item.start_time} --> ${item.end_time}`
+          : "");
+        const source = item.source_text ? `；原文「${item.source_text}」` : "";
+        return `${where}${timing ? `（${timing}）` : ""}: ${item.code}${item.status ? `/HTTP ${item.status}` : ""} ${item.message}${source}`;
       });
       details.push({
         label: `失败字幕（显示前 ${sample.length} 条）`,

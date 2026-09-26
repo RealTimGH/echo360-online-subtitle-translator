@@ -7,6 +7,10 @@
   let isTranslating = false;
   let sentenceMergeRestartRequested = false;
   let loadedCacheKey = "";
+  // Keep the latest partial result usable even when browser storage is full.
+  let pendingCheckpointEntry = null;
+  let pendingCheckpointPersistenceFailed = false;
+  let pendingCheckpointScope = null;
   let trackSyncTimer = null;
   let trackSyncTimerDueAt = 0;
   let trackSyncErrorShown = false;
@@ -44,6 +48,93 @@
       .filter(Boolean)
       .join("|");
     return `${video.currentSrc || video.src || ""}::${trackSources}`;
+  }
+
+  function setPendingCheckpoint(entry, { persistenceFailed = null, video = null } = {}) {
+    const wasSameEntry = entry && entry === pendingCheckpointEntry;
+    const previousPersistenceFailure = pendingCheckpointPersistenceFailed;
+    pendingCheckpointEntry = entry && typeof entry === "object" ? entry : null;
+    pendingCheckpointPersistenceFailed = !!pendingCheckpointEntry && (
+      persistenceFailed == null ? wasSameEntry && previousPersistenceFailure : persistenceFailed === true
+    );
+    pendingCheckpointScope = pendingCheckpointEntry
+      ? {
+        video,
+        location: location.href,
+        videoHint: video ? manualVideoHint(video) : "",
+        cacheKey: String(pendingCheckpointEntry.cacheKey || ""),
+        sourceKey: String(pendingCheckpointEntry.sourceKey || ""),
+        configSig: String(pendingCheckpointEntry.configSig || ""),
+      }
+      : null;
+  }
+
+  function clearPendingCheckpoint() {
+    pendingCheckpointEntry = null;
+    pendingCheckpointPersistenceFailed = false;
+    pendingCheckpointScope = null;
+  }
+
+  function markPendingCheckpointPersistenceFailed(value) {
+    if (pendingCheckpointEntry) pendingCheckpointPersistenceFailed = value === true;
+  }
+
+  function cacheEntryCreatedAt(entry) {
+    if (!entry || !Object.prototype.hasOwnProperty.call(entry, "createdAt")) return null;
+    const value = Number(entry.createdAt);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function isCompleteCacheEntry(entry) {
+    return !!entry && !entry.resumeCheckpoint;
+  }
+
+  function baseCacheConfigSignature(value) {
+    return String(value || "").replace(/::sentence-merge-v[0-9]+$/, "");
+  }
+
+  function cacheIdentityMatches(left, right, { allowMergeVariant = false } = {}) {
+    if (!left || !right) return false;
+    const leftSource = String(left.sourceKey || "");
+    const rightSource = String(right.sourceKey || "");
+    if (leftSource && rightSource && leftSource !== rightSource) return false;
+    const leftConfig = String(left.configSig || "");
+    const rightConfig = String(right.configSig || "");
+    if (leftConfig && rightConfig) {
+      const configMatches = allowMergeVariant
+        ? baseCacheConfigSignature(leftConfig) === baseCacheConfigSignature(rightConfig)
+        : leftConfig === rightConfig;
+      if (!configMatches) return false;
+    }
+    const leftKey = String(left.cacheKey || "");
+    const rightKey = String(right.cacheKey || "");
+    if (leftKey && rightKey && leftKey === rightKey) return true;
+    if (!allowMergeVariant || !leftSource || !rightSource || leftSource !== rightSource || !leftConfig || !rightConfig) return false;
+    return baseCacheConfigSignature(leftConfig) === baseCacheConfigSignature(rightConfig);
+  }
+
+  function preferPendingCheckpoint(storedEntry) {
+    if (!pendingCheckpointEntry) return false;
+    if (!storedEntry) return true;
+    const pendingAt = cacheEntryCreatedAt(pendingCheckpointEntry);
+    const storedAt = cacheEntryCreatedAt(storedEntry);
+    // A known newer result wins even when the older stored result is
+    // complete. Complete results retain priority for ties and for entries
+    // whose freshness cannot be established.
+    if (pendingAt != null && storedAt != null) {
+      if (pendingAt !== storedAt) return pendingAt > storedAt;
+      return pendingCheckpointPersistenceFailed && !isCompleteCacheEntry(storedEntry);
+    }
+    if (isCompleteCacheEntry(storedEntry)) return false;
+    if (pendingAt != null && storedAt == null) return true;
+    if (pendingAt == null && storedAt != null) return false;
+    return pendingCheckpointPersistenceFailed;
+  }
+
+  function invalidateMatchingPendingCheckpoint(identity) {
+    if (pendingCheckpointEntry && cacheIdentityMatches(pendingCheckpointEntry, identity, { allowMergeVariant: true })) {
+      clearPendingCheckpoint();
+    }
   }
 
   function isManualContextCurrent(context) {
@@ -99,6 +190,7 @@
           : "http://127.0.0.1:8765",
       };
       delete lastKnownConfig.useLocalBackend;
+      ns.ui.setQuickImportVisible?.(quickTranslateAutoExportEnabled());
       const nextTarget = String(lastKnownConfig.target || "ZH").toUpperCase();
       if (previousTarget && previousTarget !== nextTarget) {
         invalidateManualSession();
@@ -184,9 +276,12 @@
       const merge = sourceMeta?.sentenceMerge;
       const groupedRender = merge ? { translatedVtt, originalVtt, options } : null;
       let panelOriginalVtt = originalVtt;
+      let panelTranslatedVtt = translatedVtt;
       if (merge) {
         // Resolve pending/failure labels against the actual translation input
-        // before projecting groups back to the untouched source cue timeline.
+        // before projecting groups back to the source cue timeline. Overlay
+        // display may split a straddling cue's window; Transcript keeps one
+        // row per original cue with stacked sentence results.
         const groupedTranslation = options.previewPending
           ? ns.sentenceMerge.preview(translatedVtt, merge.plan, options)
           : translatedVtt;
@@ -197,6 +292,7 @@
         translatedVtt = projection.translatedVtt;
         originalVtt = projection.originalVtt;
         panelOriginalVtt = merge.originalVtt;
+        panelTranslatedVtt = projection.sourceTranslatedVtt || projection.translatedVtt;
         options = { ...options, previewPending: false,
           failedCues: ns.sentenceMerge.remapFailedCues(options.failedCues || [], merge.plan) };
       }
@@ -227,17 +323,17 @@
           if (prefs.transcriptPanelEnabled !== true) {
             ns.transcriptPanelRenderer.setVisible(false);
           } else {
-            const panelTranslatedVtt = options.previewPending && ns.vtt?.buildIncrementalPreviewVtt
-              ? ns.vtt.buildIncrementalPreviewVtt(translatedVtt, originalVtt, {
+            const resolvedPanelTranslatedVtt = options.previewPending && ns.vtt?.buildIncrementalPreviewVtt
+              ? ns.vtt.buildIncrementalPreviewVtt(panelTranslatedVtt, panelOriginalVtt, {
                 placeholder: options.pendingLabel,
                 failureLabel: options.failureLabel,
                 failedCues: options.failedCues,
                 markPending: options.markPending,
               })
-              : translatedVtt;
+              : panelTranslatedVtt;
             ns.transcriptPanelRenderer.setVisible(true);
             ns.transcriptPanelRenderer.setTranslation({
-              translatedVtt: panelTranslatedVtt,
+              translatedVtt: resolvedPanelTranslatedVtt,
               originalVtt: panelOriginalVtt,
               sourceMeta: resolvedSourceMeta,
               target: resolvedSourceMeta.target,
@@ -1197,6 +1293,7 @@
       // Partial manual imports return above after saving the manual workflow
       // progress; they never change the direct-translation cache.
       let importedCacheKey = "";
+      let importedCacheIdentity = null;
       let importedCacheWarning = "";
       if (validation.translatedVtt) {
         if (typeof ns.translationService?.buildCacheKey !== "function" || typeof ns.storage?.setCacheStore !== "function") {
@@ -1204,6 +1301,7 @@
         } else {
           try {
             const cacheIdentity = await ns.translationService.buildCacheKey(cfg, current.sourceId, current.vttText);
+            importedCacheIdentity = cacheIdentity;
             const cacheResult = await ns.storage.setCacheStore({
               cacheKey: cacheIdentity.cacheKey,
               sourceKey: cacheIdentity.sourceKey,
@@ -1245,6 +1343,13 @@
           phase: "render",
         });
       }
+      // A complete manual result supersedes any in-memory partial checkpoint
+      // for the same source/config. Match merge and non-merge cache identities
+      // as one scope so a later subtitle sync cannot resurrect the checkpoint.
+      invalidateMatchingPendingCheckpoint(importedCacheIdentity || {
+        sourceKey: current.sourceId || "",
+        cacheKey: importedCacheKey,
+      });
       loadedCacheKey = mounted ? importedCacheKey : "";
       ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
       ns.ui.updateActionButtons("翻译字幕已加载", false);
@@ -1354,10 +1459,47 @@
     return Promise.allSettled([manualRun, translationRun]);
   }
 
+  async function currentQuickCacheIdentity(video) {
+    if (!video || typeof ns.translationService?.resolveSourceVtt !== "function" ||
+      typeof ns.translationService?.buildCacheKey !== "function") return null;
+    try {
+      const resolved = await ns.translationService.resolveSourceVtt(video);
+      if (!resolved || typeof resolved.vttText !== "string" || !resolved.vttText.trim()) return null;
+      const cfg = await ns.storage.getConfig();
+      const prefs = await ns.storage.getPrefs();
+      let vttText = resolved.vttText;
+      let options;
+      if (prefs?.sentenceMergeEnabled === true && typeof ns.sentenceMerge?.build === "function") {
+        const plan = ns.sentenceMerge.build(vttText, { maxChars: Number(cfg?.maxChars) || 1200 });
+        if (plan?.vtt) vttText = plan.vtt;
+        options = { sentenceMergeEnabled: true };
+      }
+      const cacheIdentity = options
+        ? await ns.translationService.buildCacheKey(cfg, resolved.sourceId || "", vttText, options)
+        : await ns.translationService.buildCacheKey(cfg, resolved.sourceId || "", vttText);
+      return { cacheIdentity, vttText };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function pendingCheckpointMatchesQuickScope(video) {
+    if (!pendingCheckpointEntry || !pendingCheckpointScope || !video) return false;
+    if (pendingCheckpointScope.video !== video || pendingCheckpointScope.location !== location.href) return false;
+    if (pendingCheckpointScope.videoHint && pendingCheckpointScope.videoHint !== manualVideoHint(video)) return false;
+    const current = await currentQuickCacheIdentity(video);
+    if (!current || pendingCheckpointEntry.resumeCheckpoint?.sourceVtt !== current.vttText) return false;
+    return cacheIdentityMatches(pendingCheckpointEntry, current.cacheIdentity);
+  }
+
   async function quickTranslate() {
     const autoExport = quickTranslateAutoExportEnabled();
     const video = ns.video.getPrimaryVideo?.();
-    if (hasExistingTranslation(video)) {
+    const hasExisting = hasExistingTranslation(video);
+    const canResumePending = hasExisting && pendingCheckpointEntry
+      ? await pendingCheckpointMatchesQuickScope(video)
+      : false;
+    if (hasExisting && !canResumePending) {
       if (!confirmRetranslation({ autoExport })) {
         // Cancelling the confirmation must be a true no-op. The existing
         // status line may contain the completed/cache overview, and the
@@ -1386,6 +1528,7 @@
     }
     isTranslating = true;
     activeRunId = runId;
+    ns.ui.setIdleDimEnabled?.(true);
     ns.ui.clearTranslationSummary?.();
 
     // Start the native launch request at the beginning of the click handler.
@@ -1449,6 +1592,7 @@
       ns.ui.clearError?.();
       ns.ui.setStatusText("");
       ns.ui.updateActionButtons("加载翻译字幕", false);
+      ns.ui.setIdleDimEnabled?.(false);
     };
 
     const showFailedTranslationPreview = (failureError = null) => {
@@ -1540,7 +1684,7 @@
         ...(sentenceMerge ? { sentenceMerge } : {}) };
       let cacheEntry = null;
       try {
-        cacheEntry = await ns.storage.getCacheStore();
+        cacheEntry = await ns.storage.getCacheStore(cacheKey);
       } catch (error) {
         cacheWarningError = Object.assign(new Error("本地翻译缓存读取失败，已跳过缓存"), {
           code: "CACHE_READ_FAILED",
@@ -1548,17 +1692,29 @@
         });
         console.warn("[echo360-translator][controller] translation cache read failed; continuing without cache", safeErrorForLog(error, { phase: "cache" }));
       }
+      const currentCacheIdentity = { cacheKey, sourceKey, configSig };
+      if (!forceRefresh && pendingCheckpointEntry?.cacheKey === cacheKey &&
+        cacheIdentityMatches(pendingCheckpointEntry, currentCacheIdentity) &&
+        preferPendingCheckpoint(cacheEntry)) {
+        cacheEntry = pendingCheckpointEntry;
+      } else if (!forceRefresh && pendingCheckpointEntry?.cacheKey === cacheKey &&
+        cacheIdentityMatches(pendingCheckpointEntry, currentCacheIdentity) && cacheEntry) {
+        // A newer stored entry supersedes the in-memory checkpoint. Clearing
+        // the old reference prevents a later quick action from bypassing the
+        // normal confirmation flow with stale progress.
+        clearPendingCheckpoint();
+      }
 
       if (forceRefresh) {
-        if (cacheEntry) {
-          const clearResult = await ns.storage.setCacheStore(null);
-          if (clearResult?.ok === false) {
-            cacheWarningError = clearResult.error || Object.assign(new Error("本地缓存清理失败"), { code: "CACHE_WRITE_FAILED" });
-            console.warn("[echo360-translator][controller] old cache could not be cleared", safeErrorForLog(cacheWarningError, { phase: "cache" }));
-          } else {
-            console.log("[echo360-translator] cache cleared");
-          }
+        if (pendingCheckpointEntry?.cacheKey === cacheKey) clearPendingCheckpoint();
+        const clearResult = await ns.storage.setCacheStore(null, cacheKey);
+        if (clearResult?.ok === false) {
+          cacheWarningError = clearResult.error || Object.assign(new Error("本地缓存清理失败"), { code: "CACHE_WRITE_FAILED" });
+          console.warn("[echo360-translator][controller] old cache could not be cleared", safeErrorForLog(cacheWarningError, { phase: "cache" }));
+        } else {
+          console.log("[echo360-translator] cache slot cleared");
         }
+        cacheEntry = null;
         loadedCacheKey = "";
       }
 
@@ -1566,7 +1722,7 @@
       const currentSurfaceReady = renderState.lastRenderedVideo === video &&
         !!renderState.lastTranslatedTrack &&
         (typeof ns.renderer.hasRenderedTranslatedTrack !== "function" || ns.renderer.hasRenderedTranslatedTrack());
-      if (!forceRefresh && loadedCacheKey === cacheKey && currentSurfaceReady) {
+      if (!forceRefresh && !cacheEntry?.resumeCheckpoint && loadedCacheKey === cacheKey && currentSurfaceReady) {
         ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
         ns.ui.updateActionButtons("翻译字幕已加载");
         const summary = buildTranslationSummary(
@@ -1589,8 +1745,24 @@
         loadedCacheKey = "";
       }
 
-      let usableCacheEntry = cacheEntry;
-      if (!forceRefresh && cacheEntry?.translatedVtt && cacheEntry.cacheKey === cacheKey) {
+      let resumeCheckpoint = null;
+      if (!forceRefresh && cacheEntry?.resumeCheckpoint && cacheEntry.cacheKey === cacheKey) {
+        resumeCheckpoint = ns.translationService.validateTranslationCheckpoint?.(
+          cacheEntry.resumeCheckpoint, vttText, { target: diagnosticContext.target, provider: cfg.provider, requireFailures: true }
+        ) || null;
+        if (!resumeCheckpoint) {
+          cacheWarningError = Object.assign(new Error("部分翻译进度与当前字幕不匹配，已忽略"), { code: "INVALID_TRANSLATION_CACHE" });
+          if (pendingCheckpointEntry && cacheIdentityMatches(pendingCheckpointEntry, currentCacheIdentity)) {
+            clearPendingCheckpoint();
+          }
+        } else {
+          setPendingCheckpoint(cacheEntry, { video });
+        }
+      }
+      // A partial checkpoint is never a complete cache hit, even if its VTT
+      // contains enough target-language text to pass the complete-cache gate.
+      let usableCacheEntry = cacheEntry?.resumeCheckpoint ? null : cacheEntry;
+      if (!forceRefresh && usableCacheEntry?.translatedVtt && cacheEntry.cacheKey === cacheKey) {
         try {
           const validateTranslationResult = ns.backendClient?.validateTranslationResult;
           if (typeof validateTranslationResult !== "function") {
@@ -1735,12 +1907,13 @@
         return true;
       };
 
-      if (mountTranslationPreview(vttText, false)) {
+      if (mountTranslationPreview(resumeCheckpoint?.translatedVtt || vttText, false)) {
         ns.ui.updateActionButtons("翻译准备中...", true);
         ns.ui.setStatusText("正在准备翻译（字幕位置预览已显示）");
       }
 
       const result = await ns.translationService.translateWithConfig(cfg, backendUrl, payload, {
+        resumeCheckpoint,
         isActive: () => activeRunId === runId,
         onProgress: (current, total, line = "", details = {}) => {
           const hasKnownTotal = Number(total) > 0;
@@ -1843,38 +2016,50 @@
           : { incremental: incrementalPreviewMounted },
         onSurfaceWarning: collectSurfaceWarning,
       });
-      if (failedCount === 0) {
-        loadedCacheKey = mounted ? cacheKey : "";
-        const cacheResult = await ns.storage.setCacheStore({
+      const nextCheckpoint = failedCount > 0
+        ? ns.translationService.buildTranslationCheckpoint?.(result, vttText) || null
+        : null;
+      if (failedCount > 0 && !nextCheckpoint) {
+        cacheWarningError = Object.assign(new Error("失败位置不完整，无法保存可补译进度；再次翻译可能需要重新处理整份字幕"), {
+          code: "PARTIAL_CHECKPOINT_UNAVAILABLE",
+        });
+      }
+      loadedCacheKey = failedCount === 0 && mounted ? cacheKey : "";
+      if (failedCount === 0 || nextCheckpoint) {
+        const entry = {
           cacheKey,
           sourceKey,
           configSig,
           translatedVtt: result.translated_vtt,
           translationSummary,
+          ...(nextCheckpoint ? { resumeCheckpoint: nextCheckpoint } : {}),
           createdAt: Date.now(),
-        });
+        };
+        if (nextCheckpoint) setPendingCheckpoint(entry, { video });
+        else clearPendingCheckpoint();
+        const cacheResult = await ns.storage.setCacheStore(entry);
         if (cacheResult?.ok === false) {
+          if (nextCheckpoint) markPendingCheckpointPersistenceFailed(true);
           cacheWarningError = cacheResult.error || Object.assign(new Error("翻译完成，但本地缓存保存失败"), { code: "CACHE_WRITE_FAILED" });
           console.warn("[echo360-translator][controller] translated subtitle cache unavailable", safeErrorForLog(cacheWarningError, { phase: "cache" }));
         } else {
+          if (nextCheckpoint) markPendingCheckpointPersistenceFailed(false);
           // A successful overwrite resolves a stale force-refresh/read warning;
           // do not show a misleading cache error after a usable cache exists.
           cacheWarningError = null;
         }
-      } else {
-        loadedCacheKey = "";
       }
 
       const warningEntries = Array.from(new Set([
         ...(Array.isArray(result.warnings) ? result.warnings : []),
         ...surfaceWarnings.map(formatSurfaceWarning),
-        ...(cacheWarningError && failedCount === 0
+        ...(cacheWarningError
           ? [`[${cacheWarningError.code || "CACHE_WRITE_FAILED"}] ${cacheWarningError.message || "翻译完成，但缓存保存失败"}`]
           : []),
       ].map((item) => String(item || "").trim()).filter(Boolean)));
 
       const retryActions = {
-        onRetry: () => { ns.ui.clearError?.(); void onClickTranslate(true); },
+        onRetry: () => { ns.ui.clearError?.(); void onClickTranslate(failedCount === 0); },
         onCancel: () => ns.ui.clearError?.(),
       };
       if (failedCount > 0) {
@@ -1987,7 +2172,7 @@
         context: errorContext,
         onRetry: () => {
           ns.ui.clearError?.();
-          void onClickTranslate(true);
+          void onClickTranslate(!pendingCheckpointEntry);
         },
         onCancel: dismissFailedTranslation,
       });
@@ -2114,6 +2299,7 @@
 
   function destroy() {
     sentenceMergeRestartRequested = false;
+    clearPendingCheckpoint();
     trackSyncInstalled = false;
     if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
     trackSyncTimer = null;
@@ -2211,6 +2397,7 @@
     } catch (error) {
       console.warn("[echo360-translator][controller] could not prime config for backend startup", safeErrorForLog(error, { phase: "preferences" }));
     }
+    ns.ui.setQuickImportVisible?.(quickTranslateAutoExportEnabled());
     ns.renderer.applySubtitleSize(prefs.size || DEFAULT_SUBTITLE_SIZE);
     // Apply the opt-in Transcript setting before any later translation or
     // player mutation can schedule a renderer flush. Missing values are

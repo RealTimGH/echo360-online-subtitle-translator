@@ -42,9 +42,9 @@
   }
 
   // Split floating action control: the large, easy-to-hit primary surface
-  // performs the common one-click workflow. Two explicit secondary targets
-  // retain panel access and provide direct AI JSON import without using
-  // double-click, long-press, right-click, or another hidden gesture.
+  // performs the common one-click workflow. The adjacent disclosure opens
+  // the panel. A second import target appears only when one-click AI
+  // material export is enabled, so it does not use a hidden gesture.
   function create(root, { onQuickTranslate, onOpenPanel, onImport } = {}) {
     const group = document.createElement("div");
     group.id = "echo360-translator-ball-group";
@@ -77,8 +77,12 @@
     importButton.title = "AI 材料准备完成后，可在这里快捷导入 AI 译文";
     importButton.setAttribute("aria-label", "快捷导入 AI 翻译后的 JSON 译文");
     importButton.disabled = true;
+    importButton.hidden = true;
+    importButton.setAttribute("aria-hidden", "true");
+    importButton.tabIndex = -1;
     importButton.addEventListener("click", () => invoke(onImport, "manual translation import"));
 
+    secondary.classList.add("echo360-ball-quick-import-hidden");
     secondary.append(panelButton, importButton);
     group.append(secondary, ball);
     root.appendChild(group);
@@ -105,7 +109,11 @@
       setStatus(message = "", kind = "info") {
         const text = String(message || "").trim();
         group.dataset.kind = kind;
-        if (kind === "success" || kind === "cache") replayResultRing(group);
+        if (kind === "success" || kind === "cache") {
+          replayResultRing(group);
+        } else {
+          group.classList.remove("echo360-ball-result-ring");
+        }
         if (text) {
           ball.title = text;
           ball.setAttribute("aria-label", `一键字幕翻译：${text}`);
@@ -119,6 +127,14 @@
         importButton.title = ready
           ? "快捷导入 AI 翻译后的 JSON（也兼容旧 VTT；优先读取剪贴板）"
           : "字幕材料准备完成后即可快捷导入 AI 译文";
+      },
+      setImportVisible(visible = false) {
+        const show = visible === true;
+        secondary.classList.toggle("echo360-ball-quick-import-hidden", !show);
+        importButton.hidden = !show;
+        importButton.setAttribute("aria-hidden", String(!show));
+        if (show) importButton.removeAttribute("tabindex");
+        else importButton.tabIndex = -1;
       },
       setPanelExpanded(expanded = false) {
         panelButton.setAttribute("aria-expanded", String(expanded));

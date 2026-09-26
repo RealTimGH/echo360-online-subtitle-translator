@@ -1,6 +1,6 @@
 (() => {
   const ns = window.Echo360Translator;
-  const MIXABLE_PROVIDER_CODES = new Set(["google-web", "deepl", "azure", "openai", "deepseek", "gemini", "argos", "custom-backend"]);
+  const MIXABLE_PROVIDER_CODES = new Set(["google-web", "deepl", "azure","openai", "deepseek", "gemini", "argos", "custom-backend"]);
   const LOCAL_ARGOS_BACKEND_URL = "http://127.0.0.1:8765";
   const MIXED_PROVIDER_DEFAULTS = {
     "google-web": { model: "", endpoint: "" },
@@ -724,6 +724,326 @@
     return { lines, units };
   }
 
+  // A translation checkpoint is deliberately built from the VTT that was
+  // actually sent to a provider.  In sentence-merge mode that is the merged
+  // VTT, rather than the original player timeline.  Keeping the exact source
+  // bytes here makes a stale checkpoint fail closed when a page exposes a
+  // different caption track after a reload.
+  const TRANSLATION_CHECKPOINT_VERSION = 1;
+
+  function checkpointError(message, code = "INVALID_TRANSLATION_CHECKPOINT", details = {}) {
+    const error = new Error(message);
+    error.code = code;
+    error.phase = "checkpoint";
+    error.details = details;
+    return error;
+  }
+
+  function serializableCheckpointValue(value) {
+    if (value == null) return value;
+    try {
+      const encoded = JSON.stringify(value);
+      return encoded == null ? null : JSON.parse(encoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function resultFailureItems(result) {
+    const candidates = [
+      result?.failed_items,
+      result?.failedItems,
+      result?.metrics?.failed_items,
+      result?.metrics?.failedItems,
+    ];
+    const found = candidates.find((value) => Array.isArray(value));
+    return found ? found : [];
+  }
+
+  function resultFailureCues(result) {
+    const sources = [
+      result?.failed_cues,
+      result?.failedCues,
+      result?.metrics?.failed_cues,
+      result?.metrics?.failedCues,
+    ];
+    const cues = [];
+    const seen = new Set();
+    // The terminal list supersedes older progress/metrics mirrors, including
+    // an explicit empty list after recovery.
+    for (const raw of sources.find(Array.isArray) || []) {
+      const cue = Number(raw);
+      if (!Number.isSafeInteger(cue) || cue <= 0 || seen.has(cue)) continue;
+      seen.add(cue);
+      cues.push(cue);
+    }
+    return cues;
+  }
+
+  function resultFailureCodes(result) {
+    const source = result?.failure_codes || result?.failureCodes ||
+      result?.metrics?.failure_codes || result?.metrics?.failureCodes;
+    if (!source || typeof source !== "object" || Array.isArray(source)) return {};
+    const codes = {};
+    for (const [key, value] of Object.entries(source)) {
+      const count = Number(value);
+      if (!key || !Number.isFinite(count) || count <= 0) continue;
+      codes[key] = count;
+    }
+    return codes;
+  }
+
+  function resultFailureLineCount(result) {
+    const raw = Number(result?.metrics?.failed);
+    if (Number.isSafeInteger(raw) && raw >= 0) return raw;
+    return resultFailureItems(result).length;
+  }
+
+  function cueTimingSignature(unit) {
+    const timing = unit?.block?.find((line) => MIXED_TIMING_RE.test(String(line || "")));
+    return String(timing || "").trim().replace(/\s+/g, " ");
+  }
+
+  function checkpointStructure(sourceVtt, translatedVtt) {
+    const source = parseMixedCueUnits(sourceVtt);
+    const translated = parseMixedCueUnits(translatedVtt);
+    if (source.units.length === 0 || translated.units.length === 0) return null;
+    if (source.units.length !== translated.units.length) return null;
+    for (let index = 0; index < source.units.length; index += 1) {
+      const sourceUnit = source.units[index];
+      const translatedUnit = translated.units[index];
+      if (cueTimingSignature(sourceUnit) !== cueTimingSignature(translatedUnit) ||
+        sourceUnit.textIndexes.length !== translatedUnit.textIndexes.length) {
+        return null;
+      }
+    }
+    return { source, translated };
+  }
+
+  function addFailureCue(cues, rawCue, cueCount) {
+    const cue = Number(rawCue);
+    if (!Number.isSafeInteger(cue) || cue <= 0 || cue > cueCount) return false;
+    cues.add(cue - 1);
+    return true;
+  }
+
+  // Provider metrics count text lines, while a resume request must send whole
+  // cues.  Prefer explicit failed_cues, then map failed_items through the
+  // physical line and translatable-item positions emitted by direct_translator.
+  // This keeps multiline cues and providers that report line locations
+  // resumable without guessing from the aggregate failed count.
+  function failedCueIndexesForResult(result, parsed, { strict = false } = {}) {
+    const cues = new Set();
+    const cueCount = parsed?.units?.length || 0;
+    const sourceLineToCue = new Map();
+    const translatableLineToCue = [];
+    for (let cueIndex = 0; cueIndex < cueCount; cueIndex += 1) {
+      const unit = parsed.units[cueIndex];
+      for (const lineIndex of unit.textIndexes) {
+        sourceLineToCue.set(lineIndex, cueIndex);
+        translatableLineToCue.push(cueIndex);
+      }
+    }
+
+    let invalidExplicitCue = false;
+    for (const rawCue of resultFailureCues(result)) {
+      if (!addFailureCue(cues, rawCue, cueCount)) invalidExplicitCue = true;
+    }
+    for (const item of resultFailureItems(result)) {
+      if (!item || typeof item !== "object") continue;
+      if (item.cue != null) {
+        if (!addFailureCue(cues, item.cue, cueCount)) invalidExplicitCue = true;
+        continue;
+      }
+      const physicalLine = Number(item.line);
+      if (Number.isSafeInteger(physicalLine) && physicalLine > 0) {
+        const cueIndex = sourceLineToCue.get(physicalLine - 1);
+        if (cueIndex != null) {
+          cues.add(cueIndex);
+          continue;
+        }
+      }
+      const itemIndex = Number(item.item);
+      if (Number.isSafeInteger(itemIndex) && itemIndex > 0 && itemIndex <= translatableLineToCue.length) {
+        cues.add(translatableLineToCue[itemIndex - 1]);
+      } else if (strict) {
+        return { cues, valid: false, reason: "failure_item_not_locatable" };
+      }
+    }
+
+    const failedLines = resultFailureLineCount(result);
+    // failed_items is intentionally capped by the provider at 50 entries.
+    // Once the aggregate count exceeds that sample, an exhaustive failed_cues
+    // list is mandatory; otherwise a resume would silently treat unlisted
+    // failed cues as successful work.
+    const explicitFailedCues = resultFailureCues(result);
+    if (strict && failedLines > resultFailureItems(result).length && explicitFailedCues.length === 0) {
+      return { cues, valid: false, reason: "failure_details_sample_not_exhaustive" };
+    }
+    const locatedLineCapacity = [...cues].reduce((sum, index) => sum + parsed.units[index].textIndexes.length, 0);
+    if (strict && (failedLines > locatedLineCapacity ||
+      (Number.isInteger(result?.metrics?.failedCues) && result.metrics.failedCues !== cues.size))) {
+      return { cues, valid: false, reason: "failure_locations_incomplete" };
+    }
+    if (invalidExplicitCue || (failedLines > 0 && cues.size === 0)) {
+      return { cues, valid: false, reason: invalidExplicitCue ? "failed_cue_out_of_range" : "failed_cue_missing" };
+    }
+    if (strict && failedLines === 0 && (resultFailureItems(result).length > 0 || cues.size > 0)) {
+      return { cues, valid: false, reason: "failure_count_mismatch" };
+    }
+    return { cues, valid: true, reason: "ok" };
+  }
+
+  // Diagnostic examples are bounded; resume decisions need exact line state.
+  // Older results remain usable when their sample or whole failed cues prove
+  // every failed line. Ambiguous legacy/custom results fail closed.
+  function failedLineIndexesForResult(result, parsed) {
+    const expected = resultFailureLineCount(result);
+    const lineToCue = new Map(parsed.units.flatMap((unit, cue) => unit.textIndexes.map(line => [line, cue])));
+    const textLines = [...lineToCue.keys()];
+    const explicit = result?.failed_lines ?? result?.metrics?.failed_lines;
+    const lines = new Set();
+    if (Array.isArray(explicit)) {
+      for (const value of explicit) {
+        const line = Number(value) - 1;
+        if (!Number.isInteger(line) || !lineToCue.has(line) || lines.has(line)) return null;
+        lines.add(line);
+      }
+      if (lines.size !== expected) return null;
+    }
+    for (const item of resultFailureItems(result)) {
+      const cue = parsed.units[Number(item.cue) - 1];
+      const line = item.line != null ? Number(item.line) - 1
+        : cue?.textIndexes.length === 1 ? cue.textIndexes[0]
+          : Number.isInteger(Number(item.item)) ? textLines[Number(item.item) - 1] : NaN;
+      if (!Number.isInteger(line) || !lineToCue.has(line)) return null;
+      if (item.cue != null && lineToCue.get(line) !== Number(item.cue) - 1) return null;
+      if (Array.isArray(explicit) && !lines.has(line)) return null;
+      lines.add(line);
+    }
+    const located = failedCueIndexesForResult(result, parsed, { strict: true });
+    if (!located.valid) return null;
+    if (lines.size < expected && !Array.isArray(explicit)) {
+      const wholeCues = [...located.cues].flatMap(cue => parsed.units[cue].textIndexes);
+      if (wholeCues.length === expected) for (const line of wholeCues) lines.add(line);
+    }
+    if (lines.size !== expected) return null;
+    const cues = new Set([...lines].map(line => lineToCue.get(line)));
+    if (cues.size !== located.cues.size || [...cues].some(cue => !located.cues.has(cue))) return null;
+    return lines;
+  }
+
+  function failureItemsForLines(result, parsed, failedLines) {
+    const textLines = parsed.units.flatMap(unit => unit.textIndexes);
+    const samples = new Map(resultFailureItems(result).map(item => {
+      const unit = parsed.units[Number(item.cue) - 1];
+      const line = item.line != null ? Number(item.line) - 1
+        : unit?.textIndexes.length === 1 ? unit.textIndexes[0] : textLines[Number(item.item) - 1];
+      return [line, item];
+    }));
+    const codes = Object.keys(resultFailureCodes(result));
+    const fallbackCode = codes.length === 1 ? codes[0] : "UNSAMPLED_TRANSLATION_FAILURE";
+    const entries = new Map(parsed.units.flatMap((unit, cue) => unit.textIndexes.map(line => [line, { cue, unit }])));
+    return [...failedLines].sort((a, b) => a - b).map(line => {
+      const sample = samples.get(line);
+      const { cue, unit } = entries.get(line);
+      const timing = cueTimingSignature(unit).match(/^(\S+)\s*-->\s*(\S+)/);
+      const code = sample?.code || fallbackCode;
+      return {
+        ...(sample || {}),
+        cue: cue + 1, line: line + 1, code,
+        message: sample?.message || sample?.error || "该行翻译失败；服务仅提供前 50 条错误详情，请结合本轮错误统计排查",
+        ...(sample ? {} : /^HTTP_\d{3}$/.test(code) ? { status: Number(code.slice(-3)) } : {}),
+        source_text: sample?.source_text || parsed.lines[line],
+        timecode: sample?.timecode || (timing ? `${timing[1]} --> ${timing[2]}` : ""),
+        start_time: sample?.start_time || timing?.[1] || "",
+        end_time: sample?.end_time || timing?.[2] || "",
+      };
+    });
+  }
+
+  function buildTranslationCheckpoint(result, sourceVtt) {
+    if (!result || typeof result !== "object" || Array.isArray(result) ||
+      typeof sourceVtt !== "string" || !sourceVtt.trim()) return null;
+    const translatedVtt = typeof result.translated_vtt === "string"
+      ? result.translated_vtt
+      : typeof result.translatedVtt === "string" ? result.translatedVtt : "";
+    if (!translatedVtt.trim() || !checkpointStructure(sourceVtt, translatedVtt)) return null;
+    const resultCopy = serializableCheckpointValue({
+      ...result,
+      translated_vtt: translatedVtt,
+      failed_items: resultFailureItems(result),
+      failed_cues: resultFailureCues(result),
+      failure_codes: resultFailureCodes(result),
+      failureCodes: resultFailureCodes(result),
+    });
+    if (!resultCopy || typeof resultCopy !== "object" || Array.isArray(resultCopy)) return null;
+    const parsed = parseMixedCueUnits(sourceVtt);
+    const failureDetails = failedCueIndexesForResult(resultCopy, parsed, { strict: true });
+    const failedLines = failedLineIndexesForResult(resultCopy, parsed);
+    if (!failureDetails.valid || !failedLines) return null;
+    resultCopy.failed_lines = [...failedLines].map(line => line + 1);
+    return {
+      version: TRANSLATION_CHECKPOINT_VERSION,
+      sourceVtt,
+      translatedVtt,
+      result: resultCopy,
+    };
+  }
+
+  function validateTranslationCheckpoint(checkpoint, sourceVtt, options = {}) {
+    if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint) ||
+      typeof sourceVtt !== "string" || !sourceVtt.trim() || checkpoint.sourceVtt !== sourceVtt) {
+      return null;
+    }
+    if (checkpoint.version != null && Number(checkpoint.version) !== TRANSLATION_CHECKPOINT_VERSION) return null;
+    const result = checkpoint.result && typeof checkpoint.result === "object"
+      ? checkpoint.result
+      : checkpoint;
+    const translatedVtt = typeof checkpoint.translatedVtt === "string"
+      ? checkpoint.translatedVtt
+      : typeof result.translated_vtt === "string" ? result.translated_vtt : "";
+    if (!translatedVtt.trim() || (result.translated_vtt != null && result.translated_vtt !== translatedVtt)) return null;
+    const structure = checkpointStructure(sourceVtt, translatedVtt);
+    if (!structure) return null;
+    const failureDetails = failedCueIndexesForResult(result, structure.source, { strict: true });
+    const failedLineIndexes = failedLineIndexesForResult(result, structure.source);
+    if (!failureDetails.valid || !failedLineIndexes) return null;
+    const sourceLineCount = structure.source.units.reduce((sum, unit) => sum + unit.textIndexes.length, 0);
+    const failedLines = resultFailureLineCount(result);
+    if (failedLines < 0 || failedLines > sourceLineCount) return null;
+    if (failedLines === 0 && failureDetails.cues.size > 0) return null;
+    if (options.requireFailures === true && failureDetails.cues.size === 0) return null;
+    const normalizedResult = {
+      ...result,
+      failed_lines: [...failedLineIndexes].map(line => line + 1),
+      translated_vtt: translatedVtt,
+      failed_items: resultFailureItems(result),
+      failed_cues: resultFailureCues(result),
+      failure_codes: resultFailureCodes(result),
+      failureCodes: resultFailureCodes(result),
+    };
+    const validate = ns.backendClient?.validateTranslationResult;
+    if (typeof validate !== "function") return null;
+    try {
+      validate(normalizedResult, "translation", {
+        sourceVtt,
+        target: options.target || result?.target || "ZH",
+        provider: options.provider || result?.provider,
+        bilingual: options.bilingual === true,
+      });
+    } catch (_) {
+      return null;
+    }
+    return {
+      version: TRANSLATION_CHECKPOINT_VERSION,
+      sourceVtt,
+      translatedVtt,
+      result: serializableCheckpointValue(normalizedResult),
+      failedCueIndexes: Array.from(failureDetails.cues).sort((left, right) => left - right),
+    };
+  }
+
   function buildMixedShardVtt(units) {
     return `WEBVTT\n\n${units.map((unit) => unit.block.join("\n")).join("\n\n")}\n`;
   }
@@ -761,38 +1081,6 @@
       // the normal page-level cache signature.
       force_refresh: !!basePayload.force_refresh,
     };
-  }
-
-  function applyMixedShardResult(outputLines, units, result, skippedUnitIndexes = new Set()) {
-    const translated = parseMixedCueUnits(result?.translated_vtt || "");
-    if (translated.units.length !== units.length) {
-      const error = new Error(`混合翻译分片返回 ${translated.units.length} 个 cue，预期 ${units.length} 个`);
-      error.code = "INCOMPLETE_TRANSLATED_VTT";
-      error.phase = "translation";
-      throw error;
-    }
-    for (let index = 0; index < units.length; index += 1) {
-      if (skippedUnitIndexes.has(index)) continue;
-      const sourceUnit = units[index];
-      const resultUnit = translated.units[index];
-      if (resultUnit.textIndexes.length !== sourceUnit.textIndexes.length) {
-        const error = new Error(`混合翻译分片第 ${index + 1} 个 cue 的文本行数不一致`);
-        error.code = "INCOMPLETE_TRANSLATED_VTT";
-        error.phase = "translation";
-        throw error;
-      }
-      for (let textIndex = 0; textIndex < sourceUnit.textIndexes.length; textIndex += 1) {
-        outputLines[sourceUnit.textIndexes[textIndex]] = translated.lines[resultUnit.textIndexes[textIndex]];
-      }
-    }
-  }
-
-  function resetMixedUnits(outputLines, sourceLines, units, indexes = new Set()) {
-    for (const index of indexes) {
-      const unit = units[index];
-      if (!unit) continue;
-      for (const textIndex of unit.textIndexes) outputLines[textIndex] = sourceLines[textIndex];
-    }
   }
 
   function mixedPartialTextIsUsable(value, sourceValue) {
@@ -844,31 +1132,6 @@
     return target;
   }
 
-  function mixedFailedUnitIndexes(result, unitCount) {
-    const failedItems = Array.isArray(result?.failed_items) ? result.failed_items : [];
-    const expectedFailed = Number(result?.metrics?.failed);
-    const indexes = new Set();
-    const failedCues = Array.isArray(result?.failed_cues) && result.failed_cues.length > 0
-      ? result.failed_cues
-      : failedItems.map((item) => item?.cue);
-    for (const cue of failedCues) {
-      const index = Number(cue) - 1;
-      if (Number.isInteger(index) && index >= 0 && index < unitCount) indexes.add(index);
-    }
-    // metrics.failed counts failed text lines, while the mixed scheduler owns
-    // whole cues. Multiple failed lines in one cue therefore legitimately map
-    // to one retry unit and must not be mistaken for missing diagnostics.
-    if ((failedCues.length > 0 && indexes.size === 0) ||
-      (Number.isFinite(expectedFailed) && expectedFailed > 0 && failedCues.length === 0)) {
-      const error = new Error("混合翻译分片没有返回可定位全部失败 cue 的明细");
-      error.code = "TRANSLATION_FAILURE_DETAILS_MISSING";
-      error.phase = "translation";
-      error.details = { expectedFailedLines: expectedFailed, locatedFailedCues: indexes.size };
-      throw error;
-    }
-    return indexes;
-  }
-
   function mixedPermanentFailure(error) {
     const code = String(error?.code || error?.error_code || "").toUpperCase();
     const status = Number(error?.status ?? error?.statusCode);
@@ -895,6 +1158,333 @@
       return translateWithBackend(cfg?.customBackendUrl || backendUrl, payload, options);
     }
     return translateInExtension(payload, options);
+  }
+
+  function buildResumeCueVtt(sourceParsed, failedIndexes) {
+    const units = failedIndexes
+      .map((index) => sourceParsed.units[index])
+      .filter(Boolean);
+    return buildMixedShardVtt(units);
+  }
+
+  function cueIndexFromFailureItem(item, parsed) {
+    if (!item || typeof item !== "object" || !parsed?.units?.length) return null;
+    const cue = Number(item.cue);
+    if (Number.isSafeInteger(cue) && cue > 0 && cue <= parsed.units.length) return cue - 1;
+    const line = Number(item.line);
+    if (Number.isSafeInteger(line) && line > 0) {
+      for (let index = 0; index < parsed.units.length; index += 1) {
+        if (parsed.units[index].textIndexes.includes(line - 1)) return index;
+      }
+    }
+    const itemIndex = Number(item.item);
+    if (Number.isSafeInteger(itemIndex) && itemIndex > 0) {
+      let current = 0;
+      for (let index = 0; index < parsed.units.length; index += 1) {
+        current += parsed.units[index].textIndexes.length;
+        if (itemIndex <= current) return index;
+      }
+    }
+    return null;
+  }
+
+  function mapRetryFailureItems(result, retryParsed, originalIndexes, sourceParsed) {
+    const items = [];
+    for (const rawItem of resultFailureItems(result)) {
+      if (!rawItem || typeof rawItem !== "object") continue;
+      const retryIndex = cueIndexFromFailureItem(rawItem, retryParsed);
+      if (retryIndex == null || originalIndexes[retryIndex] == null) continue;
+      const originalIndex = originalIndexes[retryIndex];
+      const sourceUnit = sourceParsed.units[originalIndex];
+      const next = { ...rawItem, cue: originalIndex + 1 };
+      // A provider reports `line` in the child VTT.  Translate it back to the
+      // physical line in the full source so the normal UI/error validators can
+      // still highlight the correct original cue.
+      const retryLine = Number(rawItem.line);
+      if (Number.isSafeInteger(retryLine) && retryLine > 0) {
+        const retryTextOffset = retryParsed.units[retryIndex]?.textIndexes?.indexOf(retryLine - 1) ?? -1;
+        if (retryTextOffset >= 0) {
+          const textOffset = retryTextOffset;
+          next.line = (sourceUnit?.textIndexes?.[textOffset] ?? sourceUnit?.textIndexes?.[0] ?? 0) + 1;
+        } else {
+          next.line = (sourceUnit?.textIndexes?.[0] ?? 0) + 1;
+        }
+      } else {
+        next.line = (sourceUnit?.textIndexes?.[0] ?? 0) + 1;
+      }
+      items.push(next);
+    }
+    return items;
+  }
+
+  function errorAsRetryResult(error, retryPayload) {
+    const partialVtt = typeof error?.partial_vtt === "string" && error.partial_vtt.trim()
+      ? error.partial_vtt
+      : retryPayload.vtt_text;
+    return {
+      translated_vtt: partialVtt,
+      failed_items: Array.isArray(error?.failed_items) ? error.failed_items : [],
+      failed_cues: Array.isArray(error?.failed_cues) ? error.failed_cues : [],
+      ...(Array.isArray(error?.failed_lines) ? { failed_lines: error.failed_lines } : {}),
+      failure_codes: error?.failure_codes || error?.failureCodes || {},
+      failureCodes: error?.failureCodes || error?.failure_codes || {},
+      metrics: error?.metrics && typeof error.metrics === "object" ? error.metrics : {},
+      warnings: Array.isArray(error?.warnings) ? error.warnings : [],
+      provider: error?.provider || retryPayload.provider,
+      target: error?.target || retryPayload.target,
+    };
+  }
+
+  function failedResumeAttempt(checkpoint, error, sourceParsed) {
+    const base = checkpoint.result;
+    const normalized = ns.errorUtils?.normalizeError?.(error) || {};
+    const code = normalized.code && !ns.errorUtils?.isGenericCode?.(normalized.code)
+      ? normalized.code : "RESUME_RETRY_FAILED";
+    const message = String(error?.message || "补译请求失败，已保留之前的译文");
+    const failureCodes = { [code]: base.metrics.failed };
+    return {
+      ...base,
+      warnings: [message],
+      failed_items: resultFailureItems(base).map(item => ({
+        ...item, code, message, status: normalized.status || null,
+        source_text: item.source_text || sourceParsed.lines[Number(item.line) - 1] || "",
+      })),
+      failure_codes: failureCodes,
+      failureCodes,
+      metrics: { ...base.metrics, failureCodes, failure_codes: failureCodes },
+      cache_hit: false,
+    };
+  }
+
+  function mergeResumeVtt(baseVtt, sourceParsed, retryVtt, originalIndexes, pendingLines) {
+    const base = parseMixedCueUnits(baseVtt);
+    const retry = parseMixedCueUnits(retryVtt);
+    if (base.units.length !== sourceParsed.units.length || retry.units.length !== originalIndexes.length) {
+      throw checkpointError("断点重试返回的字幕 cue 数量不匹配", "INCOMPLETE_TRANSLATED_VTT", {
+        expectedRetryCues: originalIndexes.length,
+        actualRetryCues: retry.units.length,
+      });
+    }
+    const lines = [...base.lines];
+    for (let retryIndex = 0; retryIndex < originalIndexes.length; retryIndex += 1) {
+      const originalIndex = originalIndexes[retryIndex];
+      const sourceUnit = sourceParsed.units[originalIndex];
+      const retryUnit = retry.units[retryIndex];
+      if (!sourceUnit || !retryUnit || sourceUnit.textIndexes.length !== retryUnit.textIndexes.length ||
+        cueTimingSignature(sourceUnit) !== cueTimingSignature(retryUnit)) {
+        throw checkpointError("断点重试返回的字幕结构与原始 cue 不一致", "TRANSLATION_TIMELINE_MISMATCH", {
+          cue: originalIndex + 1,
+        });
+      }
+      for (let lineIndex = 0; lineIndex < sourceUnit.textIndexes.length; lineIndex += 1) {
+        if (!pendingLines || pendingLines.has(sourceUnit.textIndexes[lineIndex])) {
+          lines[base.units[originalIndex].textIndexes[lineIndex]] = retry.lines[retryUnit.textIndexes[lineIndex]];
+        }
+      }
+    }
+    return lines.join("\n");
+  }
+
+  function mergeResumePartialVtt(checkpoint, sourceParsed, retryVtt, originalIndexes) {
+    try {
+      return mergeResumeVtt(checkpoint.translatedVtt, sourceParsed, retryVtt, originalIndexes,
+        failedLineIndexesForResult(checkpoint.result, sourceParsed));
+    } catch (_) {
+      return checkpoint.translatedVtt;
+    }
+  }
+
+  function mergeResumeResult(checkpoint, sourceVtt, retryResult, originalIndexes) {
+    const baseResult = checkpoint.result || {};
+    const sourceParsed = parseMixedCueUnits(sourceVtt);
+    const retryParsed = parseMixedCueUnits(buildResumeCueVtt(sourceParsed, originalIndexes));
+    const baseFailedLines = failedLineIndexesForResult(baseResult, sourceParsed);
+    const retryFailedLines = failedLineIndexesForResult(retryResult, retryParsed);
+    if (!baseFailedLines || !retryFailedLines) {
+      throw checkpointError("补译结果没有完整、可验证的失败行位置", "TRANSLATION_FAILURE_DETAILS_MISSING");
+    }
+    const mergedVtt = mergeResumeVtt(checkpoint.translatedVtt, sourceParsed,
+      retryResult.translated_vtt, originalIndexes, baseFailedLines);
+    const lineMap = new Map(originalIndexes.flatMap((originalIndex, retryIndex) =>
+      retryParsed.units[retryIndex].textIndexes.map((line, offset) => [line, sourceParsed.units[originalIndex].textIndexes[offset]])));
+    const pendingRetryLines = new Set([...retryFailedLines].filter(line => baseFailedLines.has(lineMap.get(line))));
+    const allFailedItems = mapRetryFailureItems({
+      failed_items: failureItemsForLines(retryResult, retryParsed, pendingRetryLines),
+    }, retryParsed, originalIndexes, sourceParsed);
+    const failedItems = allFailedItems.slice(0, 50);
+    const finalFailedIndexes = new Set(allFailedItems.map(item => item.cue - 1));
+    const failedLines = allFailedItems.length;
+    const totalLines = sourceParsed.units.reduce((sum, unit) => sum + unit.textIndexes.length, 0);
+    const failureCodes = {};
+    for (const item of allFailedItems) failureCodes[item.code] = (failureCodes[item.code] || 0) + 1;
+
+    const baseMetrics = baseResult.metrics && typeof baseResult.metrics === "object" ? baseResult.metrics : {};
+    const retryMetrics = retryResult.metrics && typeof retryResult.metrics === "object" ? retryResult.metrics : {};
+    const translatedLines = Math.max(0, totalLines - failedLines);
+    const observedFailureCodes = {};
+    for (const result of [baseResult, retryResult]) {
+      addMixedCountMap(observedFailureCodes, result.metrics?.observedFailureCodes ||
+        result.metrics?.observed_failure_codes || resultFailureCodes(result));
+    }
+    const metrics = {
+      ...baseMetrics,
+      total: totalLines,
+      processed: totalLines,
+      translated: translatedLines,
+      failed: failedLines,
+      providerResults: translatedLines,
+      provider_results: translatedLines,
+      targetResults: translatedLines,
+      target_results: translatedLines,
+      totalCues: sourceParsed.units.length,
+      processedCues: sourceParsed.units.length,
+      translatedCues: Math.max(0, sourceParsed.units.length - finalFailedIndexes.size),
+      failedCues: finalFailedIndexes.size,
+      failureCodes: { ...failureCodes },
+      failure_codes: { ...failureCodes },
+      failed_items: failedItems,
+      failed_lines: allFailedItems.map(item => item.line),
+      failed_cues: Array.from(finalFailedIndexes).sort((a, b) => a - b).map(index => index + 1),
+      observedFailureCodes,
+      observed_failure_codes: { ...observedFailureCodes },
+      retryCount: (Number(baseMetrics.retryCount) || 0) + (Number(retryMetrics.retryCount) || 0),
+      rateLimitCount: (Number(baseMetrics.rateLimitCount) || 0) + (Number(retryMetrics.rateLimitCount) || 0),
+      google429Responses: (Number(baseMetrics.google429Responses) || 0) + (Number(retryMetrics.google429Responses) || 0),
+    };
+    const merged = {
+      ...baseResult,
+      ...retryResult,
+      translated_vtt: mergedVtt,
+      // A resolved checkpoint failure must not keep the previous attempt's
+      // "cue failed" warning. Provider/cache context from the current retry
+      // remains useful and is surfaced by the controller.
+      warnings: failedLines > 0 ? [...new Set(Array.isArray(retryResult.warnings) ? retryResult.warnings : [])] : [],
+      failed_items: failedItems,
+      failed_lines: allFailedItems.map(item => item.line),
+      failed_cues: Array.from(finalFailedIndexes).sort((left, right) => left - right).map((index) => index + 1),
+      failure_codes: { ...failureCodes },
+      failureCodes: { ...failureCodes },
+      metrics,
+      cache_hit: false,
+    };
+    return merged;
+  }
+
+  async function translateWithResumeCheckpoint(cfg, backendUrl, payload, options, checkpoint) {
+    const sourceParsed = parseMixedCueUnits(payload.vtt_text);
+    const failedIndexes = Array.isArray(checkpoint.failedCueIndexes)
+      ? checkpoint.failedCueIndexes.map(Number).filter((index) => Number.isSafeInteger(index) && index >= 0 && index < sourceParsed.units.length)
+      : Array.from(failedCueIndexesForResult(checkpoint.result, sourceParsed).cues);
+    const uniqueIndexes = Array.from(new Set(failedIndexes)).sort((left, right) => left - right);
+    if (uniqueIndexes.length === 0) return checkpoint.result;
+    const retryVtt = buildResumeCueVtt(sourceParsed, uniqueIndexes);
+    const retryPayload = {
+      ...payload,
+      vtt_text: retryVtt,
+      // A checkpoint is explicitly a request to revisit failed work. Avoid a
+      // provider-side source cache returning the same failed response.
+      force_refresh: true,
+    };
+    const totalLines = sourceParsed.units.reduce((sum, unit) => sum + unit.textIndexes.length, 0);
+    const retryLineCount = uniqueIndexes.reduce((sum, index) => sum + sourceParsed.units[index].textIndexes.length, 0);
+    const completedBeforeRetry = totalLines - retryLineCount;
+    const retryParsed = parseMixedCueUnits(retryVtt);
+    const pendingLines = failedLineIndexesForResult(checkpoint.result, sourceParsed);
+    const retryLineMap = new Map(uniqueIndexes.flatMap((originalIndex, retryIndex) =>
+      retryParsed.units[retryIndex].textIndexes.map((line, offset) =>
+        [line + 1, sourceParsed.units[originalIndex].textIndexes[offset] + 1])));
+    const retryOptions = {
+      ...options,
+      resumeCheckpoint: undefined,
+      onProgress: (current, total, line = "", details = {}) => {
+        const currentNumber = Number(current) || 0;
+        options.onProgress?.(
+          Math.min(totalLines, completedBeforeRetry + currentNumber),
+          totalLines,
+          line,
+          { ...details, resumed: true, resumeCues: uniqueIndexes.length }
+        );
+      },
+      onPartialVtt: (partialVtt, details = {}) => {
+        const mergedPartial = mergeResumePartialVtt(checkpoint, sourceParsed, partialVtt, uniqueIndexes);
+        const progressResult = {
+          failed_items: details.failed_items || details.failedItems || details.metrics?.failed_items || details.metrics?.failedItems || [],
+          failed_cues: details.failed_cues || details.failedCues || details.metrics?.failed_cues || details.metrics?.failedCues || [],
+          metrics: details.metrics || {},
+        };
+        const localProgressFailures = failedCueIndexesForResult(progressResult, retryParsed, { strict: false });
+        const localFailedLines = details.failed_lines ?? details.metrics?.failed_lines;
+        const globalFailedLines = Array.isArray(localFailedLines)
+          ? [...new Set(localFailedLines.map(line => retryLineMap.get(Number(line))))]
+            .filter(line => line != null && pendingLines.has(line - 1)).sort((a, b) => a - b)
+          : null;
+        const remappedFailedItems = mapRetryFailureItems(progressResult, retryParsed, uniqueIndexes, sourceParsed)
+          .filter(item => pendingLines.has(Number(item.line) - 1));
+        const globalFailedCues = globalFailedLines !== null
+          ? sourceParsed.units.filter(unit => unit.textIndexes.some(line => globalFailedLines.includes(line + 1))).map(unit => unit.index + 1)
+          : Array.from(localProgressFailures.cues)
+          .map((index) => uniqueIndexes[index])
+          .filter((index) => index != null)
+          .sort((left, right) => left - right)
+          .map((index) => index + 1);
+        options.onPartialVtt?.(mergedPartial, {
+          ...details,
+          failed_cues: globalFailedCues,
+          failedCues: globalFailedCues,
+          failed_items: remappedFailedItems,
+          ...(globalFailedLines !== null ? { failed_lines: globalFailedLines } : {}),
+          ...(details.metrics ? { metrics: { ...details.metrics,
+            failed_items: remappedFailedItems, failed_cues: globalFailedCues,
+            ...(globalFailedLines !== null ? { failed_lines: globalFailedLines } : {}),
+          } } : {}),
+          resumed: true,
+          current: Math.min(totalLines, completedBeforeRetry + (Number(details.current || details.completed) || 0)),
+          completed: Math.min(totalLines, completedBeforeRetry + (Number(details.completed || details.current) || 0)),
+          total: totalLines,
+        });
+      },
+    };
+
+    let retryResult;
+    try {
+      retryResult = await translateConfiguredOnce(cfg, backendUrl, retryPayload, retryOptions);
+    } catch (error) {
+      const errorCode = String(error?.code || "").toUpperCase();
+      if (errorCode === "TRANSLATION_CANCELLED" || errorCode === "STALE_JOB" || error?.name === "AbortError") {
+        throw error;
+      }
+      // A provider can reject a child job because every remaining cue failed.
+      // Validate the combined result, whose earlier successful cues still count.
+      // Unstructured/network failures preserve the whole checkpoint, including
+      // already successful lines inside a partially failed multiline cue.
+      const candidate = errorAsRetryResult(error, retryPayload);
+      if (resultFailureLineCount(candidate) > 0) {
+        try {
+          const merged = mergeResumeResult(checkpoint, payload.vtt_text, candidate, uniqueIndexes);
+          return ns.backendClient.validateTranslationResult(merged, "translation", {
+            sourceVtt: payload.vtt_text, target: payload.target, provider: payload.provider,
+            bilingual: payload.bilingual === true,
+          });
+        } catch (_) { /* Keep the last verified checkpoint when a child response is incomplete. */ }
+      }
+      const preserved = failedResumeAttempt(checkpoint, error, sourceParsed);
+      return ns.backendClient.validateTranslationResult(preserved, "translation", {
+        sourceVtt: payload.vtt_text, target: payload.target, provider: payload.provider,
+        bilingual: payload.bilingual === true,
+      });
+    }
+
+    const merged = mergeResumeResult(checkpoint, payload.vtt_text, retryResult, uniqueIndexes);
+    const validate = ns.backendClient?.validateTranslationResult;
+    if (typeof validate === "function") {
+      return validate(merged, "translation", {
+        sourceVtt: payload.vtt_text,
+        target: payload.target,
+        provider: payload.provider,
+        bilingual: payload.bilingual === true,
+      });
+    }
+    return merged;
   }
 
   async function translateMixed(cfg, backendUrl, payload, options = {}) {
@@ -958,6 +1548,76 @@
     const routeProgress = new Map();
     const warnings = [];
     let completedLines = 0;
+    const verifiedText = new Map();
+    const failuresByLine = new Map();
+
+    function isCancelled(error) {
+      return ["TRANSLATION_CANCELLED", "STALE_JOB"].includes(String(error?.code || "").toUpperCase()) || error?.name === "AbortError";
+    }
+
+    function restoreVerifiedText() {
+      for (const [line, text] of verifiedText) outputLines[line] = text;
+    }
+
+    function recordRouteFailure(units, error) {
+      const code = String(error?.code || error?.error_code || "MIXED_ALL_PROVIDERS_FAILED");
+      for (const unit of units) {
+        const timing = cueTimingSignature(unit).match(/^(\S+)\s*-->\s*(\S+)/);
+        for (const line of unit.textIndexes) {
+          if (verifiedText.has(line)) continue;
+          outputLines[line] = parsed.lines[line];
+          failuresByLine.set(line, {
+            cue: unit.index + 1, line: line + 1,
+            code, message: String(error?.message || "所有候选翻译服务均未完成该行"),
+            ...(error?.status ? { status: error.status } : {}),
+            source_text: parsed.lines[line],
+            timecode: timing ? `${timing[1]} --> ${timing[2]}` : "",
+            start_time: timing?.[1] || "", end_time: timing?.[2] || "",
+          });
+        }
+      }
+      restoreVerifiedText();
+    }
+
+    // A route still sends whole cues, but acceptance is monotonic per text
+    // line. A fallback cannot erase a line verified by an earlier provider.
+    function acceptRouteResult(result, childSource, units) {
+      const structure = checkpointStructure(childSource, result.translated_vtt);
+      if (!structure) throw checkpointError("混合翻译分片返回了不匹配的字幕结构", "INCOMPLETE_TRANSLATED_VTT");
+      let failedLines = failedLineIndexesForResult(result, structure.source);
+      if (!failedLines) {
+        // Older providers may identify only whole failed cues. Conservatively
+        // retry those entire cues instead of guessing which rows succeeded.
+        const located = failedCueIndexesForResult(result, structure.source, { strict: true });
+        if (!located.valid) throw checkpointError("混合翻译分片缺少完整失败位置", "TRANSLATION_FAILURE_DETAILS_MISSING");
+        failedLines = new Set([...located.cues].flatMap(cue => structure.source.units[cue].textIndexes));
+      }
+      const mappedFailures = mapRetryFailureItems({
+        failed_items: failureItemsForLines(result, structure.source, failedLines),
+      }, structure.source, units.map(unit => unit.index), parsed);
+      for (const item of mappedFailures) {
+        if (!verifiedText.has(item.line - 1)) failuresByLine.set(item.line - 1, item);
+      }
+      let succeededLines = 0;
+      const failedIndexes = new Set();
+      units.forEach((unit, cue) => {
+        unit.textIndexes.forEach((line, offset) => {
+          const childLine = structure.source.units[cue].textIndexes[offset];
+          if (!verifiedText.has(line) && !failedLines.has(childLine)) {
+            verifiedText.set(line, structure.translated.lines[structure.translated.units[cue].textIndexes[offset]]);
+            failuresByLine.delete(line);
+            succeededLines += 1;
+          }
+          if (!verifiedText.has(line)) {
+            outputLines[line] = parsed.lines[line];
+            failedIndexes.add(cue);
+          }
+        });
+      });
+      restoreVerifiedText();
+      completedLines += succeededLines;
+      return { succeededLines, failedIndexes };
+    }
 
     function providerBreakdownSnapshot() {
       return Object.fromEntries(Array.from(providerState.entries()).map(([provider, state]) => [
@@ -1059,6 +1719,9 @@
       let pendingUnits = [...group.units];
       let completedRouteLines = 0;
       while (pendingUnits.length > 0 && attempted.size < providers.length) {
+        if (typeof options.isActive === "function" && !options.isActive()) {
+          throw checkpointError("翻译任务已失效", "STALE_JOB");
+        }
         const candidate = attempted.size === 0
           ? group.provider
           : providers
@@ -1098,6 +1761,7 @@
             ),
             onPartialVtt: (partialVtt, partialMeta = {}) => {
               const merged = applyMixedShardPartial(outputLines, parsed.lines, attemptedUnits, partialVtt);
+              restoreVerifiedText();
               const partialCurrent = Number(partialMeta?.current ?? partialMeta?.completed ?? 0);
               const partialTotal = Number(partialMeta?.total ?? attemptedLines);
               const inFlight = reportProgress(
@@ -1137,13 +1801,9 @@
             },
           }));
           absorbProviderTelemetry(candidate, result);
-          const failedIndexes = mixedFailedUnitIndexes(result, attemptedUnits.length);
-          applyMixedShardResult(outputLines, attemptedUnits, result, failedIndexes);
-          resetMixedUnits(outputLines, parsed.lines, attemptedUnits, failedIndexes);
+          const { failedIndexes, succeededLines } = acceptRouteResult(result, childPayload.vtt_text, attemptedUnits);
           const succeededUnits = attemptedUnits.filter((_unit, index) => !failedIndexes.has(index));
-          const succeededLines = succeededUnits.reduce((sum, unit) => sum + unit.textCount, 0);
           state.completedCues += succeededUnits.length;
-          completedLines += succeededLines;
           completedRouteLines += succeededLines;
           routeProgress.set(group.provider, completedRouteLines);
           options.onPartialVtt?.(outputLines.join("\n"), {
@@ -1183,6 +1843,18 @@
           if (mixedPermanentFailure(firstFailure) || state.failures >= 2) state.circuitOpen = true;
           warnings.push(`${candidate} 有 ${pendingUnits.length} 个 cue 失败${state.circuitOpen ? "，本次任务已熔断" : ""}；已保留 ${succeededUnits.length} 个成功 cue 并改派。`);
         } catch (error) {
+          if (isCancelled(error)) throw error;
+          recordRouteFailure(attemptedUnits, error);
+          if (error?.partial_vtt && resultFailureLineCount(error) > 0) {
+            try {
+              const accepted = acceptRouteResult(errorAsRetryResult(error, childPayload), childPayload.vtt_text, attemptedUnits);
+              completedRouteLines += accepted.succeededLines;
+              const completedCues = attemptedUnits.length - accepted.failedIndexes.size;
+              state.completedCues += completedCues;
+              pendingUnits = attemptedUnits.filter((_unit, index) => accepted.failedIndexes.has(index));
+              if (pendingUnits.length === 0) return;
+            } catch (_) { /* Retain only previously verified rows for incomplete errors. */ }
+          }
           absorbProviderTelemetry(candidate, error);
           lastError = error;
           state.failures += 1;
@@ -1190,62 +1862,28 @@
           warnings.push(`${candidate} 分片失败${state.circuitOpen ? "，本次任务已熔断" : ""}：${error?.message || String(error)}`);
         }
       }
-      const error = new Error(`混合翻译仍有 ${pendingUnits.length} 个 cue 无法完成；所有候选服务均失败`);
-      error.code = "MIXED_ALL_PROVIDERS_FAILED";
-      error.phase = "translation";
-      error.cause = lastError;
-      error.warnings = warnings.slice(0, 30);
-      error.providerBreakdown = providerBreakdownSnapshot();
-      error.metrics = {
-        provider: "mixed",
-        total: totalLines,
-        totalCues: parsed.units.length,
-        processed: completedLines,
-        translated: completedLines,
-        failed: Math.max(0, totalLines - completedLines),
-        providerResults: completedLines,
-        targetResults: completedLines,
-        providerBreakdown: error.providerBreakdown,
-        ...mixedTelemetry(),
-      };
-      error.failure_codes = { ...error.metrics.observedFailureCodes };
-      error.failureCodes = { ...error.metrics.observedFailureCodes };
-      error.partial_vtt = outputLines.join("\n");
-      throw error;
+      // All candidates were attempted. Unresolved rows already carry the
+      // latest diagnostic; siblings may still finish before finalization.
+      for (const unit of pendingUnits) {
+        if (unit.textIndexes.some(line => !verifiedText.has(line) && !failuresByLine.has(line))) {
+          recordRouteFailure([unit], lastError);
+        }
+      }
     }
 
-    // Wait for every route to settle before surfacing a terminal error. Using
-    // Promise.all here would reject immediately while sibling provider calls
-    // continued in the background, producing confusing progress/cache writes
-    // after the UI had already reported failure.
-    const routeResults = await Promise.allSettled(groups.map((group) => runRoute(group)));
-    const failedRoute = routeResults.find((item) => item.status === "rejected");
-    if (failedRoute) {
-      const error = failedRoute.reason instanceof Error
-        ? failedRoute.reason
-        : new Error(String(failedRoute.reason || "混合翻译失败"));
-      error.code = error.code || "MIXED_ALL_PROVIDERS_FAILED";
-      error.phase = error.phase || "translation";
-      error.warnings = warnings.slice(0, 30);
-      error.providerBreakdown = providerBreakdownSnapshot();
-      error.metrics = {
-        ...(error.metrics && typeof error.metrics === "object" ? error.metrics : {}),
-        provider: "mixed",
-        total: totalLines,
-        totalCues: parsed.units.length,
-        processed: completedLines,
-        translated: completedLines,
-        failed: Math.max(0, totalLines - completedLines),
-        providerResults: completedLines,
-        targetResults: completedLines,
-        providerBreakdown: error.providerBreakdown,
-        ...mixedTelemetry(),
-      };
-      error.failure_codes = error.failure_codes || { ...error.metrics.observedFailureCodes };
-      error.failureCodes = error.failureCodes || { ...error.metrics.observedFailureCodes };
-      error.partial_vtt = outputLines.join("\n");
-      throw error;
+    const routeResults = await Promise.allSettled(groups.map(group => runRoute(group)));
+    const rejected = routeResults.find(item => item.status === "rejected" && isCancelled(item.reason)) ||
+      routeResults.find(item => item.status === "rejected");
+    if (rejected) throw rejected.reason;
+    if (typeof options.isActive === "function" && !options.isActive()) {
+      throw checkpointError("翻译任务已失效", "STALE_JOB");
     }
+    const allFailedItems = [...failuresByLine.entries()]
+      .filter(([line]) => !verifiedText.has(line)).sort(([a], [b]) => a - b).map(([, item]) => item);
+    const failedLines = allFailedItems.map(item => item.line);
+    const failedCues = [...new Set(allFailedItems.map(item => item.cue))];
+    const failureCodes = {};
+    for (const item of allFailedItems) failureCodes[item.code] = (failureCodes[item.code] || 0) + 1;
     const telemetry = mixedTelemetry();
     const providerBreakdown = providerBreakdownSnapshot();
     const metrics = {
@@ -1254,16 +1892,19 @@
       totalCues: parsed.units.length,
       processed: totalLines,
       processedCues: parsed.units.length,
-      translated: totalLines,
-      translatedCues: parsed.units.length,
-      failed: 0,
-      failedCues: 0,
-      providerResults: totalLines,
-      provider_results: totalLines,
-      targetResults: totalLines,
-      target_results: totalLines,
-      failureCodes: {},
-      failure_codes: {},
+      translated: completedLines,
+      translatedCues: parsed.units.length - failedCues.length,
+      failed: failedLines.length,
+      failedCues: failedCues.length,
+      providerResults: completedLines,
+      provider_results: completedLines,
+      targetResults: completedLines,
+      target_results: completedLines,
+      failed_items: allFailedItems.slice(0, 50),
+      failed_lines: failedLines,
+      failed_cues: failedCues,
+      failureCodes,
+      failure_codes: { ...failureCodes },
       providerBreakdown,
       ...telemetry,
     };
@@ -1298,9 +1939,11 @@
       provider: "mixed",
       target: payload.target,
       warnings,
-      failed_items: [],
-      failure_codes: {},
-      failureCodes: {},
+      failed_items: allFailedItems.slice(0, 50),
+      failed_lines: failedLines,
+      failed_cues: failedCues,
+      failure_codes: failureCodes,
+      failureCodes: { ...failureCodes },
       metrics,
       cache_hit: false,
     };
@@ -1308,10 +1951,21 @@
       completed: totalLines,
       total: totalLines,
       done: true,
-      translated: totalLines,
-      failed: 0,
+      translated: completedLines,
+      failed: failedLines.length,
+      failed_items: result.failed_items,
+      failed_cues: failedCues,
+      failed_lines: failedLines,
       metrics,
     });
+    if (completedLines === 0 && failedLines.length > 0) {
+      const error = new Error(`混合翻译仍有 ${failedCues.length} 个 cue 无法完成；所有候选服务均失败`);
+      Object.assign(error, result, {
+        code: "MIXED_ALL_PROVIDERS_FAILED", phase: "translation",
+        partial_vtt: result.translated_vtt, providerBreakdown,
+      });
+      throw error;
+    }
     const validate = ns.backendClient?.validateTranslationResult;
     return typeof validate === "function"
       ? validate(result, "translation", {
@@ -1323,7 +1977,7 @@
       : result;
   }
 
-  async function translateWithConfig(cfg, backendUrl, payload, options = {}) {
+  async function translateConfiguredOnce(cfg, backendUrl, payload, options = {}) {
     if (String(payload?.provider || cfg?.provider || "").toLowerCase() === "mixed") {
       return translateMixed(cfg, backendUrl, payload, options);
     }
@@ -1337,6 +1991,18 @@
     }
   }
 
+  async function translateWithConfig(cfg, backendUrl, payload, options = {}) {
+    const checkpoint = validateTranslationCheckpoint(options.resumeCheckpoint, payload?.vtt_text, {
+      target: payload?.target || cfg?.target,
+      provider: payload?.provider || cfg?.provider,
+      requireFailures: true,
+    });
+    if (checkpoint) {
+      return translateWithResumeCheckpoint(cfg, backendUrl, payload, options, checkpoint);
+    }
+    return translateConfiguredOnce(cfg, backendUrl, payload, options);
+  }
+
   async function buildCacheKey(cfg, sourceId, vttText, options = {}) {
     const stableSourceId = String(ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId || "").trim();
     // A canonical source URL already identifies the subtitle bytes for cache
@@ -1344,8 +2010,11 @@
     // unless the source adapter could not provide a stable identifier.
     const sourceKey = stableSourceId || `${location.href}#${await ns.storage.sha256Text(vttText)}`;
     const baseConfigSig = ns.storage.buildConfigSignature(cfg);
+    // Merge mode is identified by algorithm version, not by hashing grouped
+    // VTT. A canonical source URL already stands in for subtitle bytes; the
+    // cache validator still rejects stored cues that no longer line up.
     const configSig = options.sentenceMergeEnabled === true
-      ? `${baseConfigSig}::sentence-merge-v2:${await ns.storage.sha256Text(vttText)}`
+      ? `${baseConfigSig}::sentence-merge-v2`
       : baseConfigSig;
     return {
       sourceKey,
@@ -1360,6 +2029,8 @@
     translateWithBackend,
     translateInExtension,
     translateWithConfig,
+    buildTranslationCheckpoint,
+    validateTranslationCheckpoint,
     shouldFallbackGoogleToArgos,
     buildArgosFallbackPayload,
     normalizeMixedProviders,

@@ -33,10 +33,15 @@ function audit(ns, source) {
   for (const group of plan.groups) {
     for (const index of group.sourceIndices) sourceGroups[index]?.push(group);
   }
-  const displayWords = sourceGroups.map(groups => groups.reduce((sum, group) => sum + words(group.text), 0));
+  const stackedWords = sourceGroups.map(groups => groups.reduce((sum, group) => sum + words(group.text), 0));
+  const projected = ns.sentenceMerge.project(source, plan.vtt, plan, false);
+  const overlay = ns.vtt.parseVttCues(projected.translatedVtt);
+  const overlayWords = overlay.map(cue => words(cue.text));
   const wordsPreserved = plain(cues.map(cue => cue.text).join(" ")) === plain(plan.groups.map(group => group.text).join(" "));
   const allCuesMapped = sourceGroups.every(groups => groups.length > 0);
-  const originalEnglishUnchanged = ns.sentenceMerge.project(source, plan.vtt, plan, false).originalVtt === source;
+  const originalEnglishUnchanged = (projected.sourceOriginalVtt || projected.originalVtt) === source;
+  const overlayEnglishMatchesSourceRows = overlay.length === cues.length &&
+    overlay.every((cue, index) => cue.startMs === cues[index].startMs && cue.endMs === cues[index].endMs);
   if (!wordsPreserved || !allCuesMapped || !originalEnglishUnchanged) process.exitCode = 1;
   return {
     sourceCues: cues.length, translationUnits: counts.length,
@@ -44,7 +49,13 @@ function audit(ns, source) {
     p95Words: percentile(counts, .95), maxWords: Math.max(0, ...counts),
     unitsOver40Words: counts.filter(n => n > 40).length,
     sourceCuesInMultipleGroups: sourceGroups.filter(groups => groups.length > 1).length,
-    displayP95SourceWords: percentile(displayWords, .95), displayMaxSourceWords: Math.max(0, ...displayWords),
+    stackedDisplayP95SourceWords: percentile(stackedWords, .95),
+    stackedDisplayMaxSourceWords: Math.max(0, ...stackedWords),
+    overlayEvents: overlay.length,
+    overlayP95Words: percentile(overlayWords, .95),
+    overlayMaxWords: Math.max(0, ...overlayWords),
+    overlaySplitExtraEvents: overlay.length - cues.length,
+    overlayKeptOriginalCueShape: overlayEnglishMatchesSourceRows,
     wordsPreserved, allCuesMapped, originalEnglishUnchanged,
   };
 }
