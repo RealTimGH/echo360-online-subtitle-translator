@@ -4,20 +4,24 @@
   const OVERLAY_ATTR = "data-echo360-echo-caption";
   const LINE_ATTR = "data-echo360-echo-caption-line";
   const STACK_ATTR = "data-echo360-echo-caption-stack";
-  const SIZE_MAP = { small: 0.88, medium: 1, large: 1.14 };
+  const SIZE_MAP = { small: 0.78, medium: 0.88, large: 1 };
   const CAPTION_GAP_PX = 6;
+  const IDENTICAL_CUE_HOLD_S = 1.5;
   const LAYOUT_REFRESH_MS = 900;
   const LAYOUT_REFRESH_INTERVAL_MS = 100;
-  // Echo360 inserts/removes the native cue node asynchronously after the
-  // media cue has become active.  Do not expose a temporary fallback position
-  // during that short interval: it is the source of the visible "jump" before
-  // the English line appears.
-  const NATIVE_CUE_GRACE_MS = 420;
+  const MUTATION_OPTIONS = {
+    attributes: true,
+    attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-pressed", "aria-checked",
+      "data-state", "data-active", "data-enabled"],
+    childList: true,
+    characterData: true,
+    subtree: true,
+  };
 
   let state = null;
 
   function parseTime(value) {
-    const parts = String(value || "").trim().split(":");
+    const parts = String(value || "").trim().split(/\s+/)[0].split(":");
     if (parts.length !== 2 && parts.length !== 3) return NaN;
     const seconds = Number(parts[parts.length - 1]);
     const minutes = Number(parts[parts.length - 2]);
@@ -61,12 +65,27 @@
     });
   }
 
+  function sameOverlayText(left, right) {
+    return !!left && !!right && left.original === right.original && left.translated === right.translated;
+  }
+
+  function stickyIdenticalCueIndex(time, previousIndex) {
+    if (previousIndex < 0) return -1;
+    const previous = state.cues[previousIndex];
+    const next = state.cues[previousIndex + 1];
+    if (!previous || !next || !sameOverlayText(previous, next)) return -1;
+    if (time < previous.end || time >= next.start) return -1;
+    if (next.start - previous.end > IDENTICAL_CUE_HOLD_S) return -1;
+    return previousIndex;
+  }
+
   function findCueIndex(time) {
     if (!state?.cues.length) return -1;
     const previous = state.currentCueIndex;
     if (previous >= 0) {
       const cue = state.cues[previous];
-      if (time >= cue.start && time < cue.end) return previous;
+      if (time >= cue.start && time < cue.end &&
+        (!state.cues[previous + 1] || state.cues[previous + 1].start > time)) return previous;
     }
     let low = 0;
     let high = state.cues.length - 1;
@@ -163,6 +182,7 @@
       if (cached) return cached;
     }
     const result = [];
+    const shadowRoots = new Set();
     const seen = new Set();
     const visit = (container) => {
       const descendants = Array.from(container?.querySelectorAll?.("*") || []);
@@ -174,11 +194,29 @@
         // A shadow host is not necessarily itself a match for `selector`.
         // Traverse every host so a caption toggle or cue in an open shadow
         // root is not mistaken for “not present”.
-        if (element.shadowRoot) visit(element.shadowRoot);
+        if (element.shadowRoot) {
+          shadowRoots.add(element.shadowRoot);
+          visit(element.shadowRoot);
+        }
       }
     };
     visit(root);
-    if (cacheable) state.deepQueryCache.set(selector, result);
+    if (cacheable) {
+      // Observers do not cross shadow boundaries. Subscribe once per live root,
+      // and release detached roots instead of retaining old player subtrees.
+      if ([...state.observedShadowRoots].some((root) => !shadowRoots.has(root))) {
+        state.observer?.disconnect();
+        state.observer?.observe(root, MUTATION_OPTIONS);
+        state.observedShadowRoots.clear();
+      }
+      for (const shadowRoot of shadowRoots) {
+        if (!state.observedShadowRoots.has(shadowRoot)) {
+          state.observer?.observe(shadowRoot, MUTATION_OPTIONS);
+          state.observedShadowRoots.add(shadowRoot);
+        }
+      }
+      state.deepQueryCache.set(selector, result);
+    }
     return result;
   }
 
@@ -235,7 +273,10 @@
     const candidates = new Map();
 
     const add = (element, sourceWeight = 0) => {
-      if (!element || candidates.has(element)) return;
+      // A toolbar ancestor can be the whole player (especially while the
+      // actual controls are hidden). It must not exclude every native cue or
+      // become the fallback baseline just because it contains a CC button.
+      if (!element || element === player || element.contains?.(state.video) || candidates.has(element)) return;
       const rect = element.getBoundingClientRect?.();
       if (!rect || rect.width <= 0 || rect.height <= 0) return;
       if (rect.right < playerRect.left || rect.left > playerRect.right) return;
@@ -274,7 +315,7 @@
     if (/(?:control|timeline|volume|settings|bookmark|transcript|fullscreen)/i.test(classText)) return false;
     const rect = element.getBoundingClientRect?.();
     const playerRect = state.player.getBoundingClientRect?.();
-    if (!rect || !playerRect || rect.width < 80 || rect.height < 8 ||
+    if (!rect || !playerRect || rect.width <= 0 || rect.height < 8 ||
       rect.top < playerRect.top - 8 || rect.bottom > playerRect.bottom + 8 ||
       rect.right < playerRect.left || rect.left > playerRect.right) return false;
     return isVisible(element);
@@ -340,7 +381,7 @@
       if (!text || text.length > 500) continue;
       const rect = element.getBoundingClientRect();
       if (rect.top < playerRect.top - 8 || rect.bottom > playerRect.bottom + 8 ||
-        rect.width < 80 || rect.height < 8) continue;
+        rect.width <= 0 || rect.height < 8) continue;
       if (videoRect?.width > 0 && videoRect?.height > 0) {
         const overlap = Math.max(0, Math.min(rect.right, videoRect.right) - Math.max(rect.left, videoRect.left));
         const overlapRatio = overlap / Math.min(rect.width, videoRect.width);
@@ -417,6 +458,7 @@
       state.player.appendChild(overlay);
     }
     if (state.overlay !== overlay || !state.overlayConfigured) {
+      overlay.style.position = "absolute";
       overlay.style.inset = "0";
       overlay.style.width = "100%";
       overlay.style.height = "100%";
@@ -432,16 +474,23 @@
   }
 
   function copyNativeStyle(line, nativeCaption) {
-    const computed = nativeCaption ? getComputedStyle(nativeCaption) : null;
-    const baseSize = Number.parseFloat(computed?.fontSize || "") || 24;
+    let computed = state.nativeCaptionExpected ? state.lastNativeStyle : null;
+    if (nativeCaption) {
+      const nativeStyle = getComputedStyle(nativeCaption);
+      // Keep plain values, never a live CSSStyleDeclaration tied to a removed node.
+      computed = Object.fromEntries(["fontSize", "fontFamily", "fontWeight", "fontStyle", "lineHeight", "textShadow"]
+        .map((key) => [key, nativeStyle[key]]));
+      state.lastNativeStyle = computed;
+    }
+    // Translation typography must not change when a delayed native node is
+    // acquired: doing so reflows already visible Chinese text.
+    const baseSize = 24;
     const scale = SIZE_MAP[state?.size] || SIZE_MAP.medium;
-    line.style.fontFamily = computed?.fontFamily || "sans-serif";
+    line.style.fontFamily = "sans-serif";
     line.style.fontSize = `${baseSize * scale}px`;
-    line.style.fontWeight = computed?.fontWeight || "600";
-    line.style.fontStyle = computed?.fontStyle || "normal";
-    line.style.lineHeight = computed?.lineHeight && computed.lineHeight !== "normal"
-      ? computed.lineHeight
-      : "1.2";
+    line.style.fontWeight = "normal";
+    line.style.fontStyle = "normal";
+    line.style.lineHeight = "1.2";
     // Echo360 lessons do not use one caption theme consistently: some
     // recordings render native English as dark text on a light translucent
     // plate. Copying that dark color onto the translator's deliberately dark
@@ -546,20 +595,17 @@
       + Math.max(0, lineHeights.length - 1) * CAPTION_GAP_PX;
   }
 
-  function setStackWidth(stack, left, width, playerRect) {
-    const boundedLeft = Math.max(0, Math.min(playerRect.width, left));
-    const boundedWidth = Math.max(80, Math.min(playerRect.width - boundedLeft, width));
-    setStyleValue(stack, "left", `${boundedLeft}px`);
-    setStyleValue(stack, "width", `${boundedWidth}px`);
+  function setTranslationWidth(stack) {
+    // English glyph bounds vary per cue and during DOM replacement. A fixed
+    // player-relative text area is available before the first native cue.
+    setStyleValue(stack, "left", "2%");
+    setStyleValue(stack, "width", "96%");
     setStyleValue(stack, "right", "auto");
-    return { left: boundedLeft, width: boundedWidth };
   }
 
-  function styleFallback(stack, playerRect) {
+  function styleFallback(stack, playerRect, reserveNative = false) {
     const media = mediaBounds(state.player);
-    const mediaLeft = Math.max(0, media.left - playerRect.left);
-    const mediaWidth = Math.max(80, Math.min(playerRect.width - mediaLeft, media.width || playerRect.width));
-    setStackWidth(stack, mediaLeft, mediaWidth, playerRect);
+    setTranslationWidth(stack);
 
     // The fallback belongs to the lower edge of the player-local video
     // surface. It is intentionally independent of any arbitrary visible text:
@@ -571,39 +617,57 @@
     const controlsTop = controls && controls.top > playerRect.top + 4
       ? controls.top
       : Number.POSITIVE_INFINITY;
-    const visibleBottom = Math.min(media.bottom, controlsTop) - CAPTION_GAP_PX;
+    // Before the first real anchor exists, keep translation visible with a
+    // conservative two-line English reservation. This is an estimate only;
+    // the next confirmed native cue establishes the exact anchor.
+    const nativeReserve = reserveNative ? 2 * 24 * 1.2 + CAPTION_GAP_PX : 0;
+    const visibleBottom = Math.min(media.bottom, controlsTop) - CAPTION_GAP_PX - nativeReserve;
     const stackHeight = measuredStackHeight(stack);
     const topLimit = media.top - playerRect.top + CAPTION_GAP_PX;
-    const bottom = Math.max(0, playerRect.bottom - playerRect.top - visibleBottom);
+    const bottom = Math.max(0, playerRect.bottom - visibleBottom);
     const maxBottom = Math.max(0, playerRect.height - topLimit - stackHeight);
+    setStyleValue(stack, "transform", "none");
     setStyleValue(stack, "top", "auto");
     setStyleValue(stack, "bottom", `${Math.min(bottom, maxBottom)}px`);
     if (stack.dataset.echo360Placement !== "fallback") stack.dataset.echo360Placement = "fallback";
   }
 
-  function positionAboveNative(stack, nativeCaption, playerRect) {
-    return positionAboveNativeRect(stack, nativeCaption.getBoundingClientRect(), playerRect);
+  function playerLocalSize(playerRect) {
+    const scaleX = state.player.offsetWidth > 0 ? playerRect.width / state.player.offsetWidth : 1;
+    const scaleY = state.player.offsetHeight > 0 ? playerRect.height / state.player.offsetHeight : 1;
+    return {
+      scaleX, scaleY,
+      width: state.player.clientWidth || playerRect.width / scaleX,
+      height: state.player.clientHeight || playerRect.height / scaleY,
+    };
   }
 
-  function positionAboveNativeRect(stack, nativeRect, playerRect) {
-    const placement = setStackWidth(
-      stack,
-      nativeRect.left - playerRect.left,
-      Math.max(80, nativeRect.width),
-      playerRect
-    );
-    const stackHeight = measuredStackHeight(stack);
-    const media = mediaBounds(state.player);
-    const top = Math.max(
-      media.top - playerRect.top + CAPTION_GAP_PX,
-      nativeRect.top - playerRect.top - stackHeight - CAPTION_GAP_PX
-    );
-    setStyleValue(stack, "left", `${placement.left}px`);
-    setStyleValue(stack, "width", `${placement.width}px`);
-    setStyleValue(stack, "top", `${top}px`);
+  function rememberNativeAnchor(nativeRect, playerRect) {
+    if (playerRect.width <= 0 || playerRect.height <= 0) return;
+    const local = playerLocalSize(playerRect);
+    // A virtual anchor belongs to this mounted player, not a transient cue
+    // node. Normalized local coordinates survive scrolling, zoom and resize.
+    state.lastNativeAnchor = {
+      left: ((nativeRect.left - playerRect.left) / local.scaleX - state.player.clientLeft) / local.width,
+      top: ((nativeRect.top - playerRect.top) / local.scaleY - state.player.clientTop) / local.height,
+      width: nativeRect.width / local.scaleX / local.width,
+    };
+  }
+
+  function positionAtNativeAnchor(stack, playerRect) {
+    const anchor = state.lastNativeAnchor;
+    const local = playerLocalSize(playerRect);
+    setTranslationWidth(stack);
+    // CSS moves the actual bottom edge, including after wrapping/font changes.
+    setStyleValue(stack, "transform", "translateY(-100%)");
+    setStyleValue(stack, "top", `${anchor.top * local.height - CAPTION_GAP_PX}px`);
     setStyleValue(stack, "bottom", "auto");
     if (stack.dataset.echo360Placement !== "native-above") stack.dataset.echo360Placement = "native-above";
-    return { left: placement.left, width: placement.width, top };
+  }
+
+  function captionTime() {
+    if (state.frameMediaTime != null && !state.video.seeking && !state.video.paused) return state.frameMediaTime;
+    return Number(state.video.currentTime || 0);
   }
 
   function render() {
@@ -619,100 +683,88 @@
       hideOverlay(overlay);
       return;
     }
-    // Mutations inside open shadow roots do not cross the observer boundary.
-    // Periodically refresh discovery so a cached miss cannot last forever.
-    if (performance.now() - state.lastDiscoveryAt >= LAYOUT_REFRESH_MS) {
-      state.lastDiscoveryAt = performance.now();
-      state.deepQueryCacheDirty = true;
-      state.nativeCaptionDirty = true;
-      state.lastStackNativeCaption = null;
-    }
-    const index = findCueIndex(Number(state.video.currentTime || 0));
+    const captionState = captionToggleState(state.player, state.video);
+    const timelineIndex = findCueIndex(captionTime());
+    state.timelineCueIndex = timelineIndex;
+    let index = timelineIndex;
+    const previous = state.currentCueIndex;
+    const mediaTime = captionTime();
+    if (index < 0) index = stickyIdenticalCueIndex(mediaTime, previous);
+    // Echo's visible English DOM is authoritative during asynchronous cue
+    // hand-off. Inspect only the confirmed node, never scan on each frame.
+    if (index >= 0 && previous >= 0 && previous !== index && captionState !== false && state.followNativeCaption &&
+      !state.video.seeking && state.nativeCaption &&
+      normalizeForMatch(state.nativeCaption.textContent) === normalizeForMatch(state.cues[previous]?.original) &&
+      cachedNativeCaptionMatches(state.nativeCaption, state.cues[previous])) index = previous;
     state.currentCueIndex = index;
     const cue = index >= 0 ? state.cues[index] : null;
+    if (captionState === false) {
+      // CC can be toggled during a gap between translated cues as well.
+      state.nativeCaptionExpected = false;
+      state.lastNativeAnchor = null;
+      state.lastNativeStyle = null;
+    }
     if (!cue?.translated) {
       hideOverlay(overlay);
       return;
     }
-    const captionState = captionToggleState(state.player, state.video);
+    const previousCue = previous >= 0 ? state.cues[previous] : null;
     const cueChanged = state.lastNativeCueIndex !== index || state.lastNativeVideo !== state.video;
     if (cueChanged) {
-      // A native node belongs to one cue and one video pane. Never carry its
-      // geometry into the next cue: doing so is what placed Chinese in the
-      // middle of the player while the next English cue was still absent.
+      // Match the new cue's node afresh, but retain the player's virtual
+      // anchor. Translation text follows media time even during a DOM hand-off.
       state.lastNativeCueIndex = index;
       state.lastNativeVideo = state.video;
-      state.lastNativeRect = null;
-      state.nativeMissingSince = performance.now();
-      state.nativeLastSeenAt = 0;
-      state.nativeCaptionCueIndex = -1;
-      state.nativeCaption = null;
-      state.nativeCaptionScanComplete = false;
-      state.nativeCaptionDirty = true;
+      if (!sameOverlayText(previousCue, cue)) {
+        state.nativeCaptionCueIndex = -1;
+        state.nativeCaption = null;
+        state.nativeCaptionScanComplete = false;
+        state.nativeCaptionDirty = true;
+      }
     }
-    const nativeCaption = findNativeCaption(cue, captionState);
+    let nativeCaption = findNativeCaption(cue, captionState);
     const now = performance.now();
+    // The observer cannot see attachShadow() itself. Retry discovery only
+    // while an anchor is missing; a stable visible anchor never needs a scan.
+    if (!nativeCaption && captionState !== false && now - state.lastDiscoveryAt >= LAYOUT_REFRESH_MS) {
+      state.lastDiscoveryAt = now;
+      state.deepQueryCacheDirty = true;
+      state.nativeCaptionDirty = true;
+      nativeCaption = findNativeCaption(cue, captionState);
+    }
+    if (state.observedNativeCaption !== nativeCaption) {
+      if (state.observedNativeCaption) state.resizeObserver?.unobserve(state.observedNativeCaption);
+      if (nativeCaption) state.resizeObserver?.observe(nativeCaption);
+      state.observedNativeCaption = nativeCaption;
+    }
+    const playerRect = state.player.getBoundingClientRect();
     if (nativeCaption) {
-      state.nativeMissingSince = 0;
-      state.nativeLastSeenAt = now;
-      const nativeRect = nativeCaption.getBoundingClientRect();
-      state.lastNativeRect = {
-        top: nativeRect.top,
-        bottom: nativeRect.bottom,
-        left: nativeRect.left,
-        right: nativeRect.right,
-        width: nativeRect.width,
-        height: nativeRect.height,
-      };
-    } else if (captionState === false) {
-      state.nativeMissingSince = 0;
-      state.nativeLastSeenAt = 0;
-      state.lastNativeRect = null;
-    } else if (!state.nativeMissingSince) {
-      state.nativeMissingSince = now;
+      state.nativeCaptionExpected = true;
+      state.followNativeCaption = true;
+      rememberNativeAnchor(nativeCaption.getBoundingClientRect(), playerRect);
     }
 
-    // A native CC toggle is authoritative. When it is on, wait briefly for
-    // Echo360 to paint the matching English cue instead of rendering Chinese
-    // at a temporary baseline and then visibly jumping it upward. If the
-    // player has no native cue after the grace period, the normal fallback is
-    // used so a broken lesson never leaves a blank translation forever.
-    const sameCueNativeRect = captionState !== false && state.lastNativeRect &&
-      state.lastNativeCueIndex === index && state.lastNativeVideo === state.video &&
-      now - state.nativeLastSeenAt < NATIVE_CUE_GRACE_MS;
-    const waitingForNative = !nativeCaption && !sameCueNativeRect && captionState !== false
-      && now - state.nativeMissingSince < NATIVE_CUE_GRACE_MS;
+    // Keep the last confirmed position for this player with no expiry. A
+    // missing anchor never hides an active translation, including acquisition.
+    const retainedNativeAnchor = captionState !== false && state.lastNativeAnchor;
     const specs = [];
-    if (!waitingForNative) {
-      if (nativeCaption || !state.bilingual) {
-        specs.push({ kind: "translated", text: cue.translated, nativeCaption });
-      } else {
-        const ordered = state.reverseOrder
-          ? [["original", cue.original], ["translated", cue.translated]]
-          : [["translated", cue.translated], ["original", cue.original]];
-        for (const [kind, text] of ordered) if (text) specs.push({ kind, text, nativeCaption: null });
-      }
+    if (nativeCaption || retainedNativeAnchor || captionState === true || !state.bilingual) {
+      specs.push({ kind: "translated", text: cue.translated, nativeCaption });
+    } else {
+      const ordered = state.reverseOrder
+        ? [["original", cue.original], ["translated", cue.translated]]
+        : [["translated", cue.translated], ["original", cue.original]];
+      for (const [kind, text] of ordered) if (text) specs.push({ kind, text, nativeCaption: null });
     }
     const stack = specs.length > 0 ? ensureStack(overlay, specs) : null;
     if (!stack) {
       hideOverlay(overlay);
-      // Do not leave the previous cue visible while waiting for Echo360 to
-      // insert the next native English node. Keeping the old child in the DOM
-      // made cue-boundary tests (and, visibly, the player) show stale Chinese
-      // during the hand-off.
-      overlay.replaceChildren();
       return;
     }
-    const playerRect = state.player.getBoundingClientRect();
-    if (nativeCaption && playerRect.width > 0 && playerRect.height > 0) {
-      positionAboveNative(stack, nativeCaption, playerRect);
-    } else if (sameCueNativeRect && playerRect.width > 0 && playerRect.height > 0) {
-      // Echo360 briefly removes the old English node before inserting the new
-      // cue. Keep the last confirmed caption baseline during that hand-off so
-      // Chinese does not flash at the fallback position and then jump upward.
-      positionAboveNativeRect(stack, state.lastNativeRect, playerRect);
+    if (retainedNativeAnchor && playerRect.width > 0 && playerRect.height > 0) {
+      positionAtNativeAnchor(stack, playerRect);
     } else {
-      styleFallback(stack, playerRect);
+      styleFallback(stack, playerRect, captionState !== false);
     }
     if (overlay.hidden) overlay.hidden = false;
   }
@@ -751,15 +803,15 @@
   function scheduleVideoFrame() {
     if (!state?.visible || state.frameHandle != null || typeof state.video.requestVideoFrameCallback !== "function") return;
     const mounted = state;
-    const handle = state.video.requestVideoFrameCallback(() => {
+    const handle = state.video.requestVideoFrameCallback((_now, metadata) => {
       if (state !== mounted || state.frameHandle !== handle) return;
       state.frameHandle = null;
+      if (Number.isFinite(metadata?.mediaTime)) state.frameMediaTime = metadata.mediaTime;
       const now = performance.now();
-      const index = findCueIndex(Number(state.video.currentTime || 0));
+      const index = findCueIndex(captionTime());
       // Cue boundaries are immediate. Stable cues need only a bounded
       // fallback for CSS changes not represented by observed mutations.
-      if (index !== state.currentCueIndex || now - state.lastFrameRenderAt >= 200) {
-        state.lastFrameRenderAt = now;
+      if (index !== state.timelineCueIndex || now - state.lastLayoutRenderAt >= LAYOUT_REFRESH_MS) {
         render();
       }
       scheduleVideoFrame();
@@ -783,13 +835,15 @@
       reverseOrder: !!reverseOrder,
       visible: true,
       currentCueIndex: -1,
+      timelineCueIndex: -1,
+      followNativeCaption: false,
       overlay: null,
       listeners: [],
       interactionListeners: [],
       observer: null,
       resizeObserver: null,
       frameHandle: null,
-      lastFrameRenderAt: performance.now(),
+      frameMediaTime: null,
       lastDiscoveryAt: performance.now(),
       refreshFrame: null,
       lastLayoutRenderAt: -Infinity,
@@ -797,11 +851,13 @@
       playerPositionSaved: false,
       previousPlayerPosition: null,
       handlingMutation: false,
-      nativeMissingSince: 0,
+      nativeCaptionExpected: false,
+      observedShadowRoots: new Set(),
       lastNativeCueIndex: -1,
       lastNativeVideo: null,
-      lastNativeRect: null,
-      nativeLastSeenAt: 0,
+      lastNativeAnchor: null,
+      lastNativeStyle: null,
+      observedNativeCaption: null,
       nativeCaption: null,
       nativeCaptionCueIndex: -1,
       nativeCaptionToggleState: null,
@@ -811,9 +867,23 @@
       deepQueryCacheDirty: false,
     };
 
-    for (const eventName of ["timeupdate", "seeked", "play", "pause", "loadedmetadata"]) {
-      video.addEventListener(eventName, render);
-      state.listeners.push([eventName, render]);
+    const onTimeUpdate = () => {
+      if (!state?.visible) return;
+      if (findCueIndex(captionTime()) !== state.timelineCueIndex ||
+        performance.now() - state.lastLayoutRenderAt >= LAYOUT_REFRESH_MS) render();
+    };
+    video.addEventListener("timeupdate", onTimeUpdate);
+    state.listeners.push(["timeupdate", onTimeUpdate]);
+    for (const eventName of ["seeking", "seeked", "play", "pause", "loadedmetadata", "emptied"]) {
+      const listener = eventName === "emptied" ? () => unmount() : () => {
+        if (eventName === "seeking" || eventName === "seeked" || eventName === "loadedmetadata") {
+          state.frameMediaTime = null;
+          state.followNativeCaption = false;
+        }
+        render();
+      };
+      video.addEventListener(eventName, listener);
+      state.listeners.push([eventName, listener]);
     }
     for (const eventName of ["pointermove", "mouseenter", "mouseleave", "focusin", "focusout"]) {
       player.addEventListener(eventName, scheduleLayoutRefresh, { passive: true });
@@ -825,15 +895,31 @@
       state.resizeObserver.observe(video);
     }
     state.observer = new MutationObserver((records) => {
-      if (!state || state.handlingMutation || records.length === 0 || records.every(isOwnMutation)) return;
-      state.deepQueryCacheDirty = true;
+      if (!state?.visible || state.handlingMutation) return;
+      const external = records.filter((record) => !isOwnMutation(record));
+      if (external.length === 0) return;
+      // Geometry/style mutations do not change selector membership. In
+      // particular, a progress bar's per-frame style must not flush DOM caches.
+      const structureChanged = external.some((record) => record.type === "childList" &&
+        [...record.addedNodes, ...record.removedNodes].some((node) => node.nodeType === 1));
+      if (structureChanged || external.some((record) => record.attributeName === "class")) {
+        state.deepQueryCacheDirty = true;
+      }
       const cue = state.currentCueIndex >= 0 ? state.cues[state.currentCueIndex] : null;
-      const captionChanged = cue && records.some((record) => mutationMayAffectNativeCaption(record, cue));
+      const captionChanged = cue && external.some((record) => mutationMayAffectNativeCaption(record, cue));
+      const geometryChanged = external.some((record) => {
+        const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+        if (target === player || target === video || target?.contains?.(state.nativeCaption)) return true;
+        if (["aria-pressed", "aria-checked", "data-state", "data-active", "data-enabled"].includes(record.attributeName)) return true;
+        return /caption|subtitle|cue|control|fullscreen/i.test(
+          `${target?.id || ""} ${target?.className || ""} ${target?.getAttribute?.("data-part") || ""}`);
+      });
       if (captionChanged) {
         state.nativeCaptionDirty = true;
         state.nativeCaptionScanComplete = false;
         state.lastStackNativeCaption = null;
       }
+      if (!captionChanged && !geometryChanged && !structureChanged) return;
       state.handlingMutation = true;
       try {
         if (captionChanged && state.visible) render();
@@ -842,13 +928,7 @@
         if (state) state.handlingMutation = false;
       }
     });
-    state.observer.observe(player, {
-      attributes: true,
-      attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-pressed", "aria-checked"],
-      childList: true,
-      characterData: true,
-      subtree: true,
-    });
+    state.observer.observe(player, MUTATION_OPTIONS);
     render();
     scheduleVideoFrame();
     console.info("[echo360-translator] mounted Echo360 caption overlay", { cueCount: cues.length });
@@ -865,6 +945,7 @@
     if (bilingual !== undefined) state.bilingual = !!bilingual;
     if (reverseOrder !== undefined) state.reverseOrder = !!reverseOrder;
     state.currentCueIndex = -1;
+    state.timelineCueIndex = -1;
     state.lastNativeCueIndex = -1;
     state.nativeCaptionDirty = true;
     state.deepQueryCacheDirty = true;
@@ -880,8 +961,23 @@
     if (!next) {
       if (state.frameHandle != null) state.video.cancelVideoFrameCallback?.(state.frameHandle);
       state.frameHandle = null;
+      state.frameMediaTime = null;
       clearTimeout(state.refreshFrame);
       state.refreshFrame = null;
+      state.observer?.disconnect();
+      state.resizeObserver?.disconnect();
+      state.observedShadowRoots.clear();
+      state.observedNativeCaption = null;
+      state.nativeCaption = null;
+      state.lastStackNativeCaption = null;
+      state.deepQueryCache.clear();
+    } else {
+      state.observer?.observe(state.player, MUTATION_OPTIONS);
+      state.resizeObserver?.observe(state.player);
+      state.resizeObserver?.observe(state.video);
+      state.deepQueryCacheDirty = true;
+      state.nativeCaptionDirty = true;
+      state.lastStackNativeCaption = null;
     }
     render();
     if (next) scheduleVideoFrame();

@@ -24,6 +24,7 @@
   let activeBall = null;
   let activePopover = null;
   let activeFailureActions = null;
+  let activeRoot = null;
 
   const CONSOLE_CAPTURE_KEY = "__echo360TranslatorDiagnosticConsole__";
   const CONSOLE_LEVELS = ["debug", "info", "log", "warn", "error"];
@@ -422,6 +423,7 @@
     root.dataset.echo360Host = ns.hostSupport?.isInstructureMediaHost?.()
       ? "instructure-media"
       : "echo360";
+    activeRoot = root;
     // Keep the fixed controls outside the player's body scroll container. The
     // controls themselves own their viewport positioning; the wrapper only
     // provides shared theme variables and event isolation.
@@ -501,7 +503,10 @@
 
     // Apply stored appearance preference (async; safe to be slightly deferred).
     ns.storage.getConfig()
-      .then((cfg) => ns.uiTheme.applyAppearance(cfg.appearance || "auto"))
+      .then((cfg) => {
+        ns.uiTheme.applyAppearance(cfg.appearance || "auto");
+        applyQuickImportVisible(cfg);
+      })
       .catch((error) => {
         console.error(
           "[echo360-translator][ui] appearance load failed",
@@ -522,7 +527,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Public API (surface unchanged)
+  // Public API
   // -------------------------------------------------------------------------
   function readPanelPrefs() {
     return activePopover?.readPrefs();
@@ -596,6 +601,15 @@
     activeFailureActions?.clearTranslationSummary?.();
   }
 
+  function setIdleDimEnabled(enabled = false) {
+    if (!activeRoot || activeRoot.dataset.echo360Host !== "echo360") return;
+    activeRoot.classList.toggle("echo360-idle-dim-enabled", !!enabled);
+  }
+
+  function applyQuickImportVisible(cfg) {
+    activeBall?.setImportVisible?.(cfg?.quickTranslateAutoExport === true);
+  }
+
   ns.ui = {
     ensurePanel,
     readPanelPrefs,
@@ -623,5 +637,7 @@
     clearError,
     showTranslationSummary,
     clearTranslationSummary,
+    setIdleDimEnabled,
+    setQuickImportVisible: (visible) => activeBall?.setImportVisible?.(visible === true),
   };
 })();

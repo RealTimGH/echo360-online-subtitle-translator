@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { evalModule, makeFullNs } from "../helpers/load-module.js";
 
 const original = `WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello world\n\n00:00:02.000 --> 00:00:04.000\nGoodbye`;
@@ -547,4 +547,91 @@ describe("transcript panel renderer", () => {
       lastBridgeResult: "host-row-count-exceeds-model",
     });
   });
+});
+
+it.each(["clear", "hide", "replace"])("invalidates an in-flight capability flush on %s", async action => {
+  const {ns, root} = setup({virtualized:true});
+  const renderer = ns.transcriptPanelRenderer;
+  let request;
+  vi.spyOn(window, "postMessage").mockImplementation(data => { if(data.action === "capabilities") request=data; });
+  const pending = renderer.flush();
+  await vi.waitFor(() => expect(request).toBeTruthy());
+  if (action === "clear") renderer.clear();
+  else if (action === "hide") renderer.setVisible(false);
+  else renderer.setTranslation({originalVtt:original,translatedVtt:translated.replace("你好世界","新译文"),sessionKey:"new-session"});
+  const event = new Event("message");
+  Object.defineProperty(event,"source",{value:window});
+  Object.defineProperty(event,"data",{value:{source:"echo360-translator-transcript-page",version:1,requestId:request.requestId,
+    panelToken:request.panelToken,ok:true,capability:"echo-react-virtualized-v1",appliedRevision:0,visibleRowCount:2}});
+  window.dispatchEvent(event);
+  await expect(pending).resolves.toBeUndefined();
+  expect(root.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(0);
+  renderer.clear(); renderer.setVisible(false);
+});
+it.each(["clear", "hide", "replace"])("ignores a late layout acknowledgment after %s", async action => {
+  const { ns, root } = setup({ virtualized: true });
+  const renderer = ns.transcriptPanelRenderer;
+  let layout;
+  const respond = data => {
+    const event = new Event("message");
+    Object.defineProperty(event, "source", { value: window });
+    Object.defineProperty(event, "data", { value: {
+      source: "echo360-translator-transcript-page", version: 1,
+      requestId: data.requestId, panelToken: data.panelToken,
+      ok: true, capability: "echo-react-virtualized-v1",
+      appliedRevision: data.revision, visibleRowCount: 2,
+    } });
+    window.dispatchEvent(event);
+  };
+  vi.spyOn(window, "postMessage").mockImplementation(data => {
+    if (data.action === "set-layout") layout = data;
+    else respond(data);
+  });
+  const pending = renderer.flush();
+  await vi.waitFor(() => expect(layout).toBeTruthy());
+  if (action === "clear") renderer.clear();
+  else if (action === "hide") renderer.setVisible(false);
+  else renderer.setTranslation({ originalVtt: original, translatedVtt: translated.replace("你好世界", "新译文"), sessionKey: "new-session" });
+  respond(layout);
+  await expect(pending).resolves.toBeUndefined();
+  expect(root.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(0);
+  if (action !== "replace") expect(renderer.getDebugState().active).toBe(false);
+  renderer.clear(); renderer.setVisible(false);
+});
+
+it("does not mark a replacement model unsupported when an old scroll request fails", async () => {
+  const { ns, root, model } = setup({ virtualized: true });
+  const renderer = ns.transcriptPanelRenderer;
+  let scroll;
+  const respond = (data, ok = true) => {
+    const event = new Event("message");
+    Object.defineProperty(event, "source", { value: window });
+    Object.defineProperty(event, "data", { value: {
+      source: "echo360-translator-transcript-page", version: 1,
+      requestId: data.requestId, panelToken: data.panelToken,
+      ok, capability: "echo-react-virtualized-v1", error: ok ? undefined : "old-scroll-failed",
+      appliedRevision: data.revision, visibleRowCount: 2,
+    } });
+    window.dispatchEvent(event);
+  };
+  vi.spyOn(window, "postMessage").mockImplementation(data => {
+    if (data.action === "scroll-to-row") scroll = data;
+    else respond(data);
+  });
+  await renderer.flush();
+  root.querySelector('[data-echo360-transcript-translation="1"]').remove();
+  const pending = renderer.scrollToCue(model.cues[0]);
+  expect(scroll).toBeTruthy();
+  renderer.setTranslation({ ...model, cues: [...model.cues] });
+  respond(scroll, false);
+  expect(await pending).toBe(false);
+  expect(renderer.getDebugState().lastLayoutFailure).not.toBe("old-scroll-failed");
+  await renderer.flush();
+  expect(root.querySelectorAll('[data-echo360-transcript-translation="1"]')).toHaveLength(2);
+});
+
+afterEach(() => {
+  window.Echo360Translator?.transcriptPanelRenderer?.clear();
+  window.Echo360Translator?.transcriptPanelRenderer?.setVisible(false);
+  vi.restoreAllMocks();
 });

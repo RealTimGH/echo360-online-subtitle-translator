@@ -1023,6 +1023,7 @@
     });
 
     function render(model, { historical = false, occurredAt = null, count = 1 } = {}) {
+      refs.retry.textContent = model?.code === "PARTIAL_TRANSLATION" ? "重试失败字幕" : "重新翻译";
       currentModel = model || fallbackModel();
       const warning = currentModel.severity === "warning";
       const empty = currentModel.kind === "ready";

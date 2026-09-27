@@ -62,10 +62,19 @@
         <span>增强 Transcript 面板</span>
         <input id="echo360-pref-transcript-panel" type="checkbox" />
       </label>
-      <label id="echo360-pref-bilingual-label" class="echo360-popover-row">
-        <span>双语字幕</span>
-        <input id="echo360-pref-bilingual" type="checkbox" />
-      </label>
+      <div role="group" aria-label="字幕显示选项">
+        <label id="echo360-pref-bilingual-label" class="echo360-popover-row">
+          <span>双语字幕</span>
+          <input id="echo360-pref-bilingual" type="checkbox" />
+        </label>
+        <label id="echo360-pref-sentence-merge-english-label" class="echo360-popover-row" style="margin-left:12px;">
+          <span>
+            <span style="display:block;">英文也显示合并整句</span>
+            <small id="echo360-pref-sentence-merge-english-help" style="display:block;font-size:11px;line-height:1.35;opacity:.7;">需要“整句合并翻译”和“插件双语显示”；只连接原文，不改写字幕。</small>
+          </span>
+          <input id="echo360-pref-sentence-merge-english" type="checkbox" aria-describedby="echo360-pref-sentence-merge-english-help" />
+        </label>
+      </div>
       <label id="echo360-pref-reverse-label" class="echo360-popover-row">
         <span>反转字幕位置</span>
         <input id="echo360-pref-reverse" type="checkbox" />
@@ -95,11 +104,20 @@
           <option value="large">大</option>
         </select>
       </label>
-      <label class="echo360-popover-block-label">目标语言
-        <select id="echo360-pref-target" class="echo360-popover-select">
-          ${TARGET_OPTIONS.map((t) => `<option value="${t}">${(TARGET_LABELS && TARGET_LABELS[t]) || t}</option>`).join("")}
-        </select>
-      </label>
+      <div role="group" aria-label="翻译行为">
+        <label class="echo360-popover-block-label">目标语言
+          <select id="echo360-pref-target" class="echo360-popover-select">
+            ${TARGET_OPTIONS.map((t) => `<option value="${t}">${(TARGET_LABELS && TARGET_LABELS[t]) || t}</option>`).join("")}
+          </select>
+        </label>
+        <label id="echo360-pref-sentence-merge-label" class="echo360-popover-row">
+          <span>
+            <span style="display:block;">整句合并翻译</span>
+            <small style="display:block;font-size:11px;line-height:1.35;opacity:.7;">优先按一句合并，切换后重新翻译。</small>
+          </span>
+          <input id="echo360-pref-sentence-merge" type="checkbox" />
+        </label>
+      </div>
       <div class="echo360-popover-divider"></div>
       <button id="echo360-open-options-btn" class="echo360-popover-link-btn" title="打开完整设置">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" style="flex-shrink:0;">
@@ -116,6 +134,10 @@
       transcriptPanelEnabled: pop.querySelector("#echo360-pref-transcript-panel"),
       bilingual: pop.querySelector("#echo360-pref-bilingual"),
       bilingualLabel: pop.querySelector("#echo360-pref-bilingual-label"),
+      sentenceMergeEnabled: pop.querySelector("#echo360-pref-sentence-merge"),
+      sentenceMergeEnabledLabel: pop.querySelector("#echo360-pref-sentence-merge-label"),
+      sentenceMergeEnglish: pop.querySelector("#echo360-pref-sentence-merge-english"),
+      sentenceMergeEnglishLabel: pop.querySelector("#echo360-pref-sentence-merge-english-label"),
       reverseOrder: pop.querySelector("#echo360-pref-reverse"),
       reverseOrderLabel: pop.querySelector("#echo360-pref-reverse-label"),
       nativeCc: pop.querySelector("#echo360-pref-echo360-native-cc"),
@@ -167,6 +189,24 @@
       for (const label of [refs.bilingualLabel, refs.reverseOrderLabel, refs.sizeLabel]) {
         label.classList.toggle("is-disabled", nativeCcMode);
       }
+      syncSentenceMergeControls();
+    }
+
+    function syncSentenceMergeControls() {
+      // The display-only merged-English line is meaningful only when the
+      // source was merged and the browser track can render both languages.
+      // Keep its checked value untouched while disabled so switching modes or
+      // turning sentence merging off does not erase the saved preference.
+      const browserBilingual = refs.nativeCc.checked
+        ? !!browserModePrefs.bilingual
+        : !!refs.bilingual.checked;
+      const available = refs.sentenceMergeEnabled.checked &&
+        !refs.nativeCc.checked &&
+        browserBilingual;
+      refs.sentenceMergeEnglish.disabled = !available;
+      refs.sentenceMergeEnglish.setAttribute("aria-disabled", String(!available));
+      styleDisabledControl(refs.sentenceMergeEnglish, !available);
+      refs.sentenceMergeEnglishLabel.classList.toggle("is-disabled", !available);
     }
 
     // Reflects the currently configured provider in the read-only "翻译服务"
@@ -187,7 +227,18 @@
     pop.querySelector("#echo360-change-provider-btn").addEventListener("click", openOptionsPage);
     refs.enabled.addEventListener("change", () => handlers.onPrefsChanged?.());
     refs.transcriptPanelEnabled.addEventListener("change", () => handlers.onPrefsChanged?.());
-    refs.bilingual.addEventListener("change", () => handlers.onPrefsChanged?.());
+    refs.bilingual.addEventListener("change", () => {
+      browserModePrefs.bilingual = refs.bilingual.checked;
+      syncSentenceMergeControls();
+      handlers.onPrefsChanged?.();
+    });
+    refs.sentenceMergeEnabled.addEventListener("change", () => {
+      syncSentenceMergeControls();
+      handlers.onPrefsChanged?.();
+    });
+    refs.sentenceMergeEnglish.addEventListener("change", () => {
+      handlers.onPrefsChanged?.();
+    });
     refs.reverseOrder.addEventListener("change", () => handlers.onPrefsChanged?.());
     refs.nativeCc.addEventListener("change", () => {
       if (refs.nativeCc.checked) {
@@ -228,6 +279,8 @@
         refs.transcriptPanelEnabled.checked = prefs.transcriptPanelEnabled === true;
         refs.bilingual.checked = !!browserModePrefs.bilingual;
         refs.reverseOrder.checked = !!browserModePrefs.reverseOrder;
+        refs.sentenceMergeEnabled.checked = prefs.sentenceMergeEnabled === true;
+        refs.sentenceMergeEnglish.checked = prefs.sentenceMergeEnglish === true;
         // Checked = Beta native CC injection; unchecked = default browser track.
         // (prefs.useNativeSubtitles===true still means "use browser track".)
         refs.nativeCc.checked = prefs.useNativeSubtitles !== true;
@@ -267,6 +320,11 @@
       return {
         enabled: refs.enabled.checked,
         transcriptPanelEnabled: refs.transcriptPanelEnabled.checked,
+        sentenceMergeEnabled: refs.sentenceMergeEnabled.checked,
+        // Return the stored checkbox value even while the control is disabled.
+        // storage.savePrefs then keeps the choice through incompatible render
+        // modes and can re-enable it when its prerequisites become true.
+        sentenceMergeEnglish: refs.sentenceMergeEnglish.checked,
         bilingual: nativeCcMode ? true : browserModePrefs.bilingual,
         reverseOrder: nativeCcMode ? false : browserModePrefs.reverseOrder,
         browserBilingual: browserModePrefs.bilingual,

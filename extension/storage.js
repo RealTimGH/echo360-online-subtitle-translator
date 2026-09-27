@@ -22,7 +22,10 @@
   //        reliable browser <track> renderer (useNativeSubtitles=true). Note
   //        the flag name is historical: true means "use browser track", false
   //        means "try native CC injection".
-  const PREFS_SCHEMA_VERSION = 3;
+  //   v4 – fresh installs default bilingual + sentence-merge options on.
+  //        Upgrades only adopt the new defaults for fields the user never
+  //        stored explicitly.
+  const PREFS_SCHEMA_VERSION = 4;
   // Display/render prefs (enabled, bilingual, size, useNativeSubtitles, ...)
   // are a personal, browser-wide habit - not something tied to one specific
   // lesson - so they are stored under a single fixed key rather than scoped
@@ -91,10 +94,16 @@
     const prefs = stored || {
       enabled: true,
       size: DEFAULT_SUBTITLE_SIZE,
-      bilingual: false,
+      bilingual: true,
       reverseOrder: false,
-      browserBilingual: false,
+      browserBilingual: true,
       browserReverseOrder: false,
+      // Sentence merging changes the source cue grouping used for a
+      // translation request. Fresh installs default both options on;
+      // sentenceMergeEnglish is intentionally stored independently so a
+      // user's display choice survives while its prerequisites are off.
+      sentenceMergeEnabled: true,
+      sentenceMergeEnglish: true,
       // Transcript panel enhancement is an independent surface.  Keep it
       // opt-in on fresh installs; an explicit stored choice is preserved by
       // the normalization below so upgrades do not overwrite user settings.
@@ -106,17 +115,38 @@
       useNativeSubtitles: true,
       renderModeVersion: PREFS_SCHEMA_VERSION,
     };
-    if (prefs.renderModeVersion !== PREFS_SCHEMA_VERSION) {
+    const storedVersion = Number(prefs.renderModeVersion) || 0;
+    if (storedVersion < 3) {
       // One-shot migration off the v2 "native CC preferred" default onto the
       // reliable browser track. Users who want the Beta native look can
       // re-enable it in the settings popover after upgrading.
       prefs.useNativeSubtitles = true;
-      prefs.renderModeVersion = PREFS_SCHEMA_VERSION;
     } else {
       prefs.useNativeSubtitles = prefs.useNativeSubtitles === true;
     }
+    if (stored && storedVersion < 4) {
+      if (!Object.prototype.hasOwnProperty.call(stored, "browserBilingual") &&
+        !Object.prototype.hasOwnProperty.call(stored, "bilingual")) {
+        prefs.browserBilingual = true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(stored, "sentenceMergeEnabled")) {
+        prefs.sentenceMergeEnabled = true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(stored, "sentenceMergeEnglish")) {
+        prefs.sentenceMergeEnglish = true;
+      }
+    }
+    if (storedVersion !== PREFS_SCHEMA_VERSION) {
+      prefs.renderModeVersion = PREFS_SCHEMA_VERSION;
+    }
     prefs.browserBilingual = typeof prefs.browserBilingual === "boolean" ? prefs.browserBilingual : prefs.bilingual === true;
     prefs.browserReverseOrder = typeof prefs.browserReverseOrder === "boolean" ? prefs.browserReverseOrder : prefs.reverseOrder === true;
+    prefs.sentenceMergeEnabled = prefs.sentenceMergeEnabled === true;
+    // This is a stored preference rather than an effective render mode. The
+    // popover disables it when sentence merging, browser subtitles, or
+    // browser bilingual output is unavailable, but must retain the user's
+    // choice for when those prerequisites are restored.
+    prefs.sentenceMergeEnglish = prefs.sentenceMergeEnglish === true;
     // A missing field is the upgrade/fresh-install default: disabled.  Only a
     // stored boolean true represents an explicit opt-in.
     prefs.transcriptPanelEnabled = prefs.transcriptPanelEnabled === true;
@@ -145,6 +175,15 @@
     const transcriptPanelEnabled = typeof prefs.transcriptPanelEnabled === "boolean"
       ? prefs.transcriptPanelEnabled
       : existing.transcriptPanelEnabled === true;
+    const sentenceMergeEnabled = typeof prefs.sentenceMergeEnabled === "boolean"
+      ? prefs.sentenceMergeEnabled
+      : existing.sentenceMergeEnabled === true;
+    // Keep the display-only English preference independent of its current
+    // prerequisites. UI callers may omit it while handling another setting;
+    // in that case preserve the stored choice instead of silently clearing it.
+    const sentenceMergeEnglish = typeof prefs.sentenceMergeEnglish === "boolean"
+      ? prefs.sentenceMergeEnglish
+      : existing.sentenceMergeEnglish === true;
     const normalizedPrefs = {
       ...prefs,
       renderModeVersion: PREFS_SCHEMA_VERSION,
@@ -152,6 +191,8 @@
       browserBilingual,
       browserReverseOrder,
       transcriptPanelEnabled,
+      sentenceMergeEnabled,
+      sentenceMergeEnglish,
       bilingual: useNativeSubtitles ? browserBilingual : true,
       reverseOrder: useNativeSubtitles ? browserReverseOrder : false,
     };
@@ -169,23 +210,23 @@
     return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  async function getCacheStore() {
-    const obj = await extensionApi.storage.local.get(CACHE_KEY);
-    return obj[CACHE_KEY] && typeof obj[CACHE_KEY] === "object" ? obj[CACHE_KEY] : null;
+  async function requestSharedStorage(operation, args = {}) {
+    const response = await extensionApi.runtime.sendMessage({ type: "shared-storage", operation, ...args });
+    if (!response?.ok) throw Object.assign(new Error(response?.error?.message || "后台存储不可用"), {
+      code: response?.error?.code || "CACHE_READ_FAILED",
+    });
+    return response.data;
   }
 
-  async function setCacheStore(entryOrNull) {
+  async function getCacheStore(cacheKey) {
+    return requestSharedStorage("cache-get", { cacheKey });
+  }
+
+  async function setCacheStore(entry, cacheKey = "", options = {}) {
     try {
-      await extensionApi.storage.local.set({ [CACHE_KEY]: entryOrNull || null });
-      return { ok: true };
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err || "缓存写入失败"));
-      error.code = error.code || "CACHE_WRITE_FAILED";
-      console.error("[echo360-translator][storage] subtitle cache write failed", ns.errorUtils?.serializeError?.(error, { phase: "cache" }) || {
-        code: error.code,
-        message: error.message,
-      });
-      return { ok: false, error };
+      return await requestSharedStorage("cache-set", { entry, cacheKey, options });
+    } catch (error) {
+      return {ok:false, error:Object.assign(error, {code:"CACHE_WRITE_FAILED"})};
     }
   }
 

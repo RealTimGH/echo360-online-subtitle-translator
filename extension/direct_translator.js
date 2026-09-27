@@ -139,6 +139,22 @@ globalThis.Echo360DirectTranslator = (() => {
     return /^\s*(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}\s*-->\s*(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}/.test(line);
   }
 
+  // Keep the original cue timing beside each provider item.  A failed item is
+  // later surfaced outside the VTT parser (in the popup/error panel), so the
+  // physical line number alone is not enough to find it in a long caption
+  // file.  Match the same short and long WebVTT timestamp forms accepted by
+  // isTimecode(), while intentionally dropping cue settings from the display
+  // value.
+  function parseCueTiming(line) {
+    const match = String(line || "").match(/^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$/);
+    if (!match) return null;
+    return {
+      timecode: `${match[1]} --> ${match[2]}`,
+      startTime: match[1],
+      endTime: match[2],
+    };
+  }
+
   function shouldTranslate(line) {
     const trimmed = String(line || "").trim();
     if (!trimmed) return false;
@@ -209,6 +225,7 @@ globalThis.Echo360DirectTranslator = (() => {
     if (CJK_RE.test(source) || !LETTER_RE.test(source)) return true;
     if (/^(?:(?:https?|ftp):\/\/|www\.)\S+$/i.test(source) ||
       /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(source)) return true;
+    if (/^[B-HJ-Zb-hj-z]\.$/.test(source)) return true;
     if (/^[A-Z0-9][A-Z0-9._:/+#&()'’-]*$/.test(source)) {
       const upper = source.toUpperCase();
       const hasDigit = /\d/.test(source);
@@ -539,13 +556,23 @@ globalThis.Echo360DirectTranslator = (() => {
     }
   }
 
-  function sleep(ms, deadlineAt = null) {
+  function throwIfAborted(signal) {
+    if (signal?.aborted) throw makeTranslationError("TRANSLATION_CANCELLED", "Translation cancelled");
+  }
+
+  function sleep(ms, deadlineAt = null, signal = null) {
+    throwIfAborted(signal);
     const requestedMs = Math.max(0, Number(ms) || 0);
     const remaining = hasDeadline(deadlineAt)
       ? Math.max(0, Number(deadlineAt) - Date.now())
       : requestedMs;
     if (hasDeadline(deadlineAt) && remaining <= 0) return Promise.reject(translationDeadlineError());
-    return new Promise((resolve) => setTimeout(resolve, Math.min(requestedMs, remaining)));
+    return new Promise((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(makeTranslationError("TRANSLATION_CANCELLED", "Translation cancelled")); };
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, Math.min(requestedMs, remaining));
+      signal?.addEventListener("abort", abort, {once:true});
+      if (signal?.aborted) abort();
+    });
   }
 
   function directLog(level, event, details = {}) {
@@ -666,8 +693,7 @@ globalThis.Echo360DirectTranslator = (() => {
       rateLimitTimestamps.push(now);
       if (!circuitError && rateLimitTimestamps.length >= GOOGLE_WEB_429_CIRCUIT_THRESHOLD) {
         circuitError = makeTranslationError(
-          "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
-          `Google Web 在 ${GOOGLE_WEB_429_CIRCUIT_WINDOW_MS / 1000} 秒内返回了至少 ${GOOGLE_WEB_429_CIRCUIT_THRESHOLD} 次 HTTP 429，已停止继续请求并触发故障转移`,
+          "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",          `Google Web 在 ${GOOGLE_WEB_429_CIRCUIT_WINDOW_MS / 1000} 秒内返回了至少 ${GOOGLE_WEB_429_CIRCUIT_THRESHOLD} 次 HTTP 429，已停止继续请求并触发故障转移`,
           {
             status: 429,
             retryable: false,
@@ -714,6 +740,7 @@ globalThis.Echo360DirectTranslator = (() => {
       "SOURCE_ALREADY_TRANSLATED",
       "INCONSISTENT_TRANSLATION_RESULT",
       "GOOGLE_WEB_RATE_LIMIT_CIRCUIT_OPEN",
+      "TRANSLATION_CANCELLED",
     ].includes(code) || String(error?.message || error || "").includes("reasoning_effort");
   }
 
@@ -738,7 +765,7 @@ globalThis.Echo360DirectTranslator = (() => {
     return Math.min(GOOGLE_WEB_RETRY_MAX_MS, base * (2 ** attempt) + jitter);
   }
 
-  function createRateLimiter(rps, { onQueueWait, deadlineAt } = {}) {
+  function createRateLimiter(rps, { onQueueWait, deadlineAt, signal } = {}) {
     const rate = Number(rps) || 0;
     if (rate <= 0) {
       const unlimited = async () => ({ queueWaitMs: 0 });
@@ -754,11 +781,13 @@ globalThis.Echo360DirectTranslator = (() => {
     const waitForRequest = () => {
       const queuedAt = performance.now();
       const run = chain.then(async () => {
+        throwIfAborted(signal);
         assertDeadline(deadlineAt);
         const now = Date.now();
         const waitMs = Math.max(0, nextAt - now, cooldownUntil - now);
         nextAt = Math.max(now, nextAt, cooldownUntil) + gapMs;
-        if (waitMs > 0) await sleep(waitMs, deadlineAt);
+        if (waitMs > 0) await sleep(waitMs, deadlineAt, signal);
+        throwIfAborted(signal);
         assertDeadline(deadlineAt);
         const queueWaitMs = Math.round(performance.now() - queuedAt);
         if (queueWaitMs >= 5000) onQueueWait?.({ queueWaitMs, rps: rate });
@@ -777,7 +806,8 @@ globalThis.Echo360DirectTranslator = (() => {
     return waitForRequest;
   }
 
-  async function fetchJson(url, init, timeoutSeconds, waitForRequest = async () => {}, observer = null, deadlineAt = null) {
+  async function fetchJson(url, init, timeoutSeconds, waitForRequest = async () => {}, observer = null, deadlineAt = null, signal = null) {
+    throwIfAborted(signal);
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
@@ -795,6 +825,7 @@ globalThis.Echo360DirectTranslator = (() => {
     }
     const queuedAt = performance.now();
     const queueInfo = await waitForRequest();
+    throwIfAborted(signal);
     const queueWaitMs = Math.round(Number(queueInfo?.queueWaitMs) || (performance.now() - queuedAt));
     observer?.({ phase: "request-start", queueWaitMs });
     const controller = new AbortController();
@@ -807,15 +838,19 @@ globalThis.Echo360DirectTranslator = (() => {
     }
     const effectiveTimeoutMs = Math.max(1, Math.min(perRequestTimeoutMs, remainingTaskMs));
     const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+    const abortRequest = () => controller.abort();
+    signal?.addEventListener("abort", abortRequest, {once:true});
     const requestStartedAt = performance.now();
     try {
       const resp = await fetch(url, { ...init, signal: controller.signal });
+      throwIfAborted(signal);
       const text = await ns.errorUtils.readBoundedResponseText(resp, PROVIDER_RESPONSE_MAX_BYTES, {
         code: "PROVIDER_RESPONSE_TOO_LARGE",
         status: 502,
         phase: "translation",
         message: `Provider response exceeded ${PROVIDER_RESPONSE_MAX_BYTES} bytes`,
       });
+      throwIfAborted(signal);
       if (!resp.ok) {
         const error = createHttpError(resp.status, parseRetryAfterMs(resp.headers?.get?.("retry-after")));
         error.bodyLength = text.length;
@@ -834,6 +869,7 @@ globalThis.Echo360DirectTranslator = (() => {
         throw makeTranslationError("INVALID_PROVIDER_RESPONSE", "Provider returned non-JSON response");
       }
     } catch (error) {
+      throwIfAborted(signal);
       if (error?.name === "AbortError") {
         error.code = "REQUEST_TIMEOUT";
         error.status = null;
@@ -852,6 +888,7 @@ globalThis.Echo360DirectTranslator = (() => {
       throw error;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abortRequest);
     }
   }
 
@@ -939,7 +976,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt, cfg.signal);
     return extractOpenAiText(data);
   }
 
@@ -961,7 +998,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt, cfg.signal);
     return extractChatText(data);
   }
 
@@ -979,7 +1016,7 @@ globalThis.Echo360DirectTranslator = (() => {
         contents: [{ role: "user", parts: [{ text: prompt.user }] }],
         generationConfig: { temperature: 0 },
       }),
-    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt, cfg.signal);
     return extractGeminiText(data);
   }
 
@@ -999,7 +1036,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body,
-    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt, cfg.signal);
     const translated = Array.isArray(data?.translations) && data.translations.every((item) =>
       item && typeof item.text === "string" && item.text.trim()
     )
@@ -1023,7 +1060,7 @@ globalThis.Echo360DirectTranslator = (() => {
         "Accept": "application/json",
       },
       body: JSON.stringify(texts.map((text) => ({ Text: text }))),
-    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt);
+    }, cfg.timeout, cfg.waitForRequest, null, cfg.deadlineAt, cfg.signal);
     const translated = Array.isArray(data)
       ? data.map((item) => {
         const text = item?.translations?.[0]?.text;
@@ -1062,7 +1099,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 queueWaitMs: event.queueWaitMs,
               });
             }
-          }, cfg.deadlineAt),
+          }, cfg.deadlineAt, cfg.signal),
           cfg.retries,
           {
             shouldRetry: (error) => !cfg.googleRateLimitCircuit?.isOpen?.() && isRetryableError(error),
@@ -1082,7 +1119,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 error,
               });
             },
-            deadlineAt: cfg.deadlineAt,
+            deadlineAt: cfg.deadlineAt, signal: cfg.signal,
           }
         );
         const translated = extractGoogleWebText(data);
@@ -1129,8 +1166,10 @@ globalThis.Echo360DirectTranslator = (() => {
   }
 
   async function translateBatchChecked(texts, cfg, options = {}) {
+    throwIfAborted(cfg.signal);
     const started = Date.now();
     const translated = await translateBatch(texts, cfg, options);
+    throwIfAborted(cfg.signal);
     const elapsedSeconds = (Date.now() - started) / 1000;
     const threshold = Math.max(0, Number(cfg.slow_split_threshold ?? cfg.slowSplitThreshold) || 0);
     if (
@@ -1163,7 +1202,7 @@ globalThis.Echo360DirectTranslator = (() => {
       return await withRetries(
         () => translateBatchChecked(texts, cfg, { ...options, jsonFallback: true, batchLabel: label }),
         retries,
-        { onRetry: options.onRetry, deadlineAt: cfg.deadlineAt }
+        { onRetry: options.onRetry, deadlineAt: cfg.deadlineAt, signal: cfg.signal }
       );
     } catch (err) {
       const message = err?.message || String(err);
@@ -1195,6 +1234,7 @@ globalThis.Echo360DirectTranslator = (() => {
     const maxRetries = Math.max(0, Number(retries) || 0);
     let lastErr;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      throwIfAborted(options.signal);
       assertDeadline(options.deadlineAt);
       try {
         return await fn(attempt);
@@ -1216,7 +1256,7 @@ globalThis.Echo360DirectTranslator = (() => {
           status: getErrorStatus(err),
           error: err,
         });
-        await sleep(delayMs, options.deadlineAt);
+        await sleep(delayMs, options.deadlineAt, options.signal);
       }
     }
     throw lastErr;
@@ -1229,8 +1269,10 @@ globalThis.Echo360DirectTranslator = (() => {
     const handlers = typeof progressHandler === "function"
       ? { onProgress: progressHandler }
       : (progressHandler || {});
-    const onProgress = handlers.onProgress || (() => {});
-    const onPartialVtt = handlers.onPartialVtt || (() => {});
+    const signal = handlers.signal;
+    throwIfAborted(signal);
+    const onProgress = (...args) => { if (!signal?.aborted) handlers.onProgress?.(...args); };
+    const onPartialVtt = (...args) => { if (!signal?.aborted) handlers.onPartialVtt?.(...args); };
     const partialEmitIntervalMs = Math.max(0, Number(handlers.partialEmitIntervalMs) || 400);
     let lastPartialEmitAt = 0;
     const deadlineAt = hasDeadline(handlers.deadlineAt)
@@ -1250,6 +1292,7 @@ globalThis.Echo360DirectTranslator = (() => {
         failed: failedItemCount,
         failed_items: failedItems.slice(0, MAX_FAILURE_DETAILS),
         failed_cues: Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1),
+        failed_lines: collectFailedLines(),
         metrics: progressDetails(),
       });
     }
@@ -1312,7 +1355,8 @@ globalThis.Echo360DirectTranslator = (() => {
       concurrency: effectiveConcurrency,
       rps: effectiveRps,
       retries: effectiveRetries,
-      waitForRequest: createRateLimiter(effectiveRps, { deadlineAt }),
+      waitForRequest: createRateLimiter(effectiveRps, { deadlineAt, signal }),
+      signal,
       googleRateLimitCircuit: isGoogleWeb ? createGoogleRateLimitCircuit() : null,
       deadlineAt,
     };
@@ -1323,15 +1367,18 @@ globalThis.Echo360DirectTranslator = (() => {
     // a single cue can contain multiple text lines; all of those lines must
     // report the same one-based WebVTT cue number in `failed_items`.
     let currentCueIndex = -1;
+    let currentCueTiming = null;
     let inCue = false;
     lines.forEach((line, index) => {
       if (isTimecode(line)) {
         currentCueIndex += 1;
+        currentCueTiming = parseCueTiming(line);
         inCue = true;
         return;
       }
       if (!line.trim()) {
         inCue = false;
+        currentCueTiming = null;
         return;
       }
       if (!inCue || !shouldTranslate(line)) return;
@@ -1340,7 +1387,14 @@ globalThis.Echo360DirectTranslator = (() => {
       // `items` counts translatable text lines, while failure diagnostics and
       // the renderer need the actual WebVTT cue number. A multiline cue must
       // therefore keep the same cue index for all of its text lines.
-      items.push({ index, text: body, cueIndex: currentCueIndex });
+      items.push({
+        index,
+        text: body,
+        cueIndex: currentCueIndex,
+        timecode: currentCueTiming?.timecode || null,
+        startTime: currentCueTiming?.startTime || null,
+        endTime: currentCueTiming?.endTime || null,
+      });
     });
     if (items.length === 0) throw makeTranslationError("EMPTY_TRANSLATABLE_VTT", "VTT 中没有可翻译文本");
     const translatableCueCount = new Set(items
@@ -1386,6 +1440,22 @@ globalThis.Echo360DirectTranslator = (() => {
     const retries = Math.max(0, Number(cfg.retries) || 0);
     const repairConcurrency = Math.max(1, Math.min(Number(cfg.repair_concurrency ?? cfg.repairConcurrency) || 1, 96));
     const startedAt = performance.now();
+
+    // `failed_items` is deliberately capped for diagnostics. Keep the
+    // complete physical source-line locations separately, derived from the
+    // authoritative item-position flags rather than from that capped sample.
+    // `items` is in source order and each item.index is a zero-based physical
+    // VTT line index, so the returned values are stable one-based locations.
+    function collectFailedLines() {
+      const failedLines = [];
+      for (let itemPosition = 0; itemPosition < items.length; itemPosition += 1) {
+        if (!failureFlags[itemPosition]) continue;
+        const lineIndex = items[itemPosition]?.index;
+        if (Number.isInteger(lineIndex) && lineIndex >= 0) failedLines.push(lineIndex + 1);
+      }
+      return failedLines;
+    }
+
     const metrics = {
       provider,
       total: items.length,
@@ -1412,6 +1482,7 @@ globalThis.Echo360DirectTranslator = (() => {
       processedCues: 0,
       translatedCues: 0,
       failedCues: 0,
+      failed_lines: [],
     };
 
     function addWarning(message) {
@@ -1434,6 +1505,7 @@ globalThis.Echo360DirectTranslator = (() => {
         processedCues: Math.min(translatableCueCount, processedCueCount),
         translatedCues: Math.min(translatableCueCount, Math.max(0, translatedCueCount)),
         failedCues: failedCueCount,
+        failed_lines: collectFailedLines(),
         observedFailureCodes: { ...observedFailureCodes },
         observed_failure_codes: { ...observedFailureCodes },
         failureCodes: { ...failureCodeCounts },
@@ -1468,6 +1540,13 @@ globalThis.Echo360DirectTranslator = (() => {
           item: itemIndex + 1,
           cue: Number.isInteger(item?.cueIndex) && item.cueIndex >= 0 ? item.cueIndex + 1 : null,
           line: Number.isInteger(item?.index) ? item.index + 1 : null,
+          // Preserve enough source context for the UI to identify the exact
+          // failed subtitle without reopening/parsing the full VTT.  These
+          // fields are bounded later by the shared error formatter.
+          source_text: item?.text || "",
+          timecode: item?.timecode || null,
+          start_time: item?.startTime || null,
+          end_time: item?.endTime || null,
           ...summary,
         });
       }
@@ -1479,6 +1558,8 @@ globalThis.Echo360DirectTranslator = (() => {
       targetError.code = getErrorCode(targetError);
       targetError.metrics = { ...progressDetails() };
       targetError.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
+      targetError.failed_cues = Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1);
+      targetError.failed_lines = collectFailedLines();
       targetError.failure_codes = { ...failureCodeCounts };
       targetError.warnings = warnings.slice(0, 30);
       targetError.provider = provider;
@@ -1749,6 +1830,7 @@ globalThis.Echo360DirectTranslator = (() => {
 
     async function worker() {
       while (nextBatch < batches.length) {
+        throwIfAborted(signal);
         if (Date.now() >= deadlineAt) {
           throw makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
         }
@@ -1782,7 +1864,7 @@ globalThis.Echo360DirectTranslator = (() => {
                 onItemFailure: (failure) => batchFailures.push(failure),
               }),
               retries,
-              { onRetry: (info) => onRetry(info, label), deadlineAt }
+              { onRetry: (info) => onRetry(info, label), deadlineAt, signal }
             );
             applyBatchResult(batch, translated, batchFailures, batchNo);
           }
@@ -1833,6 +1915,7 @@ globalThis.Echo360DirectTranslator = (() => {
 
       async function repairWorker() {
         while (nextRepair < deferredFailures.length) {
+          throwIfAborted(signal);
           if (Date.now() >= deadlineAt) {
             throw makeTranslationError("TRANSLATION_TIMEOUT", "Translation task exceeded its 8 minute deadline");
           }
@@ -1850,7 +1933,7 @@ globalThis.Echo360DirectTranslator = (() => {
                   onItemFailure: (failure) => batchFailures.push(failure),
                 }),
                 retries,
-                { onRetry: (info) => onRetry(info, label), deadlineAt }
+                { onRetry: (info) => onRetry(info, label), deadlineAt, signal }
               );
             } else {
               translated = await translateBatchRecursive(
@@ -1877,13 +1960,16 @@ globalThis.Echo360DirectTranslator = (() => {
       }
 
       try {
-        await Promise.all(Array.from({ length: repairWorkers }, () => repairWorker()));
+        const repairResults = await Promise.allSettled(Array.from({ length: repairWorkers }, () => repairWorker()));
+        const rejected = repairResults.find(result => result.status === "rejected");
+        if (rejected) throw rejected.reason;
       } catch (error) {
         const enriched = attachFailureContext(error);
         emitPartialVtt(true);
         throw enriched;
       }
     }
+    throwIfAborted(signal);
     const translatedVtt = translatedLines.join("\n");
     const target = String(payload.target || "ZH").toUpperCase();
     metrics.processed = completed;
@@ -2043,14 +2129,19 @@ globalThis.Echo360DirectTranslator = (() => {
           ? isGoogleWeb
             ? `Google Web 全部 ${items.length} 条请求失败，未获得中文结果；failureCodes=${JSON.stringify(failureCodes)}`
             : `Provider 全部 ${items.length} 条字幕请求失败，未获得可用译文；failureCodes=${JSON.stringify(failureCodes)}`
-          : isGoogleWeb
-            ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}`
-            : "Provider did not return Chinese subtitles";
+            : isGoogleWeb
+              ? `Google Web 返回了结果，但未检测到中文翻译；providerResults=${metrics.providerResults}, targetResults=${metrics.targetResults}, unchanged=${metrics.unchangedResults}, failed=${failedItemCount}`
+              : "Provider did not return Chinese subtitles";
+      // The normal completion path fills cue counters after this branch, but
+      // terminal all-failed/no-target errors return here first. Snapshot the
+      // live item flags so their metrics and line locations are consistent.
+      Object.assign(metrics, progressDetails());
       const error = new Error(message);
       error.code = code;
       error.metrics = { ...metrics };
       error.failed_items = failedItems.slice(0, MAX_FAILURE_DETAILS);
       error.failed_cues = Array.from(failedCueIndexes, (cueIndex) => cueIndex + 1);
+      error.failed_lines = collectFailedLines();
       error.failure_codes = failureCodes;
       error.warnings = warnings.slice(0, 30);
       error.provider = provider;
@@ -2079,6 +2170,8 @@ globalThis.Echo360DirectTranslator = (() => {
     metrics.translatableCues = translatableCueCount;
     metrics.translatedCues = Math.max(0, translatableCueCount - finalFailedCueSet.size);
     metrics.failedCues = finalFailedCueSet.size;
+    const finalFailedLines = collectFailedLines();
+    metrics.failed_lines = finalFailedLines;
     metrics.observedFailureCodes = { ...observedFailureCodes };
     metrics.observed_failure_codes = { ...observedFailureCodes };
     metrics.providerBreakdown = {
@@ -2107,6 +2200,7 @@ globalThis.Echo360DirectTranslator = (() => {
       // separately from the bounded diagnostic sample so a multi-line cue (or
       // more than 50 failed lines) can still be reassigned without ambiguity.
       failed_cues: Array.from(finalFailedCueSet),
+      failed_lines: finalFailedLines,
       failure_codes: finalFailureCodes,
       failureCodes: finalFailureCodes,
       metrics: { ...metrics },

@@ -19,7 +19,8 @@
       (pathname === "/translate" && !query && normalizedMethod === "POST") ||
       (pathname === "/translate-async" && !query && normalizedMethod === "POST") ||
       (/^\/translate-async\/[A-Za-z0-9_-]{1,128}$/.test(pathname) &&
-        normalizedMethod === "GET" && (!query || partialRevisionQuery));
+        ((normalizedMethod === "GET" && (!query || partialRevisionQuery)) ||
+         (normalizedMethod === "DELETE" && !query)));
   }
 
   function isTrustedRuntimeSender(expectedExtensionId, sender) {

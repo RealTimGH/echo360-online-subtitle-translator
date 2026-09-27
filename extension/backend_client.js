@@ -20,6 +20,28 @@
     return null;
   }
 
+  function normalizeLocationList(...sources) {
+    const locations = [];
+    const seen = new Set();
+    for (const source of sources) {
+      if (!Array.isArray(source)) continue;
+      for (const value of source) {
+        const location = Number(value);
+        if (!Number.isSafeInteger(location) || location <= 0 || seen.has(location)) continue;
+        seen.add(location);
+        locations.push(location);
+      }
+    }
+    return locations;
+  }
+
+  function selectLocationList(...sources) {
+    for (const source of sources) {
+      if (Array.isArray(source)) return normalizeLocationList(source);
+    }
+    return [];
+  }
+
   function firstSpecificCode(...values) {
     const normalized = values
       .map((value) => ns.errorUtils?.normalizeCode?.(value) || String(value ?? "").trim().toUpperCase().replace(/^HTTP\s+(\d{3})$/, "HTTP_$1"))
@@ -175,6 +197,8 @@
       metrics: response?.metrics || problem?.metrics || null,
       failure_codes: response?.failure_codes || response?.failureCodes || problem?.failure_codes || null,
       failed_items: response?.failed_items || response?.failedItems || problem?.failed_items || [],
+      failed_cues: response?.failed_cues || response?.failedCues || problem?.failed_cues || problem?.failedCues || [],
+      failed_lines: response?.failed_lines || response?.failedLines || problem?.failed_lines || problem?.failedLines || [],
       warnings: [
         ...(Array.isArray(response?.warnings) ? response.warnings : []),
         ...(Array.isArray(problem?.warnings) ? problem.warnings : []),
@@ -316,6 +340,38 @@
     error.failed_items = Array.isArray(job.failed_items)
       ? job.failed_items
       : Array.isArray(detail.failed_items) ? detail.failed_items : [];
+    error.failed_cues = selectLocationList(
+      job.failed_cues,
+      job.failedCues,
+      detail.failed_cues,
+      detail.failedCues,
+      job.progress?.failed_cues,
+      job.progress?.failedCues,
+      error.metrics?.failed_cues,
+      error.metrics?.failedCues,
+    );
+    error.failed_lines = selectLocationList(
+      job.failed_lines,
+      job.failedLines,
+      detail.failed_lines,
+      detail.failedLines,
+      job.progress?.failed_lines,
+      job.progress?.failedLines,
+      error.metrics?.failed_lines,
+      error.metrics?.failedLines,
+    );
+    if (error.metrics && typeof error.metrics === "object") {
+      error.metrics = {
+        ...error.metrics,
+        failed_cues: error.failed_cues,
+        failed_lines: error.failed_lines,
+      };
+    } else if (error.failed_cues.length > 0 || error.failed_lines.length > 0) {
+      error.metrics = {
+        failed_cues: error.failed_cues,
+        failed_lines: error.failed_lines,
+      };
+    }
     error.failure_codes = job.failure_codes || detail.failure_codes || detail.failureCodes || error.metrics?.failureCodes || null;
     error.partial_vtt = job.partial_vtt || "";
     error.provider = job.provider || detail.provider || error.metrics?.provider || "";
@@ -324,7 +380,15 @@
       ...(Array.isArray(job.warnings) ? job.warnings : []),
       ...(Array.isArray(detail.warnings) ? detail.warnings : []),
     ];
-    error.progress = job.progress || null;
+    error.progress = job.progress ? normalizeProgress(job.progress) : null;
+    if (error.progress && (Array.isArray(job.failed_cues) || Array.isArray(job.failedCues) ||
+      Array.isArray(detail.failed_cues) || Array.isArray(detail.failedCues))) {
+      error.progress.failed_cues = error.failed_cues;
+    }
+    if (error.progress && (Array.isArray(job.failed_lines) || Array.isArray(job.failedLines) ||
+      Array.isArray(detail.failed_lines) || Array.isArray(detail.failedLines))) {
+      error.progress.failed_lines = error.failed_lines;
+    }
     error.jobId = diagnosis.jobId;
     error.error_detail = job.error_detail || null;
     error.title = job.title || detail.title || "";
@@ -363,6 +427,8 @@
       ...progress,
       current: Number.isFinite(Number(progress.current)) ? Number(progress.current) : 0,
       total: Number.isFinite(Number(progress.total)) ? Number(progress.total) : 0,
+      failed_cues: selectLocationList(progress.failed_cues, progress.failedCues, progress.metrics?.failed_cues, progress.metrics?.failedCues),
+      failed_lines: selectLocationList(progress.failed_lines, progress.failedLines, progress.metrics?.failed_lines, progress.metrics?.failedLines),
     };
   }
 
@@ -901,26 +967,29 @@
         });
       }
     }
-    const failedCues = [];
-    const seenFailedCues = new Set();
-    const failedCueSources = [
+    const failedCues = selectLocationList(
       result.failed_cues,
       result.failedCues,
       metrics.failed_cues,
       metrics.failedCues,
-    ];
-    for (const source of failedCueSources) {
-      if (!Array.isArray(source)) continue;
-      for (const cue of source) {
-        const number = Number(cue);
-        if (!Number.isInteger(number) || number <= 0 || seenFailedCues.has(number)) continue;
-        seenFailedCues.add(number);
-        failedCues.push(number);
-      }
-    }
-    if (failedCues.length === 0) return result;
-    if (Array.isArray(result.failed_cues) && result.failed_cues.length === failedCues.length) return result;
-    return { ...result, failed_cues: failedCues };
+    );
+    const failedLines = selectLocationList(
+      result.failed_lines,
+      result.failedLines,
+      metrics.failed_lines,
+      metrics.failedLines,
+    );
+    if (failedCues.length === 0 && failedLines.length === 0) return result;
+    const sameCues = Array.isArray(result.failed_cues) && result.failed_cues.length === failedCues.length &&
+      result.failed_cues.every((cue, index) => Number(cue) === failedCues[index]);
+    const sameLines = Array.isArray(result.failed_lines) && result.failed_lines.length === failedLines.length &&
+      result.failed_lines.every((line, index) => Number(line) === failedLines[index]);
+    if (sameCues && sameLines) return result;
+    return {
+      ...result,
+      ...(failedCues.length > 0 ? { failed_cues: failedCues } : {}),
+      ...(failedLines.length > 0 ? { failed_lines: failedLines } : {}),
+    };
   }
 
   function validateJob(job, phase) {
@@ -1014,7 +1083,7 @@
       });
   }
 
-  async function waitDirectJob(jobId, options = {}) {
+  async function pollDirectJob(jobId, options = {}) {
     const maxMs = DIRECT_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
@@ -1066,7 +1135,7 @@
     throw makeClientError("翻译任务超时（超过 8 分钟）", "TRANSLATION_TIMEOUT");
   }
 
-  async function waitJob(backendUrl, jobId, options = {}) {
+  async function pollBackendJob(backendUrl, jobId, options = {}) {
     const maxMs = BACKEND_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
@@ -1127,6 +1196,38 @@
       await waitForPoll(700, options.signal);
     }
     throw makeClientError("本地后端任务超时（超过 9 分钟）", "TRANSLATION_TIMEOUT");
+  }
+
+  async function waitWithCancellation(poll, cancel, options) {
+    let cancellation;
+    const abort = () => {
+      cancellation ||= Promise.resolve().then(cancel).catch(error => {
+        console.warn("[echo360-translator] could not cancel job", error?.code || error?.message);
+      });
+      return cancellation;
+    };
+    options.signal?.addEventListener("abort", abort, {once:true});
+    try {
+      if (options.signal?.aborted) abort();
+      return await poll();
+    } catch (error) {
+      await abort();
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  function waitDirectJob(jobId, options = {}) {
+    return waitWithCancellation(() => pollDirectJob(jobId, options), async () => {
+      const response = await extensionApi.runtime.sendMessage({type:"direct-translate-cancel",jobId});
+      if (!response?.ok) throw errorFromResponse(response,"取消翻译失败","DIRECT_JOB_CANCEL_FAILED");
+    }, options);
+  }
+
+  function waitJob(backendUrl, jobId, options = {}) {
+    return waitWithCancellation(() => pollBackendJob(backendUrl, jobId, options),
+      () => proxyRequest(backendUrl, `/translate-async/${jobId}`, "DELETE"), options);
   }
 
   ns.backendClient = {

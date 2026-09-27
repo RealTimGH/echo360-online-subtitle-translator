@@ -28,6 +28,7 @@
         pointer-events: none;
         --echo360-ball-bottom: 120px;
         --echo360-surface-bottom: 80px;
+        --echo360-idle-opacity: 0.35;
         ${toCssVars(DARK)}
       }
       /* Canvas embeds usually give the media frame a much taller page-sized
@@ -38,6 +39,17 @@
       #echo360-ui-root[data-echo360-host="instructure-media"] {
         --echo360-ball-bottom: 200px;
         --echo360-surface-bottom: 160px;
+      }
+      /* Echo360 classroom pages: after the user starts translation, keep the
+         idle dock unobtrusive until hover/focus or the panel opens. Touch
+         devices skip dimming because there is no persistent hover state. */
+      @media (hover: hover) {
+        #echo360-ui-root[data-echo360-host="echo360"].echo360-idle-dim-enabled #echo360-translator-ball-group:not(:hover):not(:focus-within):not(.echo360-ball-hidden):not(.echo360-ball-pulse) {
+          opacity: var(--echo360-idle-opacity);
+        }
+        #echo360-ui-root[data-echo360-host="echo360"].echo360-idle-dim-enabled #echo360-translator-panel.echo360-panel-visible {
+          opacity: 1;
+        }
       }
       /* Instructure Media embeds can have a transformed or independently
          scrolling player shell.  Keep the UI root in that media document,
@@ -204,6 +216,18 @@
       }
       .echo360-ball-secondary button:first-child { border-radius: 10px 10px 4px 4px; }
       .echo360-ball-secondary button:last-child { border-radius: 4px 4px 10px 10px; }
+      .echo360-ball-secondary.echo360-ball-quick-import-hidden {
+        height: 36px;
+        align-self: center;
+        grid-template-rows: 1fr;
+      }
+      .echo360-ball-secondary.echo360-ball-quick-import-hidden #echo360-translator-ball-panel {
+        min-height: 36px;
+        border-radius: 10px;
+      }
+      .echo360-ball-secondary.echo360-ball-quick-import-hidden #echo360-translator-ball-import {
+        display: none;
+      }
       .echo360-ball-secondary button:hover,
       .echo360-ball-secondary button:focus-visible {
         box-shadow: 0 0 0 2px var(--echo360-ball-shadow-hover);

@@ -295,7 +295,16 @@ Third line
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(result.failed_items).toHaveLength(1);
-      expect(result.failed_items[0]).toMatchObject({ code: "HTTP_429", status: 429 });
+      expect(result.failed_items[0]).toMatchObject({
+        code: "HTTP_429",
+        status: 429,
+        cue: 1,
+        line: 4,
+        source_text: "first",
+        timecode: "00:00:00.000 --> 00:00:01.000",
+        start_time: "00:00:00.000",
+        end_time: "00:00:01.000",
+      });
       expect(result.translated_vtt).toContain("first");
       expect(result.translated_vtt).toContain("第二条");
       expect(result.metrics).toMatchObject({
@@ -310,11 +319,13 @@ Third line
       });
       expect(progress).toHaveBeenCalledWith(0, 2, "[0/2] Translating...", expect.objectContaining({ effectiveRps: 6 }));
       expect(progress).toHaveBeenLastCalledWith(2, 2, "[2/2] Translating...", expect.objectContaining({ failed: 1 }));
+      expect(progress).toHaveBeenLastCalledWith(2, 2, "[2/2] Translating...", expect.objectContaining({ failed_lines: [4] }));
       expect(partial).toHaveBeenLastCalledWith(
         expect.stringContaining("第二条"),
         expect.objectContaining({
           done: true,
           failed_items: [expect.objectContaining({ cue: 1, code: "HTTP_429" })],
+          failed_lines: [4],
         })
       );
       expect(errorLog).toHaveBeenCalledWith(
@@ -638,6 +649,77 @@ Third line
     }
   });
 
+  it("accepts an isolated punctuated initial without accepting an ordinary short word", async () => {
+    expect(translator.isTargetNeutralText("p.", "p.", "ZH")).toBe(true);
+    expect(translator.isTargetNeutralText("p", "p", "ZH")).toBe(false);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => (
+      new Response(JSON.stringify([[ ["p.", "p."] ]]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ));
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        concurrency: 1,
+        rps: 0,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 1,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\np.\n",
+      });
+
+      expect(result.failed_items).toEqual([]);
+      expect(result.metrics).toMatchObject({
+        total: 1,
+        translated: 1,
+        failed: 0,
+        providerResults: 1,
+        targetResults: 1,
+        unchangedResults: 1,
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("includes source text and cue timing in a no-target failure diagnostic", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const text = new URL(url).searchParams.get("q");
+      const translated = text === "ordinary" ? text : "第二条";
+      return new Response(JSON.stringify([[ [translated, text] ]]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "google-web",
+        target: "ZH",
+        concurrency: 1,
+        rps: 0,
+        retries: 0,
+        timeout: 5,
+        max_paragraphs: 1,
+        vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nordinary\n\n00:00:01.000 --> 00:00:02.000\nsecond\n",
+      });
+
+      expect(result.failed_items).toHaveLength(1);
+      expect(result.failed_items[0]).toMatchObject({
+        cue: 1,
+        line: 4,
+        source_text: "ordinary",
+        timecode: "00:00:00.000 --> 00:00:01.000",
+        code: "NO_TARGET_TRANSLATION",
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("does not report an all-failed non-Google job as a successful partial result", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("Load failed"));
 
@@ -686,9 +768,61 @@ Third line
       expect(error.failed_items).toHaveLength(50);
       expect(error.failed_cues).toHaveLength(60);
       expect(error.failed_cues.at(-1)).toBe(60);
+      expect(error.failed_lines).toEqual(Array.from({ length: 60 }, (_, index) => index * 3 + 4));
+      expect(error.metrics).toMatchObject({
+        processedCues: 60,
+        failedCues: 60,
+        failed_lines: Array.from({ length: 60 }, (_, index) => index * 3 + 4),
+      });
       expect(Object.values(error.failure_codes).reduce((sum, count) => sum + count, 0)).toBe(60);
     } finally {
       expect(fetchMock).toHaveBeenCalled();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("returns every failed physical line when the diagnostic item sample exceeds 50", async () => {
+    let calls = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      calls += 1;
+      if (calls <= 60) return new Response("upstream failure", { status: 503 });
+      const body = JSON.parse(init.body);
+      return new Response(JSON.stringify(body.map(() => ({
+        translations: [{ text: "translated" }],
+      }))), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const cues = Array.from({ length: 61 }, (_, index) => {
+      const start = index;
+      const end = start + 1;
+      const startMinute = String(Math.floor(start / 60)).padStart(2, "0");
+      const startSecond = String(start % 60).padStart(2, "0");
+      const endMinute = String(Math.floor(end / 60)).padStart(2, "0");
+      const endSecond = String(end % 60).padStart(2, "0");
+      return `00:${startMinute}:${startSecond}.000 --> 00:${endMinute}:${endSecond}.000\nline ${index + 1}`;
+    }).join("\n\n");
+
+    try {
+      const result = await translator.translateVtt({
+        provider: "azure",
+        api_key: "azure-test-key",
+        target: "EN",
+        concurrency: 3,
+        retries: 0,
+        max_paragraphs: 1,
+        max_chars: 1200,
+        vtt_text: `WEBVTT\n\n${cues}\n`,
+      });
+
+      expect(calls).toBe(61);
+      expect(result.failed_items).toHaveLength(50);
+      expect(result.failed_lines).toEqual(Array.from({ length: 60 }, (_, index) => index * 3 + 4));
+      expect(result.metrics).toMatchObject({ total: 61, processed: 61, translated: 1, failed: 60 });
+      expect(result.metrics.failed_lines).toEqual(result.failed_lines);
+      expect(result.translated_vtt).toContain("translated");
+    } finally {
       fetchMock.mockRestore();
     }
   });
@@ -741,4 +875,74 @@ Third line
       Math.random.mockRestore();
     }
   });
+});
+
+it("preserves sentence group IDs and overlapping source ranges through provider translation", async () => {
+  const input = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nFirst sentence.\n\n2\n00:00:01.000 --> 00:00:03.000\nSecond sentence.\n\n3\n00:00:01.000 --> 00:00:03.000\nThird sentence.\n";
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+    const texts = JSON.parse(init.body).map(item => item.Text);
+    expect(texts).toEqual(["First sentence.", "Second sentence.", "Third sentence."]);
+    return new Response(JSON.stringify(texts.map((_, index) => ({ translations: [{ text: `译文${index + 1}`, to: "zh-Hans" }] }))),
+      { status: 200, headers: { "content-type": "application/json" } });
+  });
+  try {
+    const result = await translator.translateVtt({
+      provider: "azure", api_key: "test-key", target: "ZH", concurrency: 1, retries: 0,
+      max_paragraphs: 6, max_chars: 1200, vtt_text: input,
+    });
+    expect(result.translated_vtt).toBe(input.replace("First sentence.", "译文1").replace("Second sentence.", "译文2").replace("Third sentence.", "译文3"));
+  } finally {
+    fetchMock.mockRestore();
+  }
+});
+
+it("aborts provider fetch and does not retry or publish late partial results", async () => {
+  const controller = new AbortController();
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
+    started();
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {once:true});
+    });
+  });
+  const onPartialVtt = vi.fn();
+  try {
+    const pending = translator.translateVtt({
+      provider: "azure", api_key: "test-key", target: "ZH", concurrency: 1, retries: 3,
+      vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+    }, {signal: controller.signal, onPartialVtt});
+    const rejection = expect(pending).rejects.toMatchObject({code: "TRANSLATION_CANCELLED"});
+    await ready;
+    const previousCalls = onPartialVtt.mock.calls.length;
+    controller.abort();
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onPartialVtt).toHaveBeenCalledTimes(previousCalls);
+  } finally {
+    fetchMock.mockRestore();
+  }
+});
+
+it("cancels retry backoff immediately without waiting for its timer", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response("unavailable", {status:503}));
+  const retryLog = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const pending = translator.translateVtt({
+      provider:"azure", api_key:"key", target:"ZH", retries:3, fallback_mode:"deferred-fastpath",
+      vtt_text:"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+    }, {signal:controller.signal});
+    const rejection = expect(pending).rejects.toMatchObject({code:"TRANSLATION_CANCELLED"});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(retryLog.mock.calls.some(([message]) => message.includes("retry scheduled"))).toBe(true);
+    controller.abort();
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    fetchMock.mockRestore(); retryLog.mockRestore(); vi.useRealTimers();
+  }
 });

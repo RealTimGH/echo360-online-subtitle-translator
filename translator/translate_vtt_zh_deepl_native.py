@@ -163,6 +163,10 @@ TIMECODE_RE = re.compile(
     r"^\s*(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}\s*-->\s*"
     r"(?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3}"
 )
+TIMING_LINE_RE = re.compile(
+    r"^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*"
+    r"((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$"
+)
 WEBVTT_RE = re.compile(r"^\s*WEBVTT", re.IGNORECASE)
 INDEX_RE = re.compile(r"^\s*\d+\s*$")
 VOICE_TAG_RE = re.compile(r"^(?P<prefix>\s*<v\b[^>]*>)(?P<body>.*?)(?P<suffix>\s*</v>\s*)?$")
@@ -216,6 +220,13 @@ def is_target_neutral_text(source_value: object, translated_value: object, targe
         re.fullmatch(r"(?:(?:https?|ftp)://|www\.)\S+", source, re.IGNORECASE)
         or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
     ):
+        return True
+    # A lone punctuated initial such as ``p.`` is a legitimate caption token,
+    # but the period is essential to this exception.  Requiring the
+    # punctuation keeps ordinary short English words (``p``, ``a``, ``ok``)
+    # on the strict NO_TARGET_TRANSLATION path.  A/I remain words even with a
+    # dot, matching the extension's target-coverage contract.
+    if re.fullmatch(r"[B-HJ-Zb-hj-z]\.", source):
         return True
     if re.fullmatch(r"[A-Z0-9][A-Z0-9._:/+#&()'’\-]*", source):
         upper = source.upper()
@@ -365,8 +376,9 @@ class GoogleWebRateLimitCircuit:
 
     def record_429(self) -> bool:
         """Record one HTTP 429 and return whether the circuit is open."""
-        now = time.monotonic()
         with self._lock:
+            # Timestamp and append belong to the same ordering boundary.
+            now = time.monotonic()
             self._total_429 += 1
             if not self._open:
                 self._prune_locked(now)
@@ -402,6 +414,21 @@ def _failed_cues(items: list[dict]) -> list[int]:
         seen.add(cue)
         cues.append(cue)
     return cues
+
+
+def _failed_lines(items: list[dict]) -> list[int]:
+    """Return every failed physical VTT text line, including beyond the sample."""
+    lines: list[int] = []
+    seen: set[int] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        line = item.get("line")
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0 or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    return lines
 
 
 def _failure_codes(items: list[dict]) -> dict[str, int]:
@@ -448,6 +475,26 @@ def _validate_provider_batch_output(value: object, expected_len: int) -> list[st
 
 def is_timecode(line: str) -> bool:
     return bool(TIMECODE_RE.match(line))
+
+
+def parse_cue_timing(line: str) -> dict[str, str] | None:
+    """Return the display timing fields for a WebVTT cue timing line.
+
+    Failure diagnostics are shown outside the VTT renderer, so the physical
+    line number alone is not enough to identify a failed caption in a long
+    track.  Keep the same normalized timing representation as the extension:
+    cue settings are intentionally omitted while the original start/end
+    timestamp strings are retained.
+    """
+    match = TIMING_LINE_RE.match(str(line or ""))
+    if not match:
+        return None
+    start_time, end_time = match.group(1), match.group(2)
+    return {
+        "timecode": f"{start_time} --> {end_time}",
+        "start_time": start_time,
+        "end_time": end_time,
+    }
 
 
 def is_header(line: str) -> bool:
@@ -1563,12 +1610,23 @@ def translate_lines_native(
     fallback_provider_name: str | None = None
     fallback_provider_results = 0
     cue_index_by_line: dict[int, int] = {}
+    cue_timing_by_line: dict[int, dict[str, str | None]] = {}
     cue_index = 0
+    current_cue_timing: dict[str, str] | None = None
     for line_index, line in enumerate(lines):
         if is_timecode(line):
             cue_index += 1
+            current_cue_timing = parse_cue_timing(line)
+        elif not line.strip():
+            current_cue_timing = None
         if line_index in source_texts:
             cue_index_by_line[line_index] = cue_index
+            cue_timing_by_line[line_index] = {
+                "source_text": source_texts[line_index],
+                "timecode": current_cue_timing.get("timecode") if current_cue_timing else None,
+                "start_time": current_cue_timing.get("start_time") if current_cue_timing else None,
+                "end_time": current_cue_timing.get("end_time") if current_cue_timing else None,
+            }
     batches = build_text_batches(
         lines,
         translatable_idx,
@@ -1877,10 +1935,15 @@ def translate_lines_native(
             failure_status = int(status_match.group(1)) if status_match else (
                 int(failure_code[-3:]) if re.fullmatch(r"HTTP_\d{3}", failure_code) else None
             )
+            diagnostic_context = cue_timing_by_line.get(batch_ids[idx_in_batch], {})
             item = {
                 "batch": bstart + 1,
                 "line": batch_ids[idx_in_batch] + 1,
                 "cue": cue_index_by_line.get(batch_ids[idx_in_batch]),
+                "source_text": diagnostic_context.get("source_text", source_texts[batch_ids[idx_in_batch]]),
+                "timecode": diagnostic_context.get("timecode"),
+                "start_time": diagnostic_context.get("start_time"),
+                "end_time": diagnostic_context.get("end_time"),
                 "code": failure_code,
                 "message": _safe_error_text(failure_message),
             }
@@ -1935,10 +1998,15 @@ def translate_lines_native(
         safe_error = _safe_error_text(error_text or "Argos fallback failed; original text kept")
         failure_code = _error_code_from_text(safe_error)
         failure_status = _failure_status(failure_code, safe_error)
+        diagnostic_context = cue_timing_by_line.get(line_idx, {})
         replacement = {
             "batch": batch_number_by_line.get(line_idx, 0),
             "line": line_idx + 1,
             "cue": cue_index_by_line.get(line_idx),
+            "source_text": diagnostic_context.get("source_text", source_texts[line_idx]),
+            "timecode": diagnostic_context.get("timecode"),
+            "start_time": diagnostic_context.get("start_time"),
+            "end_time": diagnostic_context.get("end_time"),
             "code": failure_code,
             "message": safe_error,
         }
@@ -2256,6 +2324,7 @@ def translate_lines_native(
             "failed": len(failed_items),
             "failed_items": failed_items[:50],
             "failed_cues": _failed_cues(failed_items),
+            "failed_lines": _failed_lines(failed_items),
             "failed_batches": len({item.get("batch") for item in failed_items if item.get("batch") is not None}),
             "failure_codes": _failure_codes(failed_items),
             "failureCodes": _failure_codes(failed_items),

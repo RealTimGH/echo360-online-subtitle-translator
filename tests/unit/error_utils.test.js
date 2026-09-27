@@ -59,6 +59,10 @@ describe("structured error model", () => {
   it("recognizes only conservative unchanged neutral captions for a Chinese target", () => {
     const errors = loadErrors();
     expect(errors.isTargetNeutralText("F.", "F.", "ZH")).toBe(true);
+    expect(errors.isTargetNeutralText("p.", "p.", "ZH")).toBe(true);
+    expect(errors.isTargetNeutralText("I.", "I.", "ZH")).toBe(false);
+    expect(errors.isTargetNeutralText("a.", "a.", "ZH")).toBe(false);
+    expect(errors.isTargetNeutralText("p", "p", "ZH")).toBe(false);
     expect(errors.isTargetNeutralText("2026", "2026", "ZH")).toBe(true);
     expect(errors.isTargetNeutralText("ITLS6111", "ITLS6111", "ZH")).toBe(true);
     expect(errors.isTargetNeutralText("unchanged", "unchanged", "ZH")).toBe(false);
@@ -120,12 +124,43 @@ describe("structured error model", () => {
       code: "PARTIAL_TRANSLATION",
       message: "部分字幕失败",
       metrics: { total: 4, processed: 4, translated: 3, failed: 1 },
-      failed_items: [{ cue: 4, code: "HTTP_503", status: 503, message: "upstream unavailable" }],
-    }, { phase: "translation", severity: "warning" });
+      failed_items: [{
+        cue: 4,
+        line: 12,
+        source_text: "p.",
+        timecode: "00:00:03.000 --> 00:00:04.000",
+        code: "HTTP_503",
+        status: 503,
+        message: "upstream unavailable",
+      }],
+    }, {
+      phase: "translation",
+      severity: "warning",
+      sourceMeta: {
+        sentenceMerge: {
+          plan: {
+            groups: [
+              { sourceIndices: [0, 1] },
+              { sourceIndices: [2] },
+              { sourceIndices: [3] },
+              { sourceIndices: [4, 5] },
+            ],
+          },
+        },
+      },
+    });
 
     expect(model.severity).toBe("warning");
     expect(model.title).toContain("有字幕失败");
-    expect(model.details.find((item) => item.label.includes("失败字幕")).value).toContain("第 4 条");
+    const failureDetail = model.details.find((item) => item.label.includes("失败字幕")).value;
+    expect(failureDetail).toContain("第 4 条");
+    expect(failureDetail).toContain("VTT 第 12 行");
+    expect(failureDetail).toContain("原字幕第 5、6 条");
+    expect(failureDetail).toContain("00:00:03.000 --> 00:00:04.000");
+    expect(failureDetail).toContain("原文「p.」");
+    expect(model.recommendation).toContain("重试失败字幕");
+    const restored = errors.normalizeError(JSON.parse(JSON.stringify(errors.serializeError(model))));
+    expect(restored.failedItems[0].original_cues).toEqual([5, 6]);
   });
 
   it("supports legacy flattened messages without throwing", () => {

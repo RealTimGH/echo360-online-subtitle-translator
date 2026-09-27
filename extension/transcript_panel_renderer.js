@@ -41,6 +41,7 @@
 
   const state = {
     model: null,
+    renderGeneration: 0,
     // The controller applies the persisted opt-in after preferences load.
     // Starting disabled avoids a flash of Transcript-panel decorations on
     // fresh installs/upgrades before that asynchronous read completes.
@@ -359,12 +360,23 @@
     return result?.code === "TRANSCRIPT_BRIDGE_TIMEOUT" || result?.error === "timeout" || result?.transient === true;
   }
 
+  function panelWorkIsCurrent(panelState) {
+    const generation = state.renderGeneration;
+    const model = state.model;
+    const host = panelState.descriptor?.listHost;
+    return () => state.enabled && !!model && state.model === model &&
+      state.renderGeneration === generation && panelState.root?.isConnected &&
+      state.panelStates.get(panelState.root) === panelState && panelState.descriptor?.listHost === host;
+  }
+
   async function postBridgeWithRetry(action, panelState, payload = {}, timeoutMs = 350, maxAttempts = 3) {
+    const isCurrent = panelWorkIsCurrent(panelState);
     let result = null;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (attempt > 0) {
         await new Promise((resolve) => setTimeout(resolve, 16 * attempt));
       }
+      if (action !== "restore-layout" && !isCurrent()) return {ok:false, stale:true};
       result = await postBridge(action, panelState, payload, timeoutMs);
       if (result?.ok || !isRetryableBridgeResult(result)) return result;
     }
@@ -451,6 +463,7 @@
   }
 
   async function ensureLayoutCapability(panelState) {
+    const isCurrent = panelWorkIsCurrent(panelState);
     if (!panelState.descriptor.virtualized) {
       panelState.layout = "static";
       panelState.visibleRowCount = Number(panelState.modelRowCount || 0);
@@ -469,6 +482,10 @@
     )
       .then((result) => {
         panelState.capabilityPromise = null;
+        if (!isCurrent()) {
+          if (panelState.layout === "pending") panelState.layout = "unknown";
+          return false;
+        }
         if (result?.ok && result.capability === CAPABILITY) {
           panelState.layout = "ready";
           panelState.revision = Number(result.appliedRevision || 0);
@@ -600,6 +617,7 @@
   }
 
   async function revealLayoutWhenSafe(panelState) {
+    const isCurrent = panelWorkIsCurrent(panelState);
     if (!panelState?.descriptor?.virtualized) return true;
     // Unit-test DOMs (and a document-start page before React has assigned any
     // row geometry) expose zero-sized rectangles and no inline row height.  A
@@ -618,7 +636,7 @@
       // the bridge/retry path must correct the row offsets rather than mask
       // the problem by removing the translation from the screen.
       await nextLayoutProbeFrame();
-      if (!panelState.root?.isConnected) return false;
+      if (!isCurrent()) return false;
       setPanelLayoutReady(panelState);
       if (!hasLayoutOverlap(panelState)) return true;
       setPanelLayoutPending(panelState);
@@ -827,6 +845,7 @@
   }
 
   async function applyLayout(panelState, extras) {
+    const isCurrent = panelWorkIsCurrent(panelState);
     if (!panelState.descriptor.virtualized || panelState.layout !== "ready") return true;
     const normalized = [];
     const seen = new Set();
@@ -861,6 +880,7 @@
       revision: requestRevision,
       extras: normalized,
     }, bridgeTimeoutFor("set-layout"), bridgeAttemptsFor("set-layout"));
+    if (!isCurrent()) return false;
     if (panelState.revision !== requestRevision) {
       if (result?.ok && result.capability === CAPABILITY && Number(result.appliedRevision) === requestRevision) {
         scheduleFlush();
@@ -893,6 +913,7 @@
     state.diagnostics.layoutExtraRowCount = normalized.length;
     if (visibleChanged) scheduleFlush();
     const safe = await revealLayoutWhenSafe(panelState);
+    if (!isCurrent()) return false;
     if (!safe) {
       panelState.layoutNeedsSync = true;
       scheduleLayoutRetry(panelState);
@@ -952,9 +973,13 @@
   }
 
   async function flushPanel(panelState) {
-    if (!state.enabled || !state.model || !panelState.root.isConnected) return;
+    const isCurrent = panelWorkIsCurrent(panelState);
+    if (!isCurrent()) return;
     if (panelState.restorePromise) await panelState.restorePromise;
-    if (!(await ensureLayoutCapability(panelState))) {
+    if (!isCurrent()) return;
+    const capable = await ensureLayoutCapability(panelState);
+    if (!isCurrent()) return;
+    if (!capable) {
       removePanelDecorations(panelState, false);
       return;
     }
@@ -1009,7 +1034,7 @@
     }
     if (panelState.descriptor.virtualized) {
       const ok = await applyLayout(panelState, measureAllModelExtras(panelState, candidates, extras));
-      if (!ok) return;
+      if (!ok || !isCurrent()) return;
     }
     state.diagnostics.decoratedCueRows += decorated;
     state.diagnostics.unmappedCueRows += unmapped;
@@ -1180,6 +1205,7 @@
     }
     state.flushHandle = null;
     state.flushScheduled = false;
+    const generation = state.renderGeneration;
     const run = Promise.resolve().then(async () => {
       if (!state.started || !state.enabled || !state.model) return;
       state.diagnostics.observerFlushCount += 1;
@@ -1193,7 +1219,11 @@
       syncSearchPanels();
       if (!state.enabled || !state.model) return;
       const panels = [...state.panelStates.values()];
-      for (const panelState of panels) await flushPanel(panelState);
+      for (const panelState of panels) {
+        if (state.renderGeneration !== generation) return;
+        await flushPanel(panelState);
+      }
+      if (state.renderGeneration !== generation || !state.enabled || !state.model) return;
       syncSearchPanels();
       state.diagnostics.active = true;
       state.diagnostics.sessionKey = state.model.sessionKey;
@@ -1225,7 +1255,10 @@
     const run = () => {
       if (generation !== state.flushGeneration) return;
       state.flushHandle = null;
-      void flush({ discovery: false });
+      void flush({ discovery: false }).catch(error => {
+        console.error("[echo360-translator] Transcript flush failed", error);
+        warnOnce("flush-error", String(error?.message || error));
+      });
     };
     if (typeof requestAnimationFrame === "function") {
       state.flushHandle = requestAnimationFrame(run);
@@ -1278,6 +1311,7 @@
   }
 
   function setTranslation(value) {
+    state.renderGeneration += 1;
     const next = value?.cues ? value : modelApi()?.buildTranscriptModel?.(value || {}) || null;
     if (state.model?.sessionKey && next?.sessionKey && state.model.sessionKey !== next.sessionKey) {
       clearDecorationsOnly();
@@ -1314,6 +1348,7 @@
   function setVisible(enabled) {
     const next = enabled !== false;
     if (state.enabled === next) return;
+    state.renderGeneration += 1;
     state.enabled = next;
     if (!state.enabled) {
       clearDecorationsOnly();
@@ -1329,6 +1364,7 @@
   }
 
   function clear() {
+    state.renderGeneration += 1;
     const wasEnabled = state.enabled;
     clearDecorationsOnly();
     state.model = null;
@@ -1349,6 +1385,8 @@
   async function scrollToCue(cue) {
     if (!cue) return false;
     for (const panelState of state.panelStates.values()) {
+      const isCurrent = panelWorkIsCurrent(panelState);
+      if (!isCurrent()) return false;
       if (panelState.descriptor.virtualized &&
           (!Number.isInteger(panelState.visibleRowCount) || cue.index >= panelState.visibleRowCount)) continue;
       const candidates = adapter().findCueCandidates(panelState.root);
@@ -1362,6 +1400,7 @@
       }
       if (panelState.descriptor.virtualized && panelState.layout === "ready") {
         const result = await postBridge("scroll-to-row", panelState, { rowIndex: cue.index });
+        if (!isCurrent()) return false;
         if (result?.ok) {
           // react-virtualized renders the requested row asynchronously.  Give
           // React up to three frames to commit it, then use the real DOM node
@@ -1371,6 +1410,7 @@
               if (typeof requestAnimationFrame === "function") requestAnimationFrame(resolve);
               else setTimeout(resolve, 0);
             });
+            if (!isCurrent()) return false;
             scheduleFlush();
             const rendered = adapter().findCueCandidates(panelState.root).find((item) => {
               const translation = item.querySelector(`[${ATTR}="1"]`);
