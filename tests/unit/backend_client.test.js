@@ -617,3 +617,14 @@ describe("formatJobError (via waitDirectJob)", () => {
       .rejects.toMatchObject({ code: "JOB_NOT_FOUND", retryable: false });
   });
 });
+
+it("sends cancellation to the background when the caller aborts polling", async () => {
+  const controller = new AbortController();
+  runtimeSendMessage.mockImplementation(async message => {
+    if (message.type === "direct-translate-cancel") return {ok:true, data:{cancelled:true}};
+    controller.abort();
+    return {ok:true, data:{status:"running", progress:{current:0,total:1}}};
+  });
+  await expect(client.waitDirectJob("cancel-job", {signal:controller.signal})).rejects.toMatchObject({code:"TRANSLATION_CANCELLED"});
+  expect(runtimeSendMessage.mock.calls.filter(([message]) => message.type === "direct-translate-cancel")).toHaveLength(1);
+});

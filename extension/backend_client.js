@@ -1083,7 +1083,7 @@
       });
   }
 
-  async function waitDirectJob(jobId, options = {}) {
+  async function pollDirectJob(jobId, options = {}) {
     const maxMs = DIRECT_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
@@ -1135,7 +1135,7 @@
     throw makeClientError("翻译任务超时（超过 8 分钟）", "TRANSLATION_TIMEOUT");
   }
 
-  async function waitJob(backendUrl, jobId, options = {}) {
+  async function pollBackendJob(backendUrl, jobId, options = {}) {
     const maxMs = BACKEND_JOB_POLL_TIMEOUT_MS;
     const start = Date.now();
     let lastPartialVtt = "";
@@ -1196,6 +1196,38 @@
       await waitForPoll(700, options.signal);
     }
     throw makeClientError("本地后端任务超时（超过 9 分钟）", "TRANSLATION_TIMEOUT");
+  }
+
+  async function waitWithCancellation(poll, cancel, options) {
+    let cancellation;
+    const abort = () => {
+      cancellation ||= Promise.resolve().then(cancel).catch(error => {
+        console.warn("[echo360-translator] could not cancel job", error?.code || error?.message);
+      });
+      return cancellation;
+    };
+    options.signal?.addEventListener("abort", abort, {once:true});
+    try {
+      if (options.signal?.aborted) abort();
+      return await poll();
+    } catch (error) {
+      await abort();
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  function waitDirectJob(jobId, options = {}) {
+    return waitWithCancellation(() => pollDirectJob(jobId, options), async () => {
+      const response = await extensionApi.runtime.sendMessage({type:"direct-translate-cancel",jobId});
+      if (!response?.ok) throw errorFromResponse(response,"取消翻译失败","DIRECT_JOB_CANCEL_FAILED");
+    }, options);
+  }
+
+  function waitJob(backendUrl, jobId, options = {}) {
+    return waitWithCancellation(() => pollBackendJob(backendUrl, jobId, options),
+      () => proxyRequest(backendUrl, `/translate-async/${jobId}`, "DELETE"), options);
   }
 
   ns.backendClient = {

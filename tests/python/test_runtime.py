@@ -1132,3 +1132,112 @@ class GoogleArgosFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CacheConcurrencyRegressionTests(unittest.TestCase):
+    def test_invalid_utf8_cache_is_ignored_before_translation(self):
+        req = backend.TranslateRequest(vtt_text=SAMPLE_VTT, provider="google-web")
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(backend, "CACHE_DIR", Path(directory)), \
+             mock.patch.object(backend, "translator_runtime_available", return_value=True), \
+             mock.patch.object(backend, "get_supported_args", side_effect=RuntimeError("reached translation")):
+            (Path(directory) / f"{backend.build_cache_key(SAMPLE_VTT, req)}.vtt").write_bytes(b"\xff")
+            with self.assertRaisesRegex(RuntimeError, "reached translation"):
+                backend.run_translation(SAMPLE_VTT, req)
+
+    def test_failed_help_probe_is_retried_and_success_is_cached(self):
+        backend.get_supported_args.cache_clear()
+        self.addCleanup(backend.get_supported_args.cache_clear)
+        completed = mock.Mock(stdout="--progress-file --fallback-mode", stderr="")
+        with mock.patch.object(backend, "translator_runtime_available", return_value=True), \
+             mock.patch.object(backend.subprocess, "run", side_effect=[subprocess.TimeoutExpired("help", 1), completed]) as run:
+            self.assertEqual(backend.get_supported_args(), set())
+            self.assertEqual(backend.get_supported_args(), {"--progress-file", "--fallback-mode"})
+            self.assertEqual(backend.get_supported_args(), {"--progress-file", "--fallback-mode"})
+            self.assertEqual(run.call_count, 2)
+
+    def test_circuit_timestamps_are_sampled_under_the_event_queue_lock(self):
+        circuit = translator.GoogleWebRateLimitCircuit(threshold=3, window_seconds=10)
+        values = iter([0, 0.01, 10.005])
+        def locked_clock():
+            self.assertTrue(circuit._lock.locked(), "timestamp must not precede lock acquisition")
+            return next(values)
+        with mock.patch.object(translator.time, "monotonic", side_effect=locked_clock):
+            self.assertFalse(circuit.record_429())
+            self.assertFalse(circuit.record_429())
+            self.assertFalse(circuit.record_429())
+        self.assertEqual(list(circuit._events), [0.01, 10.005])
+
+class AsyncCancellationRegressionTests(unittest.TestCase):
+    def tearDown(self):
+        with backend._jobs_lock:
+            backend._jobs.pop("cancel-regression", None)
+            backend._job_cancel_events.pop("cancel-regression", None)
+
+    def seed_job(self):
+        import threading
+        backend._jobs["cancel-regression"] = {"status": "queued", "updated_at": 0}
+        backend._job_cancel_events["cancel-regression"] = threading.Event()
+
+    def test_cancelled_queued_job_never_invokes_translator(self):
+        self.seed_job()
+        self.assertTrue(backend.cancel_async_translation("cancel-regression")["cancelled"])
+        with mock.patch.object(backend, "run_translation") as translate:
+            backend._run_job("cancel-regression", backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="google-web"))
+        translate.assert_not_called()
+        self.assertEqual(backend._jobs["cancel-regression"]["error_code"], "TRANSLATION_CANCELLED")
+        self.assertNotIn("cancel-regression", backend._job_cancel_events)
+
+    def test_late_progress_and_result_cannot_overwrite_cancellation(self):
+        self.seed_job()
+        def translate(*args, **kwargs):
+            backend.cancel_async_translation("cancel-regression")
+            self.assertTrue(kwargs["cancel_event"].is_set())
+            kwargs["progress_callback"](1, 1, "late", SAMPLE_VTT)
+            return SAMPLE_VTT, [], False, {}
+        with mock.patch.object(backend, "run_translation", side_effect=translate):
+            backend._run_job("cancel-regression", backend.TranslateAsyncRequest(vtt_text=SAMPLE_VTT, provider="google-web"))
+        job = backend._jobs["cancel-regression"]
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "TRANSLATION_CANCELLED")
+        self.assertIsNone(job["result"])
+
+    def test_pre_cancelled_sync_translation_has_no_side_effects(self):
+        import threading
+        event = threading.Event()
+        event.set()
+        with mock.patch.object(backend.subprocess, "Popen") as spawn:
+            with self.assertRaises(HTTPException) as caught:
+                backend.run_translation(SAMPLE_VTT, backend.TranslateRequest(vtt_text=SAMPLE_VTT, provider="google-web"), cancel_event=event)
+        self.assertEqual(caught.exception.detail["error_code"], "TRANSLATION_CANCELLED")
+        spawn.assert_not_called()
+
+    def test_cancellation_terminates_a_process_blocked_reading_stdout(self):
+        import threading
+        cancelled = threading.Event()
+        stopped = threading.Event()
+        timer = threading.Timer(0.02, cancelled.set)
+        def output():
+            if not stopped.wait(2):
+                raise AssertionError("cancelled child was not terminated")
+            return
+            yield ""
+        proc = mock.Mock()
+        proc.stdout = output()
+        proc.poll.side_effect = lambda: -15 if stopped.is_set() else None
+        proc.wait.return_value = -15
+        def spawn(*args, **kwargs):
+            timer.start()
+            return proc
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(backend, "CACHE_DIR", Path(directory)), \
+                 mock.patch.object(backend, "get_supported_args", return_value=set()), \
+                 mock.patch.object(backend.subprocess, "Popen", side_effect=spawn), \
+                 mock.patch.object(backend, "terminate_translator_process", side_effect=lambda child: stopped.set()) as terminate:
+                try:
+                    with self.assertRaises(HTTPException) as caught:
+                        backend.run_translation(SAMPLE_VTT, backend.TranslateRequest(vtt_text=SAMPLE_VTT, provider="google-web"), cancel_event=cancelled)
+                    self.assertEqual(caught.exception.detail["error_code"], "TRANSLATION_CANCELLED")
+                    terminate.assert_called_once_with(proc)
+                finally:
+                    timer.cancel()
+                    stopped.set()

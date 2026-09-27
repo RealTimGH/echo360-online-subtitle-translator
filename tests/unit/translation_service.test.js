@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 /**
  * Branch-coverage tests for extension/translation_service.js (extension-only path)
  *
@@ -1098,10 +1099,10 @@ describe("buildCacheKey", () => {
       "https://example.com/sub.vtt",
       "WEBVTT\n\nHello\n"
     );
-    expect(key.sourceKey).toBe("https://example.com/sub.vtt");
+    expect(key.sourceKey).toBe("https://example.com/sub.vtt#sha256:hash-14");
     expect(key.configSig).toBe("openai|gpt-5-nano");
-    expect(key.cacheKey).toBe("https://example.com/sub.vtt::openai|gpt-5-nano");
-    expect(window.Echo360Translator.storage.sha256Text).not.toHaveBeenCalled();
+    expect(key.cacheKey).toBe("https://example.com/sub.vtt#sha256:hash-14::openai|gpt-5-nano");
+    expect(window.Echo360Translator.storage.sha256Text).toHaveBeenCalled();
   });
 
   it("falls back to page href + vtt hash when sourceId is empty", async () => {
@@ -1111,13 +1112,13 @@ describe("buildCacheKey", () => {
       writable: true,
     });
     const key = await svc.buildCacheKey({ provider: "google-web", model: "" }, "", "WEBVTT\n\n");
-    expect(key.sourceKey).toContain("https://echo360.org/lesson/abc#hash-");
+    expect(key.sourceKey).toContain("https://echo360.org/lesson/abc#sha256:hash-");
     expect(key.cacheKey).toContain("::google-web|");
   });
 });
 
 describe("sentence merging cache identity", () => {
-  it("separates merged sources by mode and version, not by grouped VTT bytes", async () => {
+  it("invalidates edited source content while retaining display-only preferences", async () => {
     const cfg = { provider: "google-web", model: "" };
     const raw = await svc.buildCacheKey(cfg, "same-url", "original");
     const merged = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true });
@@ -1125,8 +1126,38 @@ describe("sentence merging cache identity", () => {
     const english = await svc.buildCacheKey(cfg, "same-url", "original", { sentenceMergeEnabled: true, sentenceMergeEnglish: true });
     expect(merged.cacheKey).not.toBe(raw.cacheKey);
     expect(merged.configSig).toMatch(/::sentence-merge-v2$/);
-    expect(changed.cacheKey).toBe(merged.cacheKey);
+    expect(changed.cacheKey).not.toBe(merged.cacheKey);
     expect(english.cacheKey).toBe(merged.cacheKey);
-    expect(window.Echo360Translator.storage.sha256Text).not.toHaveBeenCalled();
+    expect(window.Echo360Translator.storage.sha256Text).toHaveBeenCalled();
   });
+});
+
+
+it("shares original-source identity across merge variants without confusing their results", async () => {
+  const raw = await svc.buildCacheKey({provider:"google-web", model:""}, "same-url", "original");
+  const merged = await svc.buildCacheKey({provider:"google-web", model:""}, "same-url", "grouped", {sentenceMergeEnabled:true, originalVtt:"original"});
+  expect(merged.sourceKey).toBe(raw.sourceKey);
+  expect(merged.cacheKey).not.toBe(raw.cacheKey);
+});
+
+
+it("invalidates same-length source edits even when URL and timeline are unchanged", async () => {
+  const hash = text => Promise.resolve(createHash("sha256").update(text).digest("hex"));
+  window.Echo360Translator.storage.sha256Text.mockImplementationOnce(hash).mockImplementationOnce(hash);
+  const first = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello class\n";
+  const second = first.replace("Hello class", "Leave class");
+  const cfg = {provider:"google-web", model:""};
+  const a = await svc.buildCacheKey(cfg,"https://example.test/sub.vtt",first);
+  const b = await svc.buildCacheKey(cfg,"https://example.test/sub.vtt",second);
+  expect(a.cacheKey).not.toBe(b.cacheKey);
+});
+
+it("does not create a provider job when cancellation predates dispatch", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const cfg = {provider:"google-web"};
+  await expect(svc.translateWithConfig(cfg, "", {provider:"google-web",vtt_text:"WEBVTT"}, {signal:controller.signal}))
+    .rejects.toMatchObject({code:"TRANSLATION_CANCELLED"});
+  expect(backendClientMock.createDirectTranslateJob).not.toHaveBeenCalled();
+  expect(backendClientMock.proxyRequest).not.toHaveBeenCalled();
 });

@@ -1,7 +1,9 @@
-importScripts("build_config.js", "browser_api.js", "error_utils.js", "background_contracts.js", "backend_startup.js", "direct_translator.js");
+importScripts("build_config.js", "browser_api.js", "error_utils.js", "background_contracts.js", "backend_startup.js", "direct_translator.js", "shared_storage.js", "job_journal.js");
 
 const extensionApi = globalThis.Echo360ExtensionApi;
 const backgroundContracts = globalThis.Echo360BackgroundContracts;
+const sharedStorage = globalThis.Echo360SharedStorage.createOwner(extensionApi.storage.local);
+const jobJournal = globalThis.Echo360JobJournal.createJournal(extensionApi.storage.local);
 const buildConfig = globalThis.Echo360BuildConfig || {};
 const STORAGE_KEY = "echo360TranslatorConfig";
 const API_KEYS_STORAGE_KEY = "echo360TranslatorApiKeys";
@@ -21,6 +23,7 @@ const DIRECT_JOB_MAX_COUNT = 100;
 const DIRECT_JOB_MAX_RETAINED_CHARS = 24_000_000;
 const DIRECT_JOB_MAX_ACTIVE_COUNT = 4;
 const directJobs = new Map();
+const directJobControls = new Map();
 let directCacheMutation = Promise.resolve();
 const INSTRUCTURE_MEDIA_HOST_RE = /(^|\.)instructuremedia\.com$/i;
 const SUPPORTED_PROVIDER_CODES_BG = new Set(["google-web", "deepl", "azure", "openai", "deepseek", "gemini", "argos", "custom-backend"]);
@@ -1015,7 +1018,50 @@ async function resolveApiKey(provider) {
   return apiKey;
 }
 
-function createDirectJob(payload) {
+async function persistDirectJob(job) {
+  const control = directJobControls.get(job.jobId);
+  const signature = [job.status, job.updatedAt, job.partial_revision, job.warnings?.length].join(":");
+  if (control?.snapshotSignature === signature) return control.snapshotPromise;
+  if (["queued", "running"].includes(job.status) && control?.snapshotAt &&
+      Date.now() - control.snapshotAt < 2000) return control.snapshotPromise;
+  const operation = jobJournal.save(job, control?.owner || "").catch(error => {
+    if (control?.snapshotSignature === signature) {
+      control.snapshotSignature = "";
+      control.snapshotAt = 0;
+    }
+    backgroundLog("warn", "job recovery snapshot unavailable", {jobId:job.jobId, code:error?.code || "JOB_SNAPSHOT_WRITE_FAILED"});
+  });
+  if (control) {
+    control.snapshotSignature = signature;
+    control.snapshotAt = Date.now();
+    control.snapshotPromise = operation;
+  }
+  return operation;
+}
+
+function senderScope(sender = {}) {
+  return `${sender.tab?.id ?? "extension"}:${sender.frameId ?? 0}:${sender.documentId || sender.url || ""}`;
+}
+
+function cancelDirectJob(jobId, sender) {
+  const job = directJobs.get(jobId);
+  const control = directJobControls.get(jobId);
+  if (!job) return {ok:true, data:{cancelled:false}};
+  if (control && control.owner !== senderScope(sender)) {
+    throw Object.assign(new Error("任务属于其他页面"), {code:"JOB_OWNER_MISMATCH",status:403});
+  }
+  if (!["queued", "running"].includes(job.status)) return {ok:true, data:{cancelled:false}};
+  job.status = "failed";
+  job.error_code = "TRANSLATION_CANCELLED";
+  job.error = "翻译任务已取消";
+  job.result = null;
+  job.updatedAt = Date.now();
+  control?.controller.abort();
+  void persistDirectJob(job);
+  return {ok:true,data:{cancelled:true}};
+}
+
+function createDirectJob(payload, sender) {
   const activeJobs = Array.from(directJobs.values())
     .filter((job) => job.status === "queued" || job.status === "running").length;
   if (activeJobs >= DIRECT_JOB_MAX_ACTIVE_COUNT) {
@@ -1057,6 +1103,11 @@ function createDirectJob(payload) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
+  const controller = new AbortController();
+  const assertActive = () => {
+    if (controller.signal.aborted) throw Object.assign(new Error("翻译任务已取消"), {code:"TRANSLATION_CANCELLED"});
+  };
+  directJobControls.set(jobId, {controller, owner:senderScope(sender)});
   directJobs.set(jobId, job);
   backgroundLog("info", "direct job created", {
     jobId,
@@ -1089,6 +1140,7 @@ function createDirectJob(payload) {
       // provider request.
       ensureOriginalSource(payload);
       const cacheKey = await buildDirectCacheKey(payload);
+      assertActive();
       const preTranslationWarnings = [];
       if (!payload.force_refresh) {
         let cached = null;
@@ -1117,6 +1169,7 @@ function createDirectJob(payload) {
             error: serializeBackgroundError(cacheError, { phase: "cache", jobId }),
           });
         }
+        assertActive();
         if (cached) {
           const cachedTarget = String(payload.target || "ZH").toUpperCase();
           const cachedRequiresCjk = CJK_TARGET_CODES_BG.has(cachedTarget);
@@ -1169,8 +1222,11 @@ function createDirectJob(payload) {
           return;
         }
       }
+      assertActive();
       const result = await Echo360DirectTranslator.translateVtt(payload, {
+        signal: controller.signal,
         onProgress: (current, total, line = "", details = {}) => {
+          if (controller.signal.aborted) return;
           job.status = "running";
           job.progress = { current, total, line, ...details };
           job.progress.failed_cues = normalizeFailedLocations(
@@ -1185,6 +1241,7 @@ function createDirectJob(payload) {
           job.updatedAt = Date.now();
         },
         onPartialVtt: (partialVtt, meta = {}) => {
+          if (controller.signal.aborted) return;
           if (partialVtt !== job.partial_vtt) {
             job.partial_vtt = partialVtt;
             job.partial_revision = Number(job.partial_revision || 0) + 1;
@@ -1209,6 +1266,7 @@ function createDirectJob(payload) {
           job.updatedAt = Date.now();
         },
       });
+      assertActive();
       validateDirectTranslationResult(result, payload);
       const combinedWarnings = [...preTranslationWarnings, ...(Array.isArray(result.warnings) ? result.warnings : [])];
       job.result = { ...result, warnings: combinedWarnings, cache_hit: false };
@@ -1273,6 +1331,7 @@ function createDirectJob(payload) {
       });
       pruneDirectJobs();
     } catch (err) {
+      if (controller.signal.aborted) return;
       job.status = "failed";
       job.metrics = err?.metrics || job.metrics || null;
       const errorDetail = serializeBackgroundError(err, {
@@ -1339,6 +1398,8 @@ function createDirectJob(payload) {
         failureCodes: job.failure_codes,
       });
       pruneDirectJobs();
+    } finally {
+      await persistDirectJob(job);
     }
   })();
 
@@ -1351,6 +1412,7 @@ function pruneDirectJobs() {
     const terminal = job.status === "completed" || job.status === "failed";
     if (terminal && now - (job.updatedAt || job.createdAt) > DIRECT_JOB_TTL_MS) directJobs.delete(jobId);
   }
+  for (const id of directJobControls.keys()) if (!directJobs.has(id)) directJobControls.delete(id);
   const overflow = directJobs.size - DIRECT_JOB_MAX_COUNT;
   if (overflow > 0) {
     const removable = Array.from(directJobs.entries())
@@ -1560,6 +1622,8 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
     );
   }
 
+  if (message.type === "shared-storage") return sharedStorage.handle(message);
+
   if (message.type === "fetch-text-resource") {
     return fetchAllowedTextResource(message.url, message.timeoutMs);
   }
@@ -1586,7 +1650,8 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
       const payload = normalizeDirectRequestPayload(rawPayload);
       ensureOriginalSource(payload);
       const api_key = await resolveApiKey(payload.provider);
-      const jobId = createDirectJob({ ...payload, api_key });
+      const jobId = createDirectJob({ ...payload, api_key }, sender);
+      await persistDirectJob(directJobs.get(jobId));
       return { ok: true, data: { job_id: jobId } };
     } catch (error) {
       return backgroundErrorResponse(error, {
@@ -1595,6 +1660,11 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
         target: rawPayload.target || "ZH",
       }, "DIRECT_JOB_CREATE_FAILED");
     }
+  }
+
+  if (message.type === "direct-translate-cancel") {
+    try { return cancelDirectJob(message.jobId, sender); }
+    catch (error) { return backgroundErrorResponse(error, {phase:"translation"}); }
   }
 
   if (message.type === "direct-translate-job") {
@@ -1606,7 +1676,12 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
       );
     }
     pruneDirectJobs();
-    const job = directJobs.get(message.jobId);
+    const liveJob = directJobs.get(message.jobId);
+    let job = liveJob;
+    if (!job) {
+      try { job = await jobJournal.recover(message.jobId, senderScope(sender)); }
+      catch (error) { backgroundLog("warn", "job recovery read failed", {jobId:message.jobId}); }
+    }
     if (!job) {
       return backgroundErrorResponse(
         Object.assign(new Error("扩展后台翻译任务不存在或已被清理"), { code: "JOB_NOT_FOUND", status: 404 }),
@@ -1614,6 +1689,10 @@ extensionApi.runtime.addOnMessageListener(async (message, sender) => {
         "JOB_NOT_FOUND"
       );
     }
+    const control = directJobControls.get(message.jobId);
+    if (control && control.owner !== senderScope(sender)) return backgroundErrorResponse(
+      Object.assign(new Error("任务属于其他页面"), {code:"JOB_OWNER_MISMATCH",status:403}), {phase:"translation"});
+    if (liveJob) await persistDirectJob(job);
     const responseJob = { ...job };
     // Partial VTT can be several megabytes. Once the caller has seen the
     // current revision, omit the unchanged body from the next poll while

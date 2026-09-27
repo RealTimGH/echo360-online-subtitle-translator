@@ -17,11 +17,13 @@ import { evalModule, makeFullNs, makeStorageMock } from "../helpers/load-module.
 
 function setupStorage({ storageData = {}, enableLocalBackend = false } = {}) {
   const localMock = makeStorageMock(storageData);
+  evalModule("shared_storage.js");
+  const owner = globalThis.Echo360SharedStorage.createOwner(localMock);
   const ns = makeFullNs({
     buildConfig: { buildTarget: "dev", enableLocalBackend },
     browserApi: {
       storage: { local: localMock },
-      runtime: { sendMessage: vi.fn() },
+      runtime: { sendMessage: vi.fn(message => owner.handle(message)) },
     },
   });
   window.Echo360Translator = ns;
@@ -945,6 +947,31 @@ describe("savePrefs", () => {
 // setCacheStore (error handling path)
 // ---------------------------------------------------------------------------
 describe("setCacheStore", () => {
+  it.each([
+    "Storage temporarily unavailable",
+    "MAX_WRITE_OPERATIONS_PER_MINUTE quota exceeded",
+  ])("does not discard saved progress after a non-capacity failure: %s", async (message) => {
+    const saved = { cacheKey: "saved", translatedVtt: "WEBVTT\n\nsaved", resumeCheckpoint: { completed: 10 } };
+    const { storage, localMock } = setupStorage({ storageData: {
+      echo360TranslatedVttCache: { schema: "subtitle-cache-v2", entries: { saved } },
+    } });
+    localMock.set.mockRejectedValueOnce(new Error(message));
+    const result = await storage.setCacheStore({ cacheKey: "new", translatedVtt: "WEBVTT\n\nnew" });
+    expect(result.ok).toBe(false);
+    expect(localMock.set).toHaveBeenCalledTimes(1);
+    expect(localMock._store.echo360TranslatedVttCache.entries.saved).toEqual(saved);
+  });
+
+  it("still evicts the oldest other slot when the storage byte quota is exceeded", async () => {
+    const { storage, localMock } = setupStorage({ storageData: {
+      echo360TranslatedVttCache: { schema: "subtitle-cache-v2", entries: {
+        old: { cacheKey: "old", translatedVtt: "WEBVTT\n\nold", usedAt: 1 },
+      } },
+    } });
+    localMock.set.mockRejectedValueOnce(new Error("QUOTA_BYTES quota exceeded"));
+    expect(await storage.setCacheStore({ cacheKey: "new", translatedVtt: "WEBVTT\n\nnew" })).toEqual({ ok: true });
+    expect(Object.keys(localMock._store.echo360TranslatedVttCache.entries)).toEqual(["new"]);
+  });
   it("stores independent slots for different cache keys", async () => {
     const { storage, localMock } = setupStorage();
     const raw = { cacheKey: "lesson::plain", translatedVtt: "WEBVTT\n\nraw", createdAt: 10 };
@@ -1007,6 +1034,16 @@ describe("setCacheStore", () => {
 // getCacheStore
 // ---------------------------------------------------------------------------
 describe("getCacheStore", () => {
+  it("does not evict saved translations merely to update access time", async () => {
+    const saved = { cacheKey: "saved", translatedVtt: "WEBVTT\n\nsaved", usedAt: 1 };
+    const { storage, localMock } = setupStorage({ storageData: {
+      echo360TranslatedVttCache: { schema: "subtitle-cache-v2", entries: { saved } },
+    } });
+    localMock.set.mockRejectedValueOnce(new Error("QUOTA_BYTES quota exceeded"));
+    expect(await storage.getCacheStore("saved")).toEqual(expect.objectContaining({ translatedVtt: saved.translatedVtt }));
+    expect(localMock.set).toHaveBeenCalledTimes(1);
+    expect(localMock._store.echo360TranslatedVttCache.entries.saved).toEqual(saved);
+  });
   it("returns null when cache storage is empty", async () => {
     const { storage } = setupStorage({ storageData: {} });
     expect(await storage.getCacheStore("abc")).toBeNull();

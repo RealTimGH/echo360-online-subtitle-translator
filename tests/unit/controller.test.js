@@ -50,6 +50,48 @@ function makeVideo() {
   return video;
 }
 
+function makeDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flushUntil(predicate, maxTurns = 60) {
+  for (let turn = 0; turn < maxTurns && !predicate(); turn += 1) {
+    await Promise.resolve();
+  }
+}
+
+function configureDeferredTranslation(ns, deferredResults) {
+  ns.storage.askApiKeyIfNeeded = vi.fn(async (cfg) => cfg);
+  ns.storage.getCacheStore = vi.fn(async () => null);
+  ns.storage.setCacheStore = vi.fn(async () => ({ ok: true }));
+  ns.translationService.buildCacheKey = vi.fn(async () => ({
+    sourceKey: "source",
+    configSig: "config",
+    cacheKey: "source::config",
+  }));
+  ns.translationService.buildTranslatePayload = vi.fn((_cfg, vttText) => ({
+    vtt_text: vttText,
+    provider: "google-web",
+    target: "ZH",
+    bilingual: false,
+  }));
+  ns.translationService.translateWithConfig = vi.fn(() => deferredResults.shift().promise);
+  ns.backendClient = { validateTranslationResult: vi.fn() };
+}
+
+const DEFERRED_TRANSLATION_RESULT = {
+  translated_vtt: TRANS_VTT,
+  warnings: [],
+  failed_items: [],
+  metrics: { total: 1, translated: 1, failed: 0 },
+};
+
 function setupControllerWithRenderer() {
   Object.defineProperty(window, "location", {
     value: { hostname: "echo360.org", pathname: "/lesson/test-id", href: "https://echo360.org/lesson/test-id" },
@@ -71,6 +113,8 @@ function setupControllerWithRenderer() {
   const video = makeVideo();
   document.body.appendChild(video);
   const localMock = makeStorageMock({});
+  evalModule("shared_storage.js");
+  const storageOwner = globalThis.Echo360SharedStorage.createOwner(localMock);
   const prefs = {
     enabled: true,
     size: "medium",
@@ -84,7 +128,7 @@ function setupControllerWithRenderer() {
   window.Echo360Translator = makeFullNs({
     browserApi: {
       storage: { local: localMock },
-      runtime: { sendMessage: vi.fn() },
+      runtime: { sendMessage: vi.fn(message => storageOwner.handle(message)) },
     },
     storage: {
       getPrefs: vi.fn(async () => prefs),
@@ -927,6 +971,99 @@ describe("controller track sync in Echo360 native CC mode", () => {
     expect(document.querySelector('track[data-echo360-translated="1"]')).toBeNull();
   });
 
+  it("starts a new lesson translation while the old request is pending and ignores its late result", async () => {
+    const { ns, callbacks, video, emitVideoChange } = setupManualController();
+    const oldResult = makeDeferred();
+    const newResult = makeDeferred();
+    configureDeferredTranslation(ns, [oldResult, newResult]);
+    let currentVideo = video;
+    ns.video.getPrimaryVideo = () => currentVideo;
+    ns.video.getAllVideos = () => [currentVideo];
+    ns.video.waitForVideo = vi.fn(async () => currentVideo);
+    ns.sourceFinder.pickBestMountVideoByVtt = () => currentVideo;
+
+    await ns.controller.init();
+    const oldRun = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledTimes(1);
+
+    const newVideo = makeVideo();
+    document.body.appendChild(newVideo);
+    currentVideo = newVideo;
+    emitVideoChange({ type: "media" });
+    const newRun = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 2);
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledTimes(2);
+
+    const renderTrack = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+    const rendersBeforeOldResult = renderTrack.mock.calls.length;
+    const buttonUpdatesBeforeOldResult = ns.ui.updateActionButtons.mock.calls.length;
+    oldResult.resolve(DEFERRED_TRANSLATION_RESULT);
+    await oldRun;
+
+    expect(renderTrack).toHaveBeenCalledTimes(rendersBeforeOldResult);
+    expect(ns.ui.updateActionButtons).toHaveBeenCalledTimes(buttonUpdatesBeforeOldResult);
+    expect(ns.storage.setCacheStore).not.toHaveBeenCalled();
+    expect(ns.renderer.getRenderState().lastRenderedVideo).toBe(newVideo);
+
+    newResult.resolve(DEFERRED_TRANSLATION_RESULT);
+    await newRun;
+    expect(ns.storage.setCacheStore).toHaveBeenCalledOnce();
+    expect(video.querySelector('track[data-echo360-translated="1"]')).toBeNull();
+    expect(newVideo.querySelector('track[data-echo360-translated="1"]')).not.toBeNull();
+  });
+
+  it.each(["media source", "lesson route"])("abandons a delayed result after the %s changes", async (contextChange) => {
+    const { ns, callbacks, video, emitVideoChange } = setupManualController();
+    const delayedResult = makeDeferred();
+    configureDeferredTranslation(ns, [delayedResult]);
+    const renderTrack = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledOnce();
+    const rendersBeforeChange = renderTrack.mock.calls.length;
+
+    if (contextChange === "media source") {
+      video.setAttribute("src", "https://example.test/new-lesson.mp4");
+      emitVideoChange({ type: "media" });
+    } else {
+      window.location.href = "https://echo360.org/lesson/new-lesson";
+    }
+
+    delayedResult.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+
+    expect(renderTrack).toHaveBeenCalledTimes(rendersBeforeChange);
+    expect(video.querySelector('track[data-echo360-translated="1"]')).toBeNull();
+    expect(ns.storage.setCacheStore).not.toHaveBeenCalled();
+    expect(ns.ui.showError).not.toHaveBeenCalled();
+  });
+
+  it("does not render or report a translation that resolves after controller destruction", async () => {
+    const { ns, callbacks } = setupManualController();
+    const result = makeDeferred();
+    configureDeferredTranslation(ns, [result]);
+    const renderTrack = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    expect(ns.translationService.translateWithConfig).toHaveBeenCalledOnce();
+
+    const rendersBeforeDestroy = renderTrack.mock.calls.length;
+    const buttonUpdatesBeforeDestroy = ns.ui.updateActionButtons.mock.calls.length;
+    ns.controller.destroy();
+    result.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+
+    expect(renderTrack).toHaveBeenCalledTimes(rendersBeforeDestroy);
+    expect(ns.ui.updateActionButtons).toHaveBeenCalledTimes(buttonUpdatesBeforeDestroy);
+    expect(ns.ui.showError).not.toHaveBeenCalled();
+    expect(ns.storage.setCacheStore).not.toHaveBeenCalled();
+  });
+
   it("marks every failed cue for rendering when diagnostic details are sampled", async () => {
     const { ns, callbacks } = setupManualController();
     const source = "WEBVTT\n\n" + Array.from({ length: 61 }, (_, i) => (
@@ -1021,7 +1158,7 @@ describe("sentence merging integration", () => {
     await callbacks().onTranslate();
     const payload = ns.translationService.translateWithConfig.mock.calls[0][2];
     expect(ns.vtt.parseVttCues(payload.vtt_text).map(c => c.text)).toEqual(["This is a sentence.", "Next."]);
-    expect(ns.translationService.buildCacheKey.mock.calls[0][3]).toEqual({ sentenceMergeEnabled: true });
+    expect(ns.translationService.buildCacheKey.mock.calls[0][3]).toEqual({ sentenceMergeEnabled: true, originalVtt: source });
     const rendered = ns.renderer.getRenderState();
     expect(ns.vtt.parseVttCues(rendered.lastRenderedVtt).map(c => c.text)).toEqual(["这是一个句子。", "这是一个句子。", "下一句。"]);
     expect(rendered.lastOriginalVtt).toBe(source);
@@ -1192,7 +1329,7 @@ describe("partial translation persistence and retry", () => {
     const current = setup(store);
     await current.ns.controller.init();
     await current.callbacks().onForceTranslate();
-    expect(current.ns.storage.setCacheStore).toHaveBeenCalledWith(null, "key");
+    expect(current.ns.storage.setCacheStore).toHaveBeenCalledWith(null, "key", { clearManualOverride: { sourceKey: "source", configSig: "config" } });
     expect(current.ns.translationService.translateWithConfig.mock.calls[0][3].resumeCheckpoint).toBeNull();
   });
 
@@ -1256,7 +1393,7 @@ describe("partial translation persistence and retry", () => {
     const current = setup(store);
     await current.ns.controller.init();
     await current.callbacks().onForceTranslate();
-    expect(current.ns.storage.setCacheStore).toHaveBeenCalledWith(null, "key");
+    expect(current.ns.storage.setCacheStore).toHaveBeenCalledWith(null, "key", { clearManualOverride: { sourceKey: "source", configSig: "config" } });
     expect(current.ns.translationService.buildTranslatePayload.mock.calls[0][2]).toBe(true);
     expect(current.ns.translationService.translateWithConfig.mock.calls[0][3].resumeCheckpoint).toBeNull();
   });
@@ -1341,5 +1478,196 @@ describe("partial translation persistence and retry", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     expect(await current.callbacks().onQuickTranslate()).toBe(false);
     expect(confirm).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("translation display and manual-cache race regressions", () => {
+  beforeEach(() => { vi.useFakeTimers(); vi.restoreAllMocks(); });
+  afterEach(() => { window.Echo360Translator?.controller?.destroy(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+  it("retains the latest visibility and renderer preferences for partial and final results", async () => {
+    const {ns, callbacks} = setupManualController();
+    const delayed = makeDeferred();
+    configureDeferredTranslation(ns, [delayed]);
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    const initial = await ns.storage.getPrefs();
+    const next = {...initial, enabled:false, bilingual:false, browserBilingual:false, useNativeSubtitles:true, size:"large"};
+    ns.storage.savePrefs = vi.fn(async () => {});
+    ns.ui.readPanelPrefs = vi.fn(() => next);
+    await callbacks().onPrefsChanged();
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+    const visibility = vi.spyOn(ns.renderer, "applySubtitleVisibility");
+    ns.translationService.translateWithConfig.mock.calls[0][3].onPartialVtt(TRANS_VTT, {current:1,total:1,translated:1});
+    expect(visibility).toHaveBeenLastCalledWith(false);
+    expect(render.mock.calls.at(-1)[2]).toBe(false);
+    delayed.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+    expect(visibility).toHaveBeenLastCalledWith(false);
+    expect(render.mock.calls.at(-1)[2]).toBe(false);
+    expect(render.mock.calls.at(-1)[3]).toBe("large");
+    expect(render.mock.calls.at(-1)[6]).toBe(true);
+  });
+  it("aborts the provider signal immediately on a source change or destruction", async () => {
+    const {ns, callbacks, video, emitVideoChange} = setupManualController();
+    const first = makeDeferred(), second = makeDeferred();
+    configureDeferredTranslation(ns, [first, second]);
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    const signal = ns.translationService.translateWithConfig.mock.calls[0][3].signal;
+    expect(signal.aborted).toBe(false);
+    video.src = "https://example.test/new.mp4";
+    emitVideoChange({type:"media"});
+    expect(signal.aborted).toBe(true);
+    const next = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 2);
+    const nextSignal = ns.translationService.translateWithConfig.mock.calls[1][3].signal;
+    ns.controller.destroy();
+    expect(nextSignal.aborted).toBe(true);
+    first.resolve(DEFERRED_TRANSLATION_RESULT); second.resolve(DEFERRED_TRANSLATION_RESULT);
+    await Promise.all([run, next]);
+    expect(ns.storage.setCacheStore).not.toHaveBeenCalled();
+  });
+  it("does not resurrect a controller destroyed while init waits for video", async () => {
+    const {ns, video} = setupManualController();
+    const delayed = makeDeferred();
+    ns.video.waitForVideo.mockReturnValue(delayed.promise);
+    const init = ns.controller.init();
+    ns.controller.destroy();
+    delayed.resolve(video);
+    await init;
+    expect(ns.ui.ensurePanel).not.toHaveBeenCalled();
+    expect(ns.video.subscribeToChanges).not.toHaveBeenCalled();
+  });
+  it("uses a different tab's latest preferences when a pending result finishes", async () => {
+    const {ns, callbacks} = setupManualController();
+    let changed;
+    ns.browserApi.storage.onChanged = {addListener:vi.fn(fn=>{changed=fn;}), removeListener:vi.fn()};
+    const delayed = makeDeferred();
+    configureDeferredTranslation(ns, [delayed]);
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    changed({[ns.constants.PREFS_KEY_PREFIX + "global"]:{newValue:{enabled:false,bilingual:false,browserBilingual:false,useNativeSubtitles:true,size:"large"}}}, "local");
+    const visibility = vi.spyOn(ns.renderer,"applySubtitleVisibility");
+    const render = vi.spyOn(ns.renderer,"renderTranslatedTrack");
+    delayed.resolve(DEFERRED_TRANSLATION_RESULT); await run;
+    expect(visibility).toHaveBeenLastCalledWith(false);
+    expect(render.mock.calls.at(-1)[3]).toBe("large");
+  });
+  it("cancels an active job on pagehide and ignores its late completion", async () => {
+    const {ns, callbacks} = setupManualController();
+    const delayed = makeDeferred();
+    configureDeferredTranslation(ns, [delayed]);
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    const signal = ns.translationService.translateWithConfig.mock.calls[0][3].signal;
+    window.dispatchEvent(new Event("pagehide"));
+    expect(signal.aborted).toBe(true);
+    delayed.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+    expect(ns.storage.setCacheStore).not.toHaveBeenCalled();
+  });
+  it("does not save or render an older preference edit after a newer edit finishes", async () => {
+    const {ns, callbacks} = setupManualController();
+    await ns.controller.init();
+    const initial = await ns.storage.getPrefs();
+    const oldRead = makeDeferred();
+    ns.storage.getPrefs.mockReturnValueOnce(oldRead.promise).mockResolvedValue(initial);
+    ns.storage.savePrefs = vi.fn(async () => {});
+    ns.ui.readPanelPrefs = vi.fn().mockReturnValueOnce({...initial, size:"large"})
+      .mockReturnValueOnce({...initial, size:"small"});
+    const older = callbacks().onPrefsChanged();
+    await callbacks().onPrefsChanged();
+    oldRead.resolve(initial);
+    await older;
+    expect(ns.storage.savePrefs).toHaveBeenCalledTimes(1);
+    expect(ns.storage.savePrefs).toHaveBeenLastCalledWith(expect.objectContaining({size:"small"}));
+  });
+  it("keeps a newer local edit visible while an older save emits its storage event", async () => {
+    const { ns, callbacks } = setupManualController();
+    let changed;
+    ns.browserApi.storage.onChanged = { addListener: vi.fn(fn => { changed = fn; }), removeListener: vi.fn() };
+    const translation = makeDeferred(), firstSave = makeDeferred(), secondSave = makeDeferred();
+    configureDeferredTranslation(ns, [translation]);
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    const initial = await ns.storage.getPrefs();
+    ns.storage.savePrefs = vi.fn().mockReturnValueOnce(firstSave.promise).mockReturnValueOnce(secondSave.promise);
+    ns.ui.readPanelPrefs = vi.fn().mockReturnValueOnce({ ...initial, enabled: true, size: "large" })
+      .mockReturnValueOnce({ ...initial, enabled: false, size: "small" });
+    const older = callbacks().onPrefsChanged();
+    await flushUntil(() => ns.storage.savePrefs.mock.calls.length === 1);
+    const newer = callbacks().onPrefsChanged();
+    changed({ [ns.constants.PREFS_KEY_PREFIX + "global"]: { newValue: { ...initial, enabled: true, size: "large" } } }, "local");
+    firstSave.resolve();
+    await flushUntil(() => ns.storage.savePrefs.mock.calls.length === 2);
+    const visibility = vi.spyOn(ns.renderer, "applySubtitleVisibility");
+    const render = vi.spyOn(ns.renderer, "renderTranslatedTrack");
+    ns.translationService.translateWithConfig.mock.calls[0][3].onPartialVtt(TRANS_VTT, { current: 1, total: 1, translated: 1 });
+    expect(visibility).toHaveBeenLastCalledWith(false);
+    expect(render.mock.calls.at(-1)[3]).toBe("small");
+    secondSave.resolve();
+    await Promise.all([older, newer]);
+    translation.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+    expect(visibility).toHaveBeenLastCalledWith(false);
+    expect(render.mock.calls.at(-1)[3]).toBe("small");
+  });
+  it("does not let a maintenance preference read restore visibility after a storage change", async () => {
+    const { ns } = setupManualController();
+    let changed;
+    ns.browserApi.storage.onChanged = { addListener: vi.fn(fn => { changed = fn; }), removeListener: vi.fn() };
+    await ns.controller.init();
+    const initial = await ns.storage.getPrefs();
+    const read = makeDeferred();
+    ns.storage.getPrefs.mockReturnValue(read.promise);
+    changed({ [ns.constants.PREFS_KEY_PREFIX + "global"]: { newValue: initial } }, "local");
+    await vi.advanceTimersByTimeAsync(100);
+    changed({ [ns.constants.PREFS_KEY_PREFIX + "global"]: { newValue: { ...initial, enabled: false } } }, "local");
+    const visibility = vi.spyOn(ns.renderer, "applySubtitleVisibility");
+    read.resolve(initial);
+    await flushUntil(() => visibility.mock.calls.length > 0);
+    expect(visibility).toHaveBeenLastCalledWith(false);
+  });
+  it("renders the authority's manual result when a late machine cache commit is superseded", async () => {
+    const {ns, callbacks} = setupManualController();
+    evalModule("error_utils.js"); evalModule("backend_client.js");
+    const delayed = makeDeferred();
+    configureDeferredTranslation(ns, [delayed]);
+    const manual = TRANS_VTT.replace("你好世界", "最新手动译文");
+    ns.storage.setCacheStore.mockResolvedValue({ok:true, superseded:true, entry:{
+      cacheKey:"manual-key", sourceKey:"source", configSig:"config", manualImport:true, translatedVtt:manual,
+    }});
+    await ns.controller.init();
+    const run = callbacks().onTranslate();
+    await flushUntil(() => ns.translationService.translateWithConfig.mock.calls.length === 1);
+    delayed.resolve(DEFERRED_TRANSLATION_RESULT);
+    await run;
+    expect(ns.renderer.getRenderState().lastRenderedVtt).toContain("最新手动译文");
+    expect(ns.ui.setStatusText).toHaveBeenLastCalledWith("已加载最新手动译文", "cache");
+  });
+  it("keeps a full manual import authoritative when merged cache exists", async () => {
+    const { ns, callbacks } = setupManualController();
+    evalModule("sentence_merge.js");
+    evalModule("error_utils.js"); evalModule("backend_client.js");
+    const prefs = await ns.storage.getPrefs();
+    ns.storage.getPrefs.mockResolvedValue({...prefs, sentenceMergeEnabled:true});
+    const older = TRANS_VTT.replace("你好世界","旧的机器译文");
+    const entries = {merged:{cacheKey:"merged", sourceKey:"source", configSig:"config::sentence-merge-v2", translatedVtt:older}};
+    ns.storage.askApiKeyIfNeeded = vi.fn(async x=>x);
+    ns.translationService.buildCacheKey = vi.fn(async (_cfg,_id,_text,opts)=>({sourceKey:"source",configSig:opts?.sentenceMergeEnabled?"config::sentence-merge-v2":"config",cacheKey:opts?.sentenceMergeEnabled?"merged":"plain"}));
+    ns.storage.getCacheStore = vi.fn(async key=>entries[key]||null);
+    ns.storage.setCacheStore = vi.fn(async (entry,key)=>{if(entry) entries[entry.cacheKey]=entry; else delete entries[key]; return {ok:true};});
+    await ns.controller.init(); await callbacks().onManualPrepare();
+    expect(await callbacks().onManualImport()).toBe(true);
+    expect(ns.renderer.getRenderState().lastRenderedVtt).toContain("你好世界");
+    await callbacks().onTranslate();
+    expect(ns.renderer.getRenderState().lastRenderedVtt).toContain("你好世界");
+    expect(ns.renderer.getRenderState().lastRenderedVtt).not.toContain("旧的机器译文");
   });
 });

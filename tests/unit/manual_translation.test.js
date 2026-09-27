@@ -577,6 +577,24 @@ describe("manual AI translation workflow helpers", () => {
     expect(restoredCorrupt.accepted).toEqual({ c000002: "请打开练习册。" });
   });
 
+  it.each(["missing", "malformed", "far-future"])("ignores a checkpoint with a %s timestamp", async (timestampKind) => {
+    const created = manual.createTranslationPackage({
+      sourceVtt: SOURCE,
+      sourceHash: "timestamp-session",
+      target: "ZH",
+      vtt,
+    });
+    const saved = {
+      sessionId: created.workflow.sessionId,
+      accepted: { c000001: "欢迎来到课堂" },
+    };
+    if (timestampKind === "malformed") saved.savedAt = "not-a-timestamp";
+    if (timestampKind === "far-future") saved.savedAt = Date.now() + 24 * 60 * 60 * 1000;
+    const storage = { get: vi.fn(async () => ({ ["echo360_manual_progress_v3"]: saved })) };
+
+    await expect(manual.restoreProgress(created.workflow, storage)).resolves.toBe(created.workflow);
+  });
+
   it("creates a flat translation-only package without exposing client validation metadata", () => {
     const created = completeFileSession(manual, {
       sourceVtt: SOURCE,

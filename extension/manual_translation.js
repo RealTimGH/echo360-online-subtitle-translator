@@ -24,6 +24,7 @@
   const BUNDLE_PACKAGE_TYPE = "echo360_manual_translation_bundle";
   const recordIndexMaps = new WeakMap();
   const progressWriteStates = new WeakMap();
+  const progressBases = new Map();
   const ENTITY_RE = /&(?:[a-z][a-z0-9]+|#\d+|#x[a-f0-9]+);/giu;
   const LITERAL_RE = /https?:\/\/[^\s<]+|www\.[^\s<]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|`[^`\n]+`|[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]+|(^|[\s([{"'])((?:(?:\.\.?\/)|\/)[\w.@~+%-]*[\w@~+%-](?:\/[\w.@~+%-]*[\w@~+%-])+|--?[a-z][\w-]*\b)/gimu;
   const VTT_TIMING_LINE = /^\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})\s*-->\s*((?:(?:\d{2,}):)?\d{2}:\d{2}\.\d{3})(?:\s+.*)?$/;
@@ -1348,6 +1349,7 @@ else:
       accepted: entry.accepted,
       partialCache: entry.partialCache || null,
     });
+    const baseAccepted = { ...(progressBases.get(workflow.sessionId) || {}) };
     const previous = progressWriteStates.get(storage);
     if (previous?.signature === signature) {
       if (previous.promise) await previous.promise;
@@ -1356,7 +1358,33 @@ else:
     const previousPromise = previous?.promise || Promise.resolve();
     let writePromise;
     writePromise = previousPromise.catch(() => {}).then(async () => {
-      await storage.set({ [PROGRESS_KEY]: entry });
+      const browserApi = root.Echo360Translator?.browserApi;
+      if (storage === browserApi?.storage?.local && typeof browserApi.runtime?.sendMessage === "function") {
+        const response = await browserApi.runtime.sendMessage({ type: "shared-storage",
+          operation: "progress-save", entry, baseAccepted });
+        if (!response?.ok) throw Object.assign(new Error(response?.error?.message || "手动翻译进度保存失败"), {
+          code: response?.error?.code || "CACHE_WRITE_FAILED",
+        });
+        progressBases.set(workflow.sessionId, { ...response.data.accepted });
+        // Keep changes made after this snapshot, but adopt other tabs' accepted
+        // cues only after revalidating them against this workflow. Storage can
+        // contain invalid legacy/corrupt cue values that restoreProgress
+        // intentionally filtered out.
+        const recordsById = new Map((workflow.records || []).map((record) => [record.id, record]));
+        for (const [id, value] of Object.entries(response.data.accepted)) {
+          if (Object.hasOwn(workflow.accepted, id) && workflow.accepted[id] !== entry.accepted[id]) continue;
+          const record = recordsById.get(id);
+          if (!record) continue;
+          try {
+            validateReadableTranslation(value, record, workflow.target);
+            workflow.accepted[id] = value;
+          } catch (_) { /* Keep corrupt shared progress out of the live workflow. */ }
+        }
+      } else {
+        // Explicit storage injection is used by standalone/local workflows.
+        // Browser extension contexts always use the single background writer.
+        await storage.set({ [PROGRESS_KEY]: entry });
+      }
       const current = progressWriteStates.get(storage);
       if (current?.promise === writePromise) {
         // Keep only the in-flight coalescer. Another extension context may
@@ -1367,6 +1395,8 @@ else:
       }
       return true;
     });
+    progressBases.clear();
+    progressBases.set(workflow.sessionId, { ...entry.accepted });
     progressWriteStates.set(storage, { signature, promise: writePromise });
     try {
       return await writePromise;
@@ -1380,7 +1410,20 @@ else:
   async function restoreProgress(workflow, storage = root.Echo360Translator?.browserApi?.storage?.local) {
     if (!storage?.get) return workflow;
     const saved = (await storage.get(PROGRESS_KEY))?.[PROGRESS_KEY];
-    if (saved?.sessionId !== workflow.sessionId || !saved.accepted || Date.now() - saved.savedAt > 30 * 86400000) return workflow;
+    const now = Date.now();
+    const savedAt = Number(saved?.savedAt);
+    const savedAge = now - savedAt;
+    const hasFreshCheckpoint = Number.isFinite(savedAt) && savedAt > 0 &&
+      savedAge >= -5 * 60_000 && savedAge <= 30 * 86400000;
+    if (saved?.sessionId !== workflow.sessionId || !saved.accepted ||
+        typeof saved.accepted !== "object" || Array.isArray(saved.accepted) || !hasFreshCheckpoint) {
+      // This workflow has no accepted cues in the checkpoint we just read.
+      // Clear any older in-memory baseline so its next save cannot be treated
+      // as though it had observed a different stored value.
+      progressBases.clear();
+      progressBases.set(workflow.sessionId, {});
+      return workflow;
+    }
     const accepted = {};
     for (const record of workflow.records) {
       if (!Object.hasOwn(saved.accepted, record.id)) continue;
@@ -1405,6 +1448,12 @@ else:
         reason: String(saved.partialCache.reason || "").slice(0, 80),
       }
       : null;
+    // Keep the raw values we actually observed as the merge baseline, even
+    // when validation excludes a corrupt cue from the workflow. A later valid
+    // repair can then replace that exact bad value while still detecting a
+    // concurrent edit made after this restore.
+    progressBases.clear();
+    progressBases.set(workflow.sessionId, { ...saved.accepted });
     return { ...workflow, accepted, ...(savedPartial ? { partialCache: savedPartial } : {}) };
   }
 

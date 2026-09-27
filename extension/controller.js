@@ -4,6 +4,7 @@
   const extensionApi = ns.browserApi;
 
   let activeRunId = null;
+  let activeRunContext = null;
   let isTranslating = false;
   let sentenceMergeRestartRequested = false;
   let loadedCacheKey = "";
@@ -18,6 +19,10 @@
   let trackSyncInstalled = false;
   let trackSyncSuspended = false;
   let trackSyncPrefs = null;
+  let latestDisplayPrefs = null;
+  let pendingDisplayPrefs = null;
+  let preferenceChangeRevision = 0;
+  let preferenceSaveTail = Promise.resolve();
   let trackSyncPrefsRevision = 0;
   let trackSyncRequested = false;
   let trackSyncVideoUnsubscribe = null;
@@ -31,6 +36,7 @@
   let manualPrimeFailures = 0;
   let manualGeneration = 0;
   let configWatcherInstalled = false;
+  let controllerGeneration = 0;
 
   const TRACK_SYNC_INITIAL_DELAY_MS = 1200;
   const TRACK_SYNC_EVENT_DELAY_MS = 100;
@@ -48,6 +54,31 @@
       .filter(Boolean)
       .join("|");
     return `${video.currentSrc || video.src || ""}::${trackSources}`;
+  }
+
+  function isTranslationRunCurrent(runId) {
+    if (activeRunId !== runId) return false;
+    const context = activeRunContext;
+    if (!context || context.runId !== runId) return false;
+    const primaryVideo = ns.video.getPrimaryVideo?.();
+    const videoCurrent = !context.video || (
+      context.video.isConnected !== false &&
+      (!ns.video.getPrimaryVideo || primaryVideo === context.video) &&
+      context.videoHint === manualVideoHint(context.video)
+    );
+    if (location.href === context.location && videoCurrent) return true;
+
+    // Release the translation lock as soon as the player moves to another
+    // lesson/source so a slow request cannot strand the new page in a busy
+    // state. The run id also makes its eventual completion a no-op.
+    activeRunId = null;
+    activeRunContext = null;
+    isTranslating = false;
+    context.abortController?.abort();
+    context.cleanupStale?.();
+    ns.ui.setIdleDimEnabled?.(false);
+    ns.ui.updateActionButtons?.("加载翻译字幕", false);
+    return false;
   }
 
   function setPendingCheckpoint(entry, { persistenceFailed = null, video = null } = {}) {
@@ -174,6 +205,10 @@
     configWatcher = (changes, area) => {
       if (area !== "local") return;
       if (Object.keys(changes).some((key) => key.startsWith(ns.constants.PREFS_KEY_PREFIX))) {
+        const storedPrefs = changes[`${ns.constants.PREFS_KEY_PREFIX}global`]?.newValue;
+        if (storedPrefs && typeof storedPrefs === "object") {
+          latestDisplayPrefs = { ...(latestDisplayPrefs || {}), ...storedPrefs };
+        }
         trackSyncPrefs = null;
         trackSyncPrefsRevision += 1;
         requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
@@ -271,6 +306,7 @@
     options = {},
     onSurfaceWarning = null,
   }) {
+    prefs = currentDisplayPrefs(prefs);
     let resolvedSourceMeta;
     try {
       const merge = sourceMeta?.sentenceMerge;
@@ -285,7 +321,7 @@
         const groupedTranslation = options.previewPending
           ? ns.sentenceMerge.preview(translatedVtt, merge.plan, options)
           : translatedVtt;
-        const displayPrefs = trackSyncPrefs || prefs;
+        const displayPrefs = prefs;
         const projection = ns.sentenceMerge.project(merge.originalVtt, groupedTranslation, merge.plan,
           displayPrefs.sentenceMergeEnabled === true && displayPrefs.sentenceMergeEnglish === true && displayPrefs.useNativeSubtitles === true &&
           (displayPrefs.browserBilingual ?? displayPrefs.bilingual) === true);
@@ -611,13 +647,33 @@
     }
   }
 
+  function currentDisplayPrefs(prefs) {
+    // A request owns its language/source, while the user owns the current
+    // display settings. Late progress must never restore the request's old UI.
+    return { ...prefs, ...(latestDisplayPrefs || {}), ...(pendingDisplayPrefs?.prefs || {}), target: prefs?.target };
+  }
+
   async function onPrefsChanged() {
     let renderWarning = null;
+    const changeRevision = ++preferenceChangeRevision;
     try {
-      const oldPrefs = await ns.storage.getPrefs();
       const prefs = ns.ui.readPanelPrefs();
-      await ns.storage.savePrefs(prefs);
-      trackSyncPrefs = prefs;
+      // A storage notification from an older save must not override a newer
+      // local edit while that edit is waiting in the persistence queue.
+      pendingDisplayPrefs = { revision: changeRevision, prefs: { ...prefs } };
+      latestDisplayPrefs = { ...prefs };
+      trackSyncPrefsRevision += 1;
+      const oldPrefs = await ns.storage.getPrefs();
+      if (changeRevision !== preferenceChangeRevision) return;
+      const save = preferenceSaveTail.catch(() => {}).then(() => {
+        if (changeRevision === preferenceChangeRevision) return ns.storage.savePrefs(prefs);
+      });
+      preferenceSaveTail = save;
+      await save;
+      if (changeRevision !== preferenceChangeRevision) return;
+      latestDisplayPrefs = currentDisplayPrefs(prefs);
+      pendingDisplayPrefs = null;
+      trackSyncPrefs = currentDisplayPrefs(prefs);
       trackSyncPrefsRevision += 1;
       ns.renderer.applySubtitleSize(prefs.size);
 
@@ -658,7 +714,7 @@
           });
         }
       }
-      ns.renderer.applySubtitleVisibility(prefs.enabled);
+      ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled);
       requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
       if (ns.transcriptPanelRenderer && prefs.transcriptPanelEnabled !== true) {
         ns.transcriptPanelRenderer.setVisible(false);
@@ -672,12 +728,15 @@
         ns.ui.clearError?.();
       }
     } catch (error) {
+      if (changeRevision !== preferenceChangeRevision) return;
       console.error("[echo360-translator][controller] subtitle preference failed", safeErrorForLog(error, { phase: "preferences" }));
       const typedError = withFallbackErrorCode(error, "PREFERENCES_ERROR", "preferences");
       ns.ui.showError?.(typedError, {
         phase: "preferences",
         onCancel: () => ns.ui.clearError?.(),
       });
+    } finally {
+      if (pendingDisplayPrefs?.revision === changeRevision) pendingDisplayPrefs = null;
     }
   }
 
@@ -835,7 +894,7 @@
       sourceMeta: { ...session.sourceMeta, manualImport: true, target: session.target, sessionKey: session.workflow.sessionId } });
     if (!mounted) throw Object.assign(new Error("没有找到可挂载的播放器字幕层"), { code: "RENDER_MOUNT_FAILED" });
     loadedCacheKey = "";
-    ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+    ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
     setManualSessionReady(session);
     ns.ui.setManualMessage?.("已恢复并加载全部手动译文；可下载完整 VTT 保存。", "success");
     return true;
@@ -1254,7 +1313,7 @@
               });
               loadedCacheKey = "";
               if (mounted) {
-                ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+                ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
                 ns.ui.updateActionButtons("部分手动译文已加载", false);
               }
               const partialMessage = `已加载 ${completed}/${total} 条手动译文；${failedItems.length} 条待修复。其余译文已保存在本机进度中，点击“${session.exportMode === "file" ? "手动下载完整 JSON" : "复制本批材料"}”补译；需要整段重做时使用“重新翻译”。`;
@@ -1307,8 +1366,9 @@
               sourceKey: cacheIdentity.sourceKey,
               configSig: cacheIdentity.configSig,
               translatedVtt: validation.translatedVtt,
+              manualImport: true,
               createdAt: Date.now(),
-            });
+            }, "", { invalidateMergeVariants: true });
             if (cacheResult?.ok === false) {
               const cacheError = cacheResult.error || new Error("本地缓存更新失败");
               importedCacheWarning = `AI 译文已加载，但本地缓存更新失败：${cacheError.message || "请保持当前页面打开"}`;
@@ -1351,7 +1411,7 @@
         cacheKey: importedCacheKey,
       });
       loadedCacheKey = mounted ? importedCacheKey : "";
-      ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+      ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
       ns.ui.updateActionButtons("翻译字幕已加载", false);
       const importWarnings = [progressWarning, importedCacheWarning, validation.warning]
         .map((item) => String(item || "").trim())
@@ -1472,7 +1532,7 @@
       if (prefs?.sentenceMergeEnabled === true && typeof ns.sentenceMerge?.build === "function") {
         const plan = ns.sentenceMerge.build(vttText, { maxChars: Number(cfg?.maxChars) || 1200 });
         if (plan?.vtt) vttText = plan.vtt;
-        options = { sentenceMergeEnabled: true };
+        options = { sentenceMergeEnabled: true, originalVtt: resolved.vttText };
       }
       const cacheIdentity = options
         ? await ns.translationService.buildCacheKey(cfg, resolved.sourceId || "", vttText, options)
@@ -1522,12 +1582,32 @@
   async function onClickTranslate(forceRefresh = false) {
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const runStartedAt = performance.now();
+    if (isTranslating && activeRunId != null) isTranslationRunCurrent(activeRunId);
     if (isTranslating) {
       ns.ui.setStatusText("已有翻译任务在进行中，请稍候...", "warning");
       return;
     }
     isTranslating = true;
     activeRunId = runId;
+    let incrementalPreviewMounted = false;
+    let runPreviewMounted = false;
+    const runContext = {
+      runId,
+      abortController: new AbortController(),
+      location: location.href,
+      video: null,
+      videoHint: "",
+      cleanupStale: () => {
+        if (!runPreviewMounted) return;
+        ns.renderer.cleanupTranslatedTracks();
+        ns.transcriptPanelRenderer?.clear?.();
+        loadedCacheKey = "";
+        incrementalPreviewMounted = false;
+        runPreviewMounted = false;
+      },
+    };
+    activeRunContext = runContext;
+    const isCurrentRun = () => isTranslationRunCurrent(runId);
     ns.ui.setIdleDimEnabled?.(true);
     ns.ui.clearTranslationSummary?.();
 
@@ -1548,7 +1628,6 @@
       forceRefresh,
     };
 
-    let incrementalPreviewMounted = false;
     let translatedPreviewStarted = false;
     let lastPreviewVtt = "";
     let lastPreviewMeta = {};
@@ -1620,7 +1699,7 @@
         },
         onSurfaceWarning: collectSurfaceWarning,
       });
-      if (mounted) ns.renderer.applySubtitleVisibility(prefs.enabled);
+      if (mounted) ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled);
     };
 
     try {
@@ -1631,11 +1710,15 @@
 
       diagnosticContext.phase = "video";
       const video = await ns.video.waitForVideo(15000);
+      if (!isCurrentRun()) return;
       if (!video) {
         const error = new Error("未找到播放器 video 元素（15s 超时）");
         error.code = "VIDEO_NOT_FOUND";
         throw error;
       }
+      runContext.video = video;
+      runContext.videoHint = manualVideoHint(video);
+      if (!isCurrentRun()) return;
       if (forceRefresh) {
         ns.renderer.cleanupTranslatedTracks();
         ns.transcriptPanelRenderer?.clear?.();
@@ -1643,7 +1726,9 @@
 
       diagnosticContext.phase = "source";
       const prepared = forceRefresh ? null : await preparedManualSource(video);
+      if (!isCurrentRun()) return;
       const resolvedSource = prepared || await ns.translationService.resolveSourceVtt(video);
+      if (!isCurrentRun()) return;
       let vttText = resolvedSource?.vttText;
       const sourceId = resolvedSource?.sourceId || "";
       const sourceMeta = resolvedSource?.sourceMeta || null;
@@ -1654,10 +1739,12 @@
       diagnosticContext.sourceTextLineCount = sourceMeta?.stats?.textLineCount || 0;
       diagnosticContext.sourceMultilineCueCount = sourceMeta?.stats?.multilineCueCount || 0;
       let cfg = await ns.storage.getConfig();
+      if (!isCurrentRun()) return;
       lastKnownConfig = cfg;
       diagnosticContext.phase = "config";
       const configuredProvider = String(cfg?.provider || "当前 Provider").trim().toLowerCase();
       cfg = await ns.storage.askApiKeyIfNeeded(cfg);
+      if (!isCurrentRun()) return;
       if (!cfg) {
         const error = new Error(`Provider ${configuredProvider} 缺少 API Key`);
         error.code = "PROVIDER_API_KEY_MISSING";
@@ -1669,22 +1756,48 @@
       diagnosticContext.target = String(cfg.target || "ZH").toUpperCase();
 
       const prefs = await ns.storage.getPrefs();
+      if (!isCurrentRun()) return;
+      // Prefer a newer UI snapshot if settings changed during this read.
+      if (!latestDisplayPrefs) latestDisplayPrefs = { ...prefs };
       prefs.target = String(cfg.target || "ZH").toUpperCase();
-      ns.renderer.applySubtitleSize(prefs.size);
+      ns.renderer.applySubtitleSize(currentDisplayPrefs(prefs).size);
 
-      const sentenceMerge = prefs.sentenceMergeEnabled === true
+      const originalSourceVtt = vttText;
+      let sentenceMerge = prefs.sentenceMergeEnabled === true
         ? { originalVtt: vttText, plan: ns.sentenceMerge.build(vttText, { maxChars: Number(cfg.maxChars) || 1200 }) }
         : null;
       if (sentenceMerge) vttText = sentenceMerge.plan.vtt;
-      const { sourceKey, configSig, cacheKey } = sentenceMerge
-        ? await ns.translationService.buildCacheKey(cfg, sourceId, vttText, { sentenceMergeEnabled: true })
+      let { sourceKey, configSig, cacheKey } = sentenceMerge
+        ? await ns.translationService.buildCacheKey(cfg, sourceId, vttText, { sentenceMergeEnabled: true, originalVtt: originalSourceVtt })
         : await ns.translationService.buildCacheKey(cfg, sourceId, vttText);
+      if (!isCurrentRun()) return;
       diagnosticContext.phase = "cache";
-      const panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig, sessionKey: cacheKey,
+      let panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig, sessionKey: cacheKey,
         ...(sentenceMerge ? { sentenceMerge } : {}) };
       let cacheEntry = null;
       try {
         cacheEntry = await ns.storage.getCacheStore(cacheKey);
+        if (!forceRefresh && sentenceMerge) {
+          const plainIdentity = await ns.translationService.buildCacheKey(cfg, sourceId, originalSourceVtt);
+          if (!isCurrentRun()) return;
+          const manualEntry = await ns.storage.getCacheStore(plainIdentity.cacheKey);
+          if (!isCurrentRun()) return;
+          if (manualEntry?.manualImport === true && !manualEntry.resumeCheckpoint &&
+              cacheIdentityMatches(manualEntry, plainIdentity)) {
+            ns.backendClient.validateTranslationResult({ translated_vtt: manualEntry.translatedVtt }, "cache", {
+              sourceVtt: originalSourceVtt, target: diagnosticContext.target,
+            });
+            // Manual results retain their original cue alignment. Do not feed
+            // them to the grouped-result projector or resurrect a machine slot.
+            ({ sourceKey, configSig, cacheKey } = plainIdentity);
+            sentenceMerge = null;
+            vttText = originalSourceVtt;
+            cacheEntry = manualEntry;
+            panelSourceMeta = { ...(sourceMeta || {}), sourceKey, configSig,
+              sessionKey: cacheKey, manualImport: true };
+            invalidateMatchingPendingCheckpoint(plainIdentity);
+          }
+        }
       } catch (error) {
         cacheWarningError = Object.assign(new Error("本地翻译缓存读取失败，已跳过缓存"), {
           code: "CACHE_READ_FAILED",
@@ -1692,6 +1805,7 @@
         });
         console.warn("[echo360-translator][controller] translation cache read failed; continuing without cache", safeErrorForLog(error, { phase: "cache" }));
       }
+      if (!isCurrentRun()) return;
       const currentCacheIdentity = { cacheKey, sourceKey, configSig };
       if (!forceRefresh && pendingCheckpointEntry?.cacheKey === cacheKey &&
         cacheIdentityMatches(pendingCheckpointEntry, currentCacheIdentity) &&
@@ -1707,7 +1821,10 @@
 
       if (forceRefresh) {
         if (pendingCheckpointEntry?.cacheKey === cacheKey) clearPendingCheckpoint();
-        const clearResult = await ns.storage.setCacheStore(null, cacheKey);
+        const clearResult = await ns.storage.setCacheStore(null, cacheKey, {
+          clearManualOverride: { sourceKey, configSig },
+        });
+        if (!isCurrentRun()) return;
         if (clearResult?.ok === false) {
           cacheWarningError = clearResult.error || Object.assign(new Error("本地缓存清理失败"), { code: "CACHE_WRITE_FAILED" });
           console.warn("[echo360-translator][controller] old cache could not be cleared", safeErrorForLog(cacheWarningError, { phase: "cache" }));
@@ -1723,7 +1840,7 @@
         !!renderState.lastTranslatedTrack &&
         (typeof ns.renderer.hasRenderedTranslatedTrack !== "function" || ns.renderer.hasRenderedTranslatedTrack());
       if (!forceRefresh && !cacheEntry?.resumeCheckpoint && loadedCacheKey === cacheKey && currentSurfaceReady) {
-        ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+        ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
         ns.ui.updateActionButtons("翻译字幕已加载");
         const summary = buildTranslationSummary(
           { provider: cfg.provider },
@@ -1823,10 +1940,10 @@
           });
         }
         if (mounted && cacheSurfaceWarnings.length === 0) {
-          ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+          ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
         } else if (mounted) {
-          ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+          ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled !== false);
           ns.ui.updateActionButtons("翻译字幕已加载");
         } else {
           ns.ui.updateActionButtons("翻译已就绪");
@@ -1873,6 +1990,7 @@
       });
 
       const mountTranslationPreview = (partialVtt, incremental = false, partialMeta = {}) => {
+        if (!isCurrentRun()) return false;
         lastPreviewVtt = partialVtt;
         lastPreviewMeta = partialMeta || {};
         const failedCues = failedCuesFromProgress(partialMeta, vttText);
@@ -1903,7 +2021,8 @@
         });
         if (!mounted) return false;
         incrementalPreviewMounted = true;
-        ns.renderer.applySubtitleVisibility(prefs.enabled);
+        runPreviewMounted = true;
+        ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled);
         return true;
       };
 
@@ -1914,8 +2033,10 @@
 
       const result = await ns.translationService.translateWithConfig(cfg, backendUrl, payload, {
         resumeCheckpoint,
-        isActive: () => activeRunId === runId,
+        isActive: isCurrentRun,
+        signal: runContext.abortController.signal,
         onProgress: (current, total, line = "", details = {}) => {
+          if (!isCurrentRun()) return;
           const hasKnownTotal = Number(total) > 0;
           const statusLine = String(line || "").trim();
           const tip = hasKnownTotal
@@ -1949,6 +2070,7 @@
               : details?.phase || "translation";
         },
         onPartialVtt: (partialVtt, progress) => {
+          if (!isCurrentRun()) return;
           if (!mountTranslationPreview(partialVtt, true, progress)) return;
           const current = Number(progress?.current || 0);
           const total = Number(progress?.total || 0);
@@ -1964,11 +2086,12 @@
           diagnosticContext.phase = progress?.recovery ? "recovery" : "translation";
         },
         onSyncFallback: () => {
+          if (!isCurrentRun()) return;
           diagnosticContext.phase = "backend";
           ns.ui.setStatusText("后端不支持异步进度接口，回退到同步翻译...");
         },
       });
-      if (activeRunId !== runId) return;
+      if (!isCurrentRun()) return;
       if (typeof ns.backendClient?.validateTranslationResult === "function") {
         // Keep one final result gate at the controller boundary. Direct jobs,
         // local-backend jobs and test/custom integrations must all prove that
@@ -2016,6 +2139,7 @@
           : { incremental: incrementalPreviewMounted },
         onSurfaceWarning: collectSurfaceWarning,
       });
+      if (mounted) runPreviewMounted = true;
       const nextCheckpoint = failedCount > 0
         ? ns.translationService.buildTranslationCheckpoint?.(result, vttText) || null
         : null;
@@ -2038,6 +2162,28 @@
         if (nextCheckpoint) setPendingCheckpoint(entry, { video });
         else clearPendingCheckpoint();
         const cacheResult = await ns.storage.setCacheStore(entry);
+        if (!isCurrentRun()) return;
+        if (cacheResult?.superseded && cacheResult.entry?.manualImport === true) {
+          const authoritative = cacheResult.entry;
+          ns.backendClient.validateTranslationResult({ translated_vtt: authoritative.translatedVtt }, "cache", {
+            sourceVtt: originalSourceVtt, target: diagnosticContext.target,
+          });
+          clearPendingCheckpoint();
+          const manualMounted = renderTranslationSurfaces({
+            translatedVtt: authoritative.translatedVtt,
+            originalVtt: originalSourceVtt,
+            prefs,
+            sourceMeta: { ...(sourceMeta || {}), sourceKey: authoritative.sourceKey,
+              configSig: authoritative.configSig, sessionKey: authoritative.cacheKey, manualImport: true },
+          });
+          loadedCacheKey = manualMounted ? authoritative.cacheKey : "";
+          ns.ui.showTranslationSummary?.(null);
+          ns.ui.clearError?.();
+          ns.ui.setStatusText("已加载最新手动译文", "cache");
+          ns.ui.updateActionButtons("翻译字幕已加载");
+          ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled);
+          return;
+        }
         if (cacheResult?.ok === false) {
           if (nextCheckpoint) markPendingCheckpointPersistenceFailed(true);
           cacheWarningError = cacheResult.error || Object.assign(new Error("翻译完成，但本地缓存保存失败"), { code: "CACHE_WRITE_FAILED" });
@@ -2135,11 +2281,12 @@
 
       if (mounted) {
         ns.ui.updateActionButtons(failedCount > 0 ? "部分翻译已加载" : "翻译字幕已加载");
-        ns.renderer.applySubtitleVisibility(prefs.enabled);
+        ns.renderer.applySubtitleVisibility(currentDisplayPrefs(prefs).enabled);
       } else {
         ns.ui.updateActionButtons("翻译已就绪");
       }
     } catch (err) {
+      if (!isCurrentRun()) return;
       try {
         showFailedTranslationPreview(err);
       } catch (previewError) {
@@ -2178,10 +2325,10 @@
       });
       ns.ui.updateActionButtons("加载翻译字幕");
     } finally {
-      if (activeRunId === runId) {
-        isTranslating = false;
-        activeRunId = null;
-      }
+      if (!isCurrentRun()) return;
+      isTranslating = false;
+      activeRunId = null;
+      activeRunContext = null;
       const btn = document.getElementById("echo360-translator-btn");
       if (btn && !btn.textContent.includes("已加载") && !btn.textContent.includes("已就绪")) {
         ns.ui.updateActionButtons("加载翻译字幕", false);
@@ -2196,11 +2343,14 @@
   }
 
   async function getTrackSyncPrefs() {
-    if (trackSyncPrefs) return trackSyncPrefs;
+    if (trackSyncPrefs) return currentDisplayPrefs(trackSyncPrefs);
     const revision = trackSyncPrefsRevision;
     const prefs = await ns.storage.getPrefs();
-    if (revision === trackSyncPrefsRevision) trackSyncPrefs = prefs;
-    return prefs;
+    if (revision === trackSyncPrefsRevision) {
+      trackSyncPrefs = prefs;
+      latestDisplayPrefs = { ...prefs };
+    }
+    return currentDisplayPrefs(prefs);
   }
 
   function isSyncHidden() {
@@ -2237,7 +2387,10 @@
       const p = await getTrackSyncPrefs();
       if (!trackSyncInstalled || trackSyncSuspended || isSyncHidden()) return;
       maybePrimeManualSession(ns.video.getPrimaryVideo?.());
-      if (p.enabled === false) return;
+      if (p.enabled === false) {
+        ns.renderer.applySubtitleVisibility(false);
+        return;
+      }
       ns.renderer.ensureTrackOnPrimaryVideo();
       ns.renderer.applySubtitleVisibility(true);
     } catch (error) {
@@ -2261,6 +2414,7 @@
   }
 
   function onTrackSyncSignal() {
+    if (activeRunContext) isTranslationRunCurrent(activeRunContext.runId);
     requestTrackSync(TRACK_SYNC_EVENT_DELAY_MS);
   }
 
@@ -2274,6 +2428,17 @@
   }
 
   function suspendTrackSync() {
+    const context = activeRunContext;
+    if (context) {
+      activeRunId = null;
+      activeRunContext = null;
+      isTranslating = false;
+      sentenceMergeRestartRequested = false;
+      context.abortController?.abort();
+      context.cleanupStale?.();
+      ns.ui.setIdleDimEnabled?.(false);
+      ns.ui.updateActionButtons?.("加载翻译字幕", false);
+    }
     trackSyncSuspended = true;
     onSyncVisibilityChanged();
   }
@@ -2298,7 +2463,13 @@
   }
 
   function destroy() {
+    controllerGeneration += 1;
+    preferenceChangeRevision += 1;
     sentenceMergeRestartRequested = false;
+    activeRunContext?.abortController?.abort();
+    activeRunId = null;
+    activeRunContext = null;
+    isTranslating = false;
     clearPendingCheckpoint();
     trackSyncInstalled = false;
     if (trackSyncTimer != null) clearTimeout(trackSyncTimer);
@@ -2309,6 +2480,8 @@
     document.removeEventListener("enterpictureinpicture", onSyncVisibilityChanged, true);
     document.removeEventListener("leavepictureinpicture", onSyncVisibilityChanged, true);
     trackSyncPrefs = null;
+    latestDisplayPrefs = null;
+    pendingDisplayPrefs = null;
     trackSyncPrefsRevision += 1;
     window.removeEventListener("pagehide", suspendTrackSync);
     window.removeEventListener("pageshow", resumeTrackSync);
@@ -2323,6 +2496,8 @@
   }
 
   async function init() {
+    const generation = ++controllerGeneration;
+    const isCurrent = () => generation === controllerGeneration;
     const supportedPlayerDocument = ns.hostSupport?.isSupportedPlayerDocument?.() ||
       location.hostname.includes("echo360.");
     if (!supportedPlayerDocument) {
@@ -2336,6 +2511,7 @@
     ns.transcriptPanelRenderer?.start?.();
 
     const video = await ns.video.waitForVideo(30000);
+    if (!isCurrent()) return;
     if (!video) {
       const error = new Error("初始化等待 30 秒后仍未找到播放器 video 元素");
       error.code = "VIDEO_NOT_FOUND";
@@ -2392,23 +2568,27 @@
     }
 
     const prefs = await getTrackSyncPrefs();
+    if (!isCurrent()) return;
     try {
       lastKnownConfig = await ns.storage.getConfig();
     } catch (error) {
       console.warn("[echo360-translator][controller] could not prime config for backend startup", safeErrorForLog(error, { phase: "preferences" }));
     }
+    if (!isCurrent()) return;
     ns.ui.setQuickImportVisible?.(quickTranslateAutoExportEnabled());
-    ns.renderer.applySubtitleSize(prefs.size || DEFAULT_SUBTITLE_SIZE);
+    const displayPrefs = currentDisplayPrefs(prefs);
+    ns.renderer.applySubtitleSize(displayPrefs.size || DEFAULT_SUBTITLE_SIZE);
     // Apply the opt-in Transcript setting before any later translation or
     // player mutation can schedule a renderer flush. Missing values are
     // intentionally treated as disabled for fresh installs and upgrades.
-    ns.transcriptPanelRenderer?.setVisible?.(prefs.transcriptPanelEnabled === true);
-    ns.renderer.applySubtitleVisibility(prefs.enabled !== false);
+    ns.transcriptPanelRenderer?.setVisible?.(displayPrefs.transcriptPanelEnabled === true);
+    ns.renderer.applySubtitleVisibility(displayPrefs.enabled !== false);
 
     installTrackSync();
 
     const firstRunKey = "echo360TranslatorFirstRunShown";
     const firstRun = await extensionApi.storage.local.get(firstRunKey);
+    if (!isCurrent()) return;
     if (!firstRun[firstRunKey]) {
       ns.ui.setStatusText("首次使用：默认 Google Translate 可免费试用；若重视质量，请在扩展设置中配置 AI/API 模型。");
       await extensionApi.storage.local.set({ [firstRunKey]: true });

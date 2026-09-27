@@ -376,8 +376,9 @@ class GoogleWebRateLimitCircuit:
 
     def record_429(self) -> bool:
         """Record one HTTP 429 and return whether the circuit is open."""
-        now = time.monotonic()
         with self._lock:
+            # Timestamp and append belong to the same ordering boundary.
+            now = time.monotonic()
             self._total_429 += 1
             if not self._open:
                 self._prune_locked(now)

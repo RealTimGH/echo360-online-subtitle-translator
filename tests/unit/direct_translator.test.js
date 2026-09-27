@@ -895,3 +895,54 @@ it("preserves sentence group IDs and overlapping source ranges through provider 
     fetchMock.mockRestore();
   }
 });
+
+it("aborts provider fetch and does not retry or publish late partial results", async () => {
+  const controller = new AbortController();
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
+    started();
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {once:true});
+    });
+  });
+  const onPartialVtt = vi.fn();
+  try {
+    const pending = translator.translateVtt({
+      provider: "azure", api_key: "test-key", target: "ZH", concurrency: 1, retries: 3,
+      vtt_text: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+    }, {signal: controller.signal, onPartialVtt});
+    const rejection = expect(pending).rejects.toMatchObject({code: "TRANSLATION_CANCELLED"});
+    await ready;
+    const previousCalls = onPartialVtt.mock.calls.length;
+    controller.abort();
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onPartialVtt).toHaveBeenCalledTimes(previousCalls);
+  } finally {
+    fetchMock.mockRestore();
+  }
+});
+
+it("cancels retry backoff immediately without waiting for its timer", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response("unavailable", {status:503}));
+  const retryLog = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const pending = translator.translateVtt({
+      provider:"azure", api_key:"key", target:"ZH", retries:3, fallback_mode:"deferred-fastpath",
+      vtt_text:"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+    }, {signal:controller.signal});
+    const rejection = expect(pending).rejects.toMatchObject({code:"TRANSLATION_CANCELLED"});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(retryLog.mock.calls.some(([message]) => message.includes("retry scheduled"))).toBe(true);
+    controller.abort();
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    fetchMock.mockRestore(); retryLog.mockRestore(); vi.useRealTimers();
+  }
+});

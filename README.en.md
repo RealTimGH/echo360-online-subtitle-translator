@@ -418,7 +418,11 @@ Cache identity is based on content-affecting inputs:
 
 Performance-only settings such as concurrency, RPS, retries, and timeout are not part of the content cache key.
 
-The extension keeps a keyed map of translated VTT slots so merged and unmerged results can coexist, with no fixed entry cap. Older slots are dropped only if Chrome local quota is exhausted, and force-refresh clears only the current slot. Bilingual display is rendered client-side, so toggling bilingual subtitles does not require retranslating.
+The extension keeps a keyed map of translated VTT slots so merged and unmerged results can coexist, with no fixed entry cap. Older slots are dropped only if Chrome local quota is exhausted, and force-refresh clears the current slot and its matching manual override. Bilingual display is rendered client-side, so toggling bilingual subtitles does not require retranslating.
+
+Cache keys include the original subtitle SHA-256, so updated content at an unchanged URL cannot reuse old translations. One background owner serializes cross-page cache operations; manual progress merges by cue. Complete manual imports take precedence over older cached and in-flight machine results. Asynchronous rendering uses current display preferences.
+
+Changing lessons or destroying the controller cancels requests and retry waits. The local backend supports cancellation and terminates translator subprocesses. After a worker restart, persisted completed results remain readable; unfinished work reports interruption with any available recent preview and requires a user decision to retry. Recovery is quota-dependent and bounded to 10 jobs, 5 million characters, and one hour, with active snapshots written at most once every two seconds. Snapshots contain no API keys. Older custom backends without a cancellation endpoint can only stop client-side waiting. See [cache and asynchronous correctness notes](docs/cache-async-correctness.md).
 
 ## Notes
 

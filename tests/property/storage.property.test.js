@@ -27,11 +27,13 @@ import { evalModule, makeFullNs, makeStorageMock } from "../helpers/load-module.
 
 function setupStorage({ storageData = {}, enableLocalBackend = false } = {}) {
   const localMock = makeStorageMock(storageData);
+  evalModule("shared_storage.js");
+  const owner = globalThis.Echo360SharedStorage.createOwner(localMock);
   const ns = makeFullNs({
     buildConfig: { buildTarget: "dev", enableLocalBackend },
     browserApi: {
       storage: { local: localMock },
-      runtime: { sendMessage: vi.fn() },
+      runtime: { sendMessage: vi.fn(message => owner.handle(message)) },
     },
   });
   window.Echo360Translator = ns;

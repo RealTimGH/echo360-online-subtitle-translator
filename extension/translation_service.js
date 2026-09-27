@@ -375,7 +375,14 @@
     return { ...data, job_id: jobId.trim() };
   }
 
+  function throwIfTranslationCancelled(options = {}) {
+    if (options.signal?.aborted || (typeof options.isActive === "function" && !options.isActive())) {
+      throw Object.assign(new Error("翻译任务已取消"), { code: "TRANSLATION_CANCELLED", phase: "translation" });
+    }
+  }
+
   async function translateWithBackend(backendUrl, payload, options = {}) {
+    throwIfTranslationCancelled(options);
     let create;
     try {
       create = await ns.backendClient.proxyRequest(backendUrl, "/translate-async", "POST", payload);
@@ -383,6 +390,7 @@
       const status = Number(asyncErr?.status ?? asyncErr?.statusCode);
       const isCreate404 = status === 404 || asyncErr?.code === "HTTP_404";
       if (!isCreate404) throw asyncErr;
+      throwIfTranslationCancelled(options);
       if (options.onSyncFallback) options.onSyncFallback();
       const syncResult = await ns.backendClient.proxyTranslateSync(backendUrl, payload);
       const validateTranslationResult = ns.backendClient?.validateTranslationResult;
@@ -416,6 +424,7 @@
   }
 
   async function translateInExtension(payload, options = {}) {
+    throwIfTranslationCancelled(options);
     let create = await ns.backendClient.createDirectTranslateJob(payload);
     create = validateCreatedJobResponse(create, "backend");
     const waitOptions = {
@@ -1978,12 +1987,14 @@
   }
 
   async function translateConfiguredOnce(cfg, backendUrl, payload, options = {}) {
+    throwIfTranslationCancelled(options);
     if (String(payload?.provider || cfg?.provider || "").toLowerCase() === "mixed") {
       return translateMixed(cfg, backendUrl, payload, options);
     }
     try {
       return await translateSingleProvider(cfg, backendUrl, payload, options);
     } catch (error) {
+      throwIfTranslationCancelled(options);
       if (!shouldFallbackGoogleToArgos(error, payload) || ns.buildConfig?.enableLocalBackend === false) {
         throw error;
       }
@@ -1992,6 +2003,7 @@
   }
 
   async function translateWithConfig(cfg, backendUrl, payload, options = {}) {
+    throwIfTranslationCancelled(options);
     const checkpoint = validateTranslationCheckpoint(options.resumeCheckpoint, payload?.vtt_text, {
       target: payload?.target || cfg?.target,
       provider: payload?.provider || cfg?.provider,
@@ -2005,14 +2017,14 @@
 
   async function buildCacheKey(cfg, sourceId, vttText, options = {}) {
     const stableSourceId = String(ns.sourceFinder?.canonicalizeSourceId?.(sourceId) || sourceId || "").trim();
-    // A canonical source URL already identifies the subtitle bytes for cache
-    // purposes. Avoid hashing the full VTT (which can be several megabytes)
-    // unless the source adapter could not provide a stable identifier.
-    const sourceKey = stableSourceId || `${location.href}#${await ns.storage.sha256Text(vttText)}`;
+    // Subtitle URLs can stay unchanged when an instructor edits the text.
+    // Bind both complete results and checkpoints to the source content. Merge
+    // variants share the original fingerprint, but keep separate result keys.
+    const sourceHash = await ns.storage.sha256Text(options.originalVtt ?? vttText);
+    const sourceKey = `${stableSourceId || location.href}#sha256:${sourceHash}`;
     const baseConfigSig = ns.storage.buildConfigSignature(cfg);
-    // Merge mode is identified by algorithm version, not by hashing grouped
-    // VTT. A canonical source URL already stands in for subtitle bytes; the
-    // cache validator still rejects stored cues that no longer line up.
+    // Grouping is determined by the original bytes, algorithm and config;
+    // display-only English preferences do not change translation identity.
     const configSig = options.sentenceMergeEnabled === true
       ? `${baseConfigSig}::sentence-merge-v2`
       : baseConfigSig;

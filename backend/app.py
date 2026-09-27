@@ -242,6 +242,7 @@ logger = logging.getLogger("echo360-translator")
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]\s+Translating")
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+_job_cancel_events: dict[str, threading.Event] = {}
 _translation_slots = threading.BoundedSemaphore(JOB_MAX_ACTIVE_COUNT)
 
 ERROR_TITLES = {
@@ -653,19 +654,13 @@ def allowed_reasoning_for_model(model: str) -> set[str]:
 
 
 @lru_cache(maxsize=1)
-def get_supported_args() -> set[str]:
-    if not translator_runtime_available():
-        return set()
-    try:
-        proc = subprocess.run(
-            [*get_translator_command(), "--help"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=TRANSLATOR_HELP_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        return set()
+def _probe_supported_args(command: tuple[str, ...]) -> set[str]:
+    # lru_cache does not cache exceptions: transient startup/help failures
+    # must be retried, rather than becoming a permanent empty capability set.
+    proc = subprocess.run(
+        [*command, "--help"], check=True, capture_output=True, text=True,
+        timeout=TRANSLATOR_HELP_TIMEOUT_SECONDS,
+    )
     text = (proc.stdout or "") + "\n" + (proc.stderr or "")
     supported = set()
     for flag in (
@@ -682,6 +677,19 @@ def get_supported_args() -> set[str]:
         if flag in text:
             supported.add(flag)
     return supported
+
+
+def get_supported_args() -> set[str]:
+    if not translator_runtime_available():
+        return set()
+    try:
+        return set(_probe_supported_args(tuple(get_translator_command())))
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return set()
+
+
+# Preserve the test/maintenance invalidation hook on the public helper.
+get_supported_args.cache_clear = _probe_supported_args.cache_clear
 
 
 def get_translator_python() -> str:
@@ -1640,7 +1648,13 @@ def run_translation(
     req: TranslateRequest,
     force_refresh: bool = False,
     progress_callback=None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[str], bool, dict]:
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise_problem(499, "TRANSLATION_CANCELLED", "翻译任务已取消", phase="translation")
+
+    check_cancelled()
     warnings: list[str] = []
     # Keep direct callers and older integrations on the same safe source path
     # as the HTTP request models. The request model normally already contains
@@ -1818,7 +1832,7 @@ def run_translation(
             if cached_text is not None:
                 warnings.append("CACHE_INVALID_IGNORED: 本地缓存与当前字幕/目标语言不匹配，或不是有效的带时间轴 WebVTT，已忽略并重新翻译")
             logger.warning("ignoring invalid translation cache file=%s", cache_file)
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             warnings.append("CACHE_READ_FAILED: 无法读取本地缓存，已忽略并重新翻译")
             logger.warning("ignoring unreadable translation cache file=%s: %s", cache_file, exc)
 
@@ -1844,6 +1858,7 @@ def run_translation(
         )
         logger.info("translator command: %s", " ".join(redact_args(args)))
         try:
+            check_cancelled()
             proc_env = {**os.environ, "TRANSLATOR_API_KEY": req.api_key}
             proc = subprocess.Popen(
                 args,
@@ -1879,6 +1894,18 @@ def run_translation(
             )
             deadline_timer.daemon = True
             deadline_timer.start()
+            cancellation_done = threading.Event()
+
+            def watch_cancellation() -> None:
+                while not cancellation_done.wait(0.1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        terminate_translator_process(proc)
+                        return
+
+            cancellation_watcher = None
+            if cancel_event is not None:
+                cancellation_watcher = threading.Thread(target=watch_cancellation, daemon=True)
+                cancellation_watcher.start()
             assert proc.stdout is not None
             try:
                 for line in proc.stdout:
@@ -1904,8 +1931,12 @@ def run_translation(
                 return_code = proc.wait()
             finally:
                 deadline_timer.cancel()
+                cancellation_done.set()
+                if cancellation_watcher is not None:
+                    cancellation_watcher.join(timeout=2)
                 if proc.poll() is None:
                     terminate_translator_process(proc)
+            check_cancelled()
             if timed_out.is_set():
                 raise_problem(
                     504,
@@ -2319,6 +2350,7 @@ def run_translation(
             )
         if failed > 0:
             warnings.append(f"PARTIAL_TRANSLATION: {failed}/{total} 条字幕保留原文，结果不会写入缓存")
+        check_cancelled()
         if failed == 0:
             try:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2329,6 +2361,7 @@ def run_translation(
                         temporary_cache.chmod(0o600)
                     except OSError:
                         pass
+                    check_cancelled()
                     os.replace(temporary_cache, cache_file)
                 finally:
                     try:
@@ -2425,6 +2458,8 @@ def translate(req: TranslateRequest) -> dict:
 
 
 def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
+    with _jobs_lock:
+        cancel_event = _job_cancel_events.setdefault(job_id, threading.Event())
     normalize_request_timed_text(req)
     logger.info(
         "[job %s] started provider=%s target=%s requested_concurrency=%s requested_rps=%s retries=%s",
@@ -2438,7 +2473,7 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
     def on_progress(current: int, total: int, line: str, partial_vtt: str = "") -> None:
         with _jobs_lock:
             job = _jobs.get(job_id)
-            if not job:
+            if not job or cancel_event.is_set():
                 return
             job["status"] = "running"
             job["progress"] = {
@@ -2458,11 +2493,15 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
 
     slot_acquired = False
     try:
-        _translation_slots.acquire()
-        slot_acquired = True
+        while not cancel_event.is_set():
+            if _translation_slots.acquire(timeout=0.1):
+                slot_acquired = True
+                break
+        if not slot_acquired:
+            return
         with _jobs_lock:
             job = _jobs.get(job_id)
-            if not job:
+            if not job or cancel_event.is_set():
                 return
             job["status"] = "running"
             job["updated_at"] = int(time.time())
@@ -2471,10 +2510,11 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             req,
             force_refresh=req.force_refresh,
             progress_callback=on_progress,
+            cancel_event=cancel_event,
         )
         with _jobs_lock:
             job = _jobs.get(job_id)
-            if not job:
+            if not job or cancel_event.is_set():
                 return
             job["status"] = "completed"
             # The final result supersedes the last progress snapshot. Release
@@ -2524,7 +2564,7 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
         error_code = problem["error_code"]
         with _jobs_lock:
             job = _jobs.get(job_id)
-            if not job:
+            if not job or cancel_event.is_set():
                 return
             job["status"] = "failed"
             job["error"] = error_text
@@ -2553,6 +2593,8 @@ def _run_job(job_id: str, req: TranslateAsyncRequest) -> None:
             str(error_text).replace("\n", " ")[:320],
         )
     finally:
+        with _jobs_lock:
+            _job_cancel_events.pop(job_id, None)
         if slot_acquired:
             _translation_slots.release()
 
@@ -2581,6 +2623,7 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
                 retryable=True,
                 details={"activeJobs": active_jobs, "limit": JOB_MAX_ACTIVE_COUNT},
             )
+        _job_cancel_events[job_id] = threading.Event()
         _jobs[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -2623,6 +2666,7 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
             details={"cause": type(exc).__name__},
         )
         with _jobs_lock:
+            _job_cancel_events.pop(job_id, None)
             job = _jobs.get(job_id)
             if job:
                 job["status"] = "failed"
@@ -2639,6 +2683,21 @@ def translate_async(req: TranslateAsyncRequest) -> dict:
             retryable=True,
         )
     return {"job_id": job_id}
+
+
+@app.delete("/translate-async/{job_id}")
+def cancel_async_translation(job_id: str) -> dict:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return {"cancelled": False}
+        if job.get("status") not in {"queued", "running"}:
+            return {"cancelled": False}
+        _job_cancel_events.setdefault(job_id, threading.Event()).set()
+        problem = problem_payload(499, "TRANSLATION_CANCELLED", "翻译任务已取消", phase="translation")
+        job.update(status="failed", error=problem["detail"], error_code="TRANSLATION_CANCELLED",
+                   status_code=499, error_detail=problem, result=None, updated_at=int(time.time()))
+        return {"cancelled": True}
 
 
 @app.get("/translate-async/{job_id}")
